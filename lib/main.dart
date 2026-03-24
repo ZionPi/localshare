@@ -848,7 +848,7 @@ class _MyHomePageState extends State<MyHomePage> {
     }
     await _scrollController.animateTo(
       0,
-      duration: const Duration(milliseconds: 280),
+      duration: const Duration(milliseconds: 260),
       curve: Curves.easeOutCubic,
     );
   }
@@ -859,7 +859,7 @@ class _MyHomePageState extends State<MyHomePage> {
     }
     await _scrollController.animateTo(
       _scrollController.position.maxScrollExtent,
-      duration: const Duration(milliseconds: 280),
+      duration: const Duration(milliseconds: 260),
       curve: Curves.easeOutCubic,
     );
   }
@@ -1682,59 +1682,103 @@ connectWs();
   Widget build(BuildContext context) {
     final cards = _sortedCards;
     return Scaffold(
-      appBar: AppBar(title: Text(widget.title)),
+      appBar: AppBar(
+        toolbarHeight: 60,
+        titleSpacing: 18,
+        title: const Text(
+          '本地分享',
+          style: TextStyle(
+            fontSize: 18,
+            fontWeight: FontWeight.w900,
+            color: Color(0xFF0D44B3),
+          ),
+        ),
+        actions: [
+          IconButton(
+            tooltip: '顶部',
+            onPressed: _scrollToTop,
+            icon: const Icon(Icons.keyboard_double_arrow_up_rounded, size: 22),
+          ),
+          IconButton(
+            tooltip: '底部',
+            onPressed: _scrollToBottom,
+            icon:
+                const Icon(Icons.keyboard_double_arrow_down_rounded, size: 22),
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : Stack(
               children: [
                 Positioned.fill(
                   child: DecoratedBox(
-                    decoration: const BoxDecoration(
-                      gradient: LinearGradient(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF8FAFE),
+                      gradient: const LinearGradient(
                         begin: Alignment.topCenter,
                         end: Alignment.bottomCenter,
-                        colors: [Color(0xFFF7F9FB), Color(0xFFF1F4F9)],
+                        colors: [Color(0xFFF8FAFE), Color(0xFFF1F4FB)],
+                      ),
+                      boxShadow: const [],
+                    ),
+                  ),
+                ),
+                Positioned(
+                  top: -80,
+                  left: -40,
+                  child: Container(
+                    width: 220,
+                    height: 220,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: RadialGradient(
+                        colors: [
+                          const Color(0x331353D8),
+                          const Color(0x001353D8),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+                Positioned(
+                  top: 360,
+                  right: -70,
+                  child: Container(
+                    width: 180,
+                    height: 180,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: RadialGradient(
+                        colors: [
+                          const Color(0x1A002E88),
+                          const Color(0x00002E88),
+                        ],
                       ),
                     ),
                   ),
                 ),
                 Center(
                   child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 980),
+                    constraints: const BoxConstraints(maxWidth: 560),
                     child: ListView(
                       controller: _scrollController,
-                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 110),
+                      padding: const EdgeInsets.fromLTRB(16, 6, 16, 28),
                       children: [
+                        _buildSearchBar(),
+                        const SizedBox(height: 16),
                         _buildHero(),
-                        const SizedBox(height: 18),
+                        const SizedBox(height: 14),
                         _buildAddressPanel(),
-                        const SizedBox(height: 18),
+                        const SizedBox(height: 14),
                         _buildComposerCard(),
-                        const SizedBox(height: 18),
+                        const SizedBox(height: 14),
                         _buildServiceControls(),
-                        const SizedBox(height: 24),
+                        const SizedBox(height: 20),
                         _buildCardsSection(cards),
                       ],
                     ),
-                  ),
-                ),
-                Positioned(
-                  right: 16,
-                  bottom: 20,
-                  child: Column(
-                    children: [
-                      FloatingActionButton.small(
-                        heroTag: 'scroll-top',
-                        onPressed: _scrollToTop,
-                        child: const Icon(Icons.vertical_align_top),
-                      ),
-                      const SizedBox(height: 12),
-                      FloatingActionButton.small(
-                        heroTag: 'scroll-bottom',
-                        onPressed: _scrollToBottom,
-                        child: const Icon(Icons.vertical_align_bottom),
-                      ),
-                    ],
                   ),
                 ),
               ],
@@ -1743,77 +1787,116 @@ connectWs();
   }
 
   Widget _buildHero() {
-    return Padding(
-      padding: const EdgeInsets.only(top: 10),
+    return const Padding(
+      padding: EdgeInsets.only(top: 2),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
+          Text(
             '快速制卡',
             style: TextStyle(
-              fontSize: 40,
-              height: 1.0,
+              fontSize: 26,
+              height: 1.04,
               fontWeight: FontWeight.w900,
-              color: Color(0xFF002E88),
+              color: Color(0xFF00359E),
             ),
           ),
-          const SizedBox(height: 10),
+          SizedBox(height: 6),
           Text(
-            '支持直接输入文本、剪贴板获取或上传文件，一键生成统一风格的分享卡片。',
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  color: const Color(0xFF5F6778),
-                  height: 1.6,
-                ),
+            '支持直接输入文本、剪贴板获取或上传文件，一键生成精致分享卡片。',
+            style: TextStyle(
+              color: Color(0xFF6E7788),
+              height: 1.5,
+              fontSize: 13.5,
+              fontWeight: FontWeight.w500,
+            ),
           ),
         ],
       ),
     );
   }
 
+  Widget _buildSearchBar() {
+    return Container(
+      decoration: _panelDecoration(radius: 20, shadowOpacity: 0.035),
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: TextField(
+        controller: _searchController,
+        decoration: InputDecoration(
+          prefixIcon: const Icon(Icons.search_rounded),
+          hintText: '搜索卡片内容或附件文件名',
+          suffixIcon: _searchController.text.isEmpty
+              ? null
+              : IconButton(
+                  onPressed: () {
+                    setState(() {
+                      _searchController.clear();
+                    });
+                  },
+                  icon: const Icon(Icons.close_rounded),
+                ),
+        ),
+        onChanged: (_) => setState(() {}),
+      ),
+    );
+  }
+
   Widget _buildAddressPanel() {
     return InkWell(
-      borderRadius: BorderRadius.circular(28),
+      borderRadius: BorderRadius.circular(26),
       onTap: _copyServerAddress,
       child: Container(
-        decoration: _panelDecoration(),
-        padding: const EdgeInsets.fromLTRB(18, 18, 18, 16),
+        decoration: _panelDecoration(radius: 26, shadowOpacity: 0.045),
+        padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              '访问地址',
-              style: TextStyle(
-                fontSize: 11,
-                fontWeight: FontWeight.w800,
-                letterSpacing: 3.2,
-                color: Color(0x801353D8),
-              ),
-            ),
-            const SizedBox(height: 8),
-            SelectableText(
-              _serverAddress,
-              style: const TextStyle(
-                fontSize: 28,
-                height: 1.2,
-                fontWeight: FontWeight.w900,
-                color: Color(0xFF002E88),
-              ),
-            ),
-            const SizedBox(height: 8),
             Row(
-              children: const [
-                Icon(Icons.content_copy, size: 16, color: Color(0x801353D8)),
-                SizedBox(width: 6),
-                Expanded(
+              children: [
+                const Expanded(
                   child: Text(
-                    '点击可复制当前真实访问地址，端口自动分配。',
+                    '访问地址',
                     style: TextStyle(
-                      color: Color(0xFF6B7381),
-                      fontSize: 13,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 2.8,
+                      color: Color(0x7A1353D8),
                     ),
                   ),
                 ),
+                Container(
+                  width: 34,
+                  height: 34,
+                  decoration: BoxDecoration(
+                    color: const Color(0x101353D8),
+                    borderRadius: BorderRadius.circular(17),
+                  ),
+                  child: const Icon(
+                    Icons.content_copy_rounded,
+                    size: 16,
+                    color: Color(0xFF1353D8),
+                  ),
+                ),
               ],
+            ),
+            const SizedBox(height: 6),
+            SelectableText(
+              _serverAddress,
+              style: const TextStyle(
+                fontSize: 16,
+                height: 1.28,
+                fontWeight: FontWeight.w800,
+                color: Color(0xFF1143AB),
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              '点击可复制当前真实访问地址，端口自动分配。',
+              style: TextStyle(
+                color: Color(0xFF758094),
+                fontSize: 12.5,
+                height: 1.45,
+              ),
             ),
           ],
         ),
@@ -1823,19 +1906,24 @@ connectWs();
 
   Widget _buildComposerCard() {
     return Container(
-      decoration: _panelDecoration(),
+      decoration: _panelDecoration(radius: 28, shadowOpacity: 0.055),
       child: Padding(
-        padding: const EdgeInsets.all(10),
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             TextField(
               controller: _composerController,
-              minLines: 8,
-              maxLines: 12,
+              minLines: 6,
+              maxLines: 10,
               decoration: const InputDecoration(
                 hintText: '写一句灵感、贴一段内容，或先选择附件再制卡',
                 fillColor: Colors.transparent,
+                hintStyle: TextStyle(
+                  color: Color(0xFF9AA3B2),
+                  height: 1.65,
+                ),
+                contentPadding: EdgeInsets.fromLTRB(12, 12, 12, 6),
                 border: InputBorder.none,
                 enabledBorder: InputBorder.none,
                 focusedBorder: InputBorder.none,
@@ -1867,27 +1955,26 @@ connectWs();
                 }).toList(),
               ),
             ],
-            const Divider(height: 18, color: Color(0xFFE7EBF0)),
+            const Divider(height: 18, color: Color(0xFFE8EDF5)),
             Wrap(
               spacing: 10,
               runSpacing: 10,
-              alignment: WrapAlignment.spaceBetween,
               children: [
                 _buildCapsuleButton(
                   label: _isPickingFiles ? '读取中...' : '选择文件',
-                  icon: Icons.attach_file,
+                  icon: Icons.attach_file_rounded,
                   onTap: _isPickingFiles ? null : _pickFilesFromDevice,
                   variant: _CapsuleButtonVariant.soft,
                 ),
                 _buildCapsuleButton(
                   label: '粘贴文字',
-                  icon: Icons.content_paste,
+                  icon: Icons.content_paste_rounded,
                   onTap: _pasteTextToComposer,
                   variant: _CapsuleButtonVariant.ghost,
                 ),
                 _buildCapsuleButton(
                   label: '清空',
-                  icon: Icons.delete_outline,
+                  icon: Icons.delete_outline_rounded,
                   onTap: () {
                     setState(() {
                       _composerController.clear();
@@ -1896,52 +1983,62 @@ connectWs();
                   },
                   variant: _CapsuleButtonVariant.ghost,
                 ),
-                _buildCapsuleButton(
-                  label: '制卡',
-                  icon: Icons.auto_awesome,
-                  onTap: _createCardFromComposer,
-                  variant: _CapsuleButtonVariant.primary,
-                ),
               ],
             ),
+            const SizedBox(height: 12),
+            _buildPrimaryActionButton(),
           ],
         ),
       ),
     );
   }
 
+  Widget _buildPrimaryActionButton() {
+    return FilledButton.icon(
+      onPressed: _createCardFromComposer,
+      style: FilledButton.styleFrom(
+        backgroundColor: const Color(0xFF1550D7),
+        foregroundColor: Colors.white,
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        elevation: 0,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+        ),
+      ),
+      icon: const Icon(Icons.auto_awesome_rounded, size: 20),
+      label: const Text(
+        '制卡',
+        style: TextStyle(
+          fontWeight: FontWeight.w900,
+          fontSize: 17,
+          letterSpacing: 0.2,
+        ),
+      ),
+    );
+  }
+
   Widget _buildServiceControls() {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final singleColumn = constraints.maxWidth < 620;
-        final items = [
-          _buildServiceCard(
-            icon: Icons.play_arrow,
+    return Row(
+      children: [
+        Expanded(
+          child: _buildServiceCard(
+            icon: Icons.play_arrow_rounded,
             label: '启动服务',
-            subtitle: '随机端口 · 后台同步已就绪',
+            subtitle: '后台同步已就绪',
             onTap: _isServerRunning ? null : _startServer,
           ),
-          _buildServiceCard(
-            icon: Icons.stop,
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: _buildServiceCard(
+            icon: Icons.stop_rounded,
             label: '停止服务',
-            subtitle: '停止后网页访问会中断',
+            subtitle: '停止后访问中断',
             onTap: _isServerRunning ? _stopServer : null,
             isDanger: true,
           ),
-        ];
-        if (singleColumn) {
-          return Column(children: [
-            for (final item in items) ...[item, const SizedBox(height: 12)]
-          ]);
-        }
-        return Row(
-          children: [
-            Expanded(child: items[0]),
-            const SizedBox(width: 12),
-            Expanded(child: items[1]),
-          ],
-        );
-      },
+        ),
+      ],
     );
   }
 
@@ -1950,48 +2047,33 @@ connectWs();
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(
+          crossAxisAlignment: CrossAxisAlignment.end,
           children: [
             const Expanded(
               child: Text(
                 '卡片列表',
                 style: TextStyle(
-                  fontSize: 22,
+                  fontSize: 20,
                   fontWeight: FontWeight.w900,
-                  color: Color(0xFF002E88),
+                  color: Color(0xFF00359E),
                 ),
               ),
             ),
             Text(
               '${cards.length} 张卡片',
-              style: const TextStyle(color: Color(0xFF6B7381)),
+              style: const TextStyle(
+                color: Color(0xFF7C8699),
+                fontWeight: FontWeight.w600,
+              ),
             ),
           ],
-        ),
-        const SizedBox(height: 12),
-        TextField(
-          controller: _searchController,
-          decoration: InputDecoration(
-            prefixIcon: const Icon(Icons.search),
-            hintText: '搜索卡片内容或附件文件名',
-            suffixIcon: _searchController.text.isEmpty
-                ? null
-                : IconButton(
-                    onPressed: () {
-                      setState(() {
-                        _searchController.clear();
-                      });
-                    },
-                    icon: const Icon(Icons.close),
-                  ),
-          ),
-          onChanged: (_) => setState(() {}),
         ),
         const SizedBox(height: 16),
         if (cards.isEmpty)
           Container(
-            decoration: _panelDecoration(),
+            decoration: _panelDecoration(radius: 24, shadowOpacity: 0.04),
             width: double.infinity,
-            padding: const EdgeInsets.all(28),
+            padding: const EdgeInsets.all(24),
             child: Column(
               children: const [
                 Icon(Icons.blur_on, size: 48, color: Color(0x551353D8)),
@@ -2005,26 +2087,13 @@ connectWs();
             ),
           )
         else
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final columns = constraints.maxWidth > 860
-                  ? 3
-                  : constraints.maxWidth > 560
-                      ? 2
-                      : 1;
-              return GridView.builder(
-                itemCount: cards.length,
-                shrinkWrap: true,
-                physics: const NeverScrollableScrollPhysics(),
-                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: columns,
-                  crossAxisSpacing: 14,
-                  mainAxisSpacing: 14,
-                  mainAxisExtent: 340,
-                ),
-                itemBuilder: (context, index) => _buildCardTile(cards[index]),
-              );
-            },
+          Column(
+            children: [
+              for (var i = 0; i < cards.length; i++) ...[
+                _buildCardTile(cards[i]),
+                if (i != cards.length - 1) const SizedBox(height: 14),
+              ],
+            ],
           ),
       ],
     );
@@ -2037,94 +2106,86 @@ connectWs();
         .toList();
 
     return Container(
-      decoration: _panelDecoration(),
-      padding: const EdgeInsets.all(16),
+      decoration: _panelDecoration(radius: 24, shadowOpacity: 0.045),
+      padding: const EdgeInsets.all(15),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
             children: [
-              Expanded(
-                child: Text(
-                  '创建 ${_formatDateTime(card.createdAt)}',
-                  style: const TextStyle(
-                    color: Color(0xFF6B7381),
-                    fontSize: 12,
-                  ),
-                ),
-              ),
-              Text(
-                '更新 ${_formatDateTime(card.updatedAt)}',
-                style: const TextStyle(
-                  color: Color(0xFF6B7381),
-                  fontSize: 12,
-                ),
-              ),
+              _buildMetaPill('创建 ${_formatDateTime(card.createdAt)}'),
+              _buildMetaPill('更新 ${_formatDateTime(card.updatedAt)}'),
+              if (cardAttachments.isNotEmpty)
+                _buildMetaPill('${cardAttachments.length} 个附件'),
             ],
           ),
           const SizedBox(height: 14),
-          Expanded(
-            child: SingleChildScrollView(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    card.text.isEmpty ? '无文本内容' : card.text,
-                    style: const TextStyle(
-                      color: Color(0xFF191C1E),
-                      fontSize: 15,
-                      height: 1.65,
-                      fontWeight: FontWeight.w500,
+          Text(
+            card.text.isEmpty ? '无文本内容' : card.text,
+            style: const TextStyle(
+              color: Color(0xFF1F2430),
+              fontSize: 14.5,
+              height: 1.65,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          if (cardAttachments.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            ...cardAttachments.map(
+              (attachment) => Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF7F9FD),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: const Color(0xFFE2E7F1)),
+                ),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 38,
+                      height: 38,
+                      decoration: BoxDecoration(
+                        color: const Color(0x141353D8),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Icon(
+                        _iconForAttachment(attachment),
+                        color: const Color(0xFF1353D8),
+                      ),
                     ),
-                  ),
-                  if (cardAttachments.isNotEmpty) ...[
-                    const SizedBox(height: 14),
-                    ...cardAttachments.map(
-                      (attachment) => Container(
-                        margin: const EdgeInsets.only(bottom: 8),
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFF5F7FB),
-                          borderRadius: BorderRadius.circular(18),
-                          border: Border.all(color: const Color(0xFFE0E3E5)),
-                        ),
-                        child: Row(
-                          children: [
-                            Icon(_iconForAttachment(attachment),
-                                color: const Color(0xFF1353D8)),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    attachment.name,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    _attachmentLabel(attachment),
-                                    style: const TextStyle(
-                                      color: Color(0xFF6B7381),
-                                      fontSize: 12,
-                                    ),
-                                  ),
-                                ],
-                              ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            attachment.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w800,
+                              fontSize: 14,
                             ),
-                          ],
-                        ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            _attachmentLabel(attachment),
+                            style: const TextStyle(
+                              color: Color(0xFF7A8497),
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ],
-                ],
+                ),
               ),
             ),
-          ),
+          ],
           const SizedBox(height: 12),
           Wrap(
             spacing: 8,
@@ -2159,19 +2220,20 @@ connectWs();
     bool isDanger = false,
   }) {
     return InkWell(
-      borderRadius: BorderRadius.circular(24),
+      borderRadius: BorderRadius.circular(28),
       onTap: onTap,
       child: Opacity(
         opacity: onTap == null ? 0.5 : 1,
         child: Container(
-          decoration: _panelDecoration(),
-          padding: const EdgeInsets.all(18),
+          constraints: const BoxConstraints(minHeight: 142),
+          decoration: _panelDecoration(radius: 24, shadowOpacity: 0.04),
+          padding: const EdgeInsets.all(16),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Container(
-                width: 48,
-                height: 48,
+                width: 42,
+                height: 42,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: isDanger
@@ -2190,13 +2252,17 @@ connectWs();
                 label,
                 style: const TextStyle(
                   fontWeight: FontWeight.w800,
-                  fontSize: 18,
+                  fontSize: 15,
                 ),
               ),
               const SizedBox(height: 4),
               Text(
                 subtitle,
-                style: const TextStyle(color: Color(0xFF6B7381)),
+                style: const TextStyle(
+                  color: Color(0xFF7C8699),
+                  fontSize: 12.5,
+                  height: 1.4,
+                ),
               ),
             ],
           ),
@@ -2235,8 +2301,8 @@ connectWs();
         foregroundColor: foreground,
         elevation: 0,
         padding: EdgeInsets.symmetric(
-          horizontal: compact ? 14 : 18,
-          vertical: compact ? 10 : 14,
+          horizontal: compact ? 14 : 16,
+          vertical: compact ? 9 : 11,
         ),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(999),
@@ -2253,16 +2319,37 @@ connectWs();
     );
   }
 
-  BoxDecoration _panelDecoration() {
+  Widget _buildMetaPill(String text) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF4F7FC),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          fontSize: 12,
+          color: Color(0xFF718097),
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+
+  BoxDecoration _panelDecoration({
+    double radius = 28,
+    double shadowOpacity = 0.08,
+  }) {
     return BoxDecoration(
-      color: Colors.white.withValues(alpha: 0.92),
-      borderRadius: BorderRadius.circular(28),
-      border: Border.all(color: const Color(0xFFE0E3E5)),
-      boxShadow: const [
+      color: Colors.white.withValues(alpha: 0.96),
+      borderRadius: BorderRadius.circular(radius),
+      border: Border.all(color: const Color(0xFFE6EBF3)),
+      boxShadow: [
         BoxShadow(
-          color: Color(0x141353D8),
-          blurRadius: 32,
-          offset: Offset(0, 16),
+          color: Color(0xFF1353D8).withValues(alpha: shadowOpacity),
+          blurRadius: 24,
+          offset: const Offset(0, 12),
         ),
       ],
     );
