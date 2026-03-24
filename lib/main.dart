@@ -1761,10 +1761,10 @@ connectWs();
                 ),
                 Center(
                   child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 560),
+                    constraints: const BoxConstraints(maxWidth: 720),
                     child: ListView(
                       controller: _scrollController,
-                      padding: const EdgeInsets.fromLTRB(16, 6, 16, 28),
+                      padding: const EdgeInsets.fromLTRB(12, 6, 12, 28),
                       children: [
                         _buildSearchBar(),
                         const SizedBox(height: 16),
@@ -1818,13 +1818,22 @@ connectWs();
 
   Widget _buildSearchBar() {
     return Container(
-      decoration: _panelDecoration(radius: 20, shadowOpacity: 0.035),
-      padding: const EdgeInsets.symmetric(horizontal: 2),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.98),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0xFFE4EAF4)),
+      ),
       child: TextField(
         controller: _searchController,
         decoration: InputDecoration(
           prefixIcon: const Icon(Icons.search_rounded),
           hintText: '搜索卡片内容或附件文件名',
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+          fillColor: Colors.transparent,
+          border: InputBorder.none,
+          enabledBorder: InputBorder.none,
+          focusedBorder: InputBorder.none,
           suffixIcon: _searchController.text.isEmpty
               ? null
               : IconButton(
@@ -1836,6 +1845,9 @@ connectWs();
                   icon: const Icon(Icons.close_rounded),
                 ),
         ),
+        style: const TextStyle(fontSize: 14.5, fontWeight: FontWeight.w500),
+        cursorColor: const Color(0xFF1353D8),
+        onTapOutside: (_) => FocusScope.of(context).unfocus(),
         onChanged: (_) => setState(() {}),
       ),
     );
@@ -2107,7 +2119,7 @@ connectWs();
 
     return Container(
       decoration: _panelDecoration(radius: 24, shadowOpacity: 0.045),
-      padding: const EdgeInsets.all(15),
+      padding: const EdgeInsets.all(12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -2127,7 +2139,7 @@ connectWs();
             style: const TextStyle(
               color: Color(0xFF1F2430),
               fontSize: 14.5,
-              height: 1.65,
+              height: 1.6,
               fontWeight: FontWeight.w500,
             ),
           ),
