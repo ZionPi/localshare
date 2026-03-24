@@ -17,6 +17,7 @@ import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const MyApp());
 }
 
@@ -25,50 +26,66 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    const background = Color(0xFFF7F9FB);
+    const primary = Color(0xFF1353D8);
+    const primaryDark = Color(0xFF002E88);
+    const surface = Colors.white;
+
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: '本地分享',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF274E8F),
-          primary: const Color(0xFF274E8F),
-          secondary: const Color(0xFFFFD166),
-          surface: const Color(0xFFF8F5EC),
-        ),
-        scaffoldBackgroundColor: const Color(0xFFF4F1E8),
         useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: primary,
+          primary: primary,
+          secondary: const Color(0xFFD0E1FB),
+          surface: surface,
+          brightness: Brightness.light,
+        ),
+        scaffoldBackgroundColor: background,
         appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFFF4F1E8),
-          foregroundColor: Color(0xFF18212F),
-          centerTitle: false,
+          backgroundColor: background,
+          foregroundColor: primaryDark,
           elevation: 0,
+          centerTitle: false,
           titleTextStyle: TextStyle(
-            color: Color(0xFF18212F),
-            fontSize: 28,
+            color: primaryDark,
+            fontSize: 22,
             fontWeight: FontWeight.w800,
           ),
         ),
-        floatingActionButtonTheme: const FloatingActionButtonThemeData(
-          backgroundColor: Color(0xFFD8E4FF),
-          foregroundColor: Color(0xFF18345F),
-        ),
-        chipTheme: ChipThemeData(
-          backgroundColor: const Color(0xFFFFF6DA),
-          selectedColor: const Color(0xFFFFE08A),
-          deleteIconColor: const Color(0xFF5C6577),
-          side: const BorderSide(color: Color(0xFFE3D7A6)),
-          labelStyle: const TextStyle(
-            color: Color(0xFF18212F),
-            fontWeight: FontWeight.w600,
-          ),
+        snackBarTheme: SnackBarThemeData(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: primaryDark,
+          contentTextStyle: const TextStyle(color: Colors.white),
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(999),
+            borderRadius: BorderRadius.circular(18),
           ),
         ),
         inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: Colors.white,
+          hintStyle: const TextStyle(color: Color(0xFF7C8291)),
+          contentPadding: const EdgeInsets.all(18),
           border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(18),
-            borderSide: const BorderSide(color: Color(0xFFD5D0C6)),
+            borderRadius: BorderRadius.circular(24),
+            borderSide: BorderSide.none,
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(24),
+            borderSide: const BorderSide(color: Color(0xFFE0E3E5)),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(24),
+            borderSide: const BorderSide(color: primary, width: 1.4),
+          ),
+        ),
+        cardTheme: CardThemeData(
+          elevation: 0,
+          color: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(28),
           ),
         ),
       ),
@@ -107,11 +124,6 @@ class CardAttachment {
   final AttachmentKind kind;
   final DateTime createdAt;
 
-  String get extension {
-    final index = name.lastIndexOf('.');
-    return index == -1 ? '' : name.substring(index + 1).toLowerCase();
-  }
-
   bool get isPreviewable =>
       kind == AttachmentKind.image ||
       kind == AttachmentKind.audio ||
@@ -141,6 +153,7 @@ class CardAttachment {
       'kind': kind.name,
       'createdAt': createdAt.toIso8601String(),
       'downloadUrl': '/files/$id',
+      'previewUrl': '/files/$id?view=1',
       'previewable': isPreviewable,
     };
   }
@@ -217,9 +230,197 @@ class CardItem {
   }
 }
 
+class LocalShareStorage {
+  LocalShareStorage._(this.rootDir)
+      : attachmentsDir = Directory('${rootDir.path}/attachments'),
+        stateFile = File('${rootDir.path}/cards_state_v2.json'),
+        backupDir = Directory('${rootDir.path}/backups');
+
+  static const String legacyDocumentKey = 'document_content';
+  static const String legacyAppStateKey = 'cards_state_v1';
+  static const int schemaVersion = 2;
+
+  final Directory rootDir;
+  final Directory attachmentsDir;
+  final File stateFile;
+  final Directory backupDir;
+
+  static Future<LocalShareStorage> create() async {
+    Directory baseDir;
+    try {
+      baseDir = await getApplicationSupportDirectory();
+    } catch (_) {
+      try {
+        baseDir = await getApplicationDocumentsDirectory();
+      } catch (_) {
+        baseDir = Directory('${Directory.systemTemp.path}/localshare_data');
+      }
+    }
+    final root = Directory('${baseDir.path}/localshare');
+    if (!await root.exists()) {
+      await root.create(recursive: true);
+    }
+    return LocalShareStorage._(root);
+  }
+
+  Future<void> ensureReady() async {
+    if (!await attachmentsDir.exists()) {
+      await attachmentsDir.create(recursive: true);
+    }
+    if (!await backupDir.exists()) {
+      await backupDir.create(recursive: true);
+    }
+  }
+
+  Future<PersistedState> loadState() async {
+    await ensureReady();
+    if (await stateFile.exists()) {
+      try {
+        return _decodeState(await stateFile.readAsString());
+      } catch (_) {
+        final fallback = await _loadLatestBackup();
+        if (fallback != null) {
+          return fallback;
+        }
+        rethrow;
+      }
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    final savedState = prefs.getString(legacyAppStateKey);
+    if (savedState != null && savedState.isNotEmpty) {
+      await _writeBackup('legacy-migration', savedState);
+      final decoded = _decodeState(savedState, allowLegacyEnvelope: true);
+      await saveState(decoded.cards, decoded.attachments);
+      return decoded;
+    }
+
+    final legacyContent = prefs.getString(legacyDocumentKey) ?? '';
+    if (legacyContent.trim().isNotEmpty) {
+      final now = DateTime.now();
+      final migrated = PersistedState(
+        cards: <CardItem>[
+          CardItem(
+            id: 'card-${now.microsecondsSinceEpoch}',
+            text: legacyContent,
+            createdAt: now,
+            updatedAt: now,
+          ),
+        ],
+        attachments: <CardAttachment>[],
+      );
+      await _writeBackup(
+        'legacy-text',
+        jsonEncode({'document_content': legacyContent}),
+      );
+      await saveState(migrated.cards, migrated.attachments);
+      return migrated;
+    }
+
+    return const PersistedState(
+        cards: <CardItem>[], attachments: <CardAttachment>[]);
+  }
+
+  Future<PersistedState?> _loadLatestBackup() async {
+    if (!await backupDir.exists()) {
+      return null;
+    }
+    final files = await backupDir
+        .list()
+        .where((entity) => entity is File && entity.path.endsWith('.json'))
+        .cast<File>()
+        .toList();
+    if (files.isEmpty) {
+      return null;
+    }
+    files.sort((a, b) => b.path.compareTo(a.path));
+    for (final file in files) {
+      try {
+        return _decodeState(await file.readAsString(),
+            allowLegacyEnvelope: true);
+      } catch (_) {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  PersistedState _decodeState(String source,
+      {bool allowLegacyEnvelope = false}) {
+    final decoded = jsonDecode(source) as Map<String, dynamic>;
+    final cardsJson = decoded['cards'] as List<dynamic>? ?? <dynamic>[];
+    final attachmentsJson =
+        decoded['attachments'] as List<dynamic>? ?? <dynamic>[];
+
+    if (!allowLegacyEnvelope && !decoded.containsKey('version')) {
+      throw const FormatException('Missing state version');
+    }
+
+    return PersistedState(
+      cards: cardsJson
+          .map((item) => CardItem.fromJson(item as Map<String, dynamic>))
+          .toList(),
+      attachments: attachmentsJson
+          .map((item) => CardAttachment.fromJson(item as Map<String, dynamic>))
+          .toList(),
+    );
+  }
+
+  Future<void> saveState(
+    List<CardItem> cards,
+    Iterable<CardAttachment> attachments,
+  ) async {
+    await ensureReady();
+    final payload = jsonEncode({
+      'version': schemaVersion,
+      'savedAt': DateTime.now().toIso8601String(),
+      'cards': cards.map((card) => card.toJson()).toList(),
+      'attachments':
+          attachments.map((attachment) => attachment.toJson()).toList(),
+    });
+
+    if (await stateFile.exists()) {
+      try {
+        await _writeBackup('autosave', await stateFile.readAsString());
+      } catch (_) {}
+    }
+
+    final tempFile = File('${stateFile.path}.tmp');
+    await tempFile.writeAsString(payload, flush: true);
+    if (await stateFile.exists()) {
+      await stateFile.delete();
+    }
+    await tempFile.rename(stateFile.path);
+  }
+
+  Future<void> _writeBackup(String reason, String payload) async {
+    await ensureReady();
+    final file = File(
+      '${backupDir.path}/${DateTime.now().millisecondsSinceEpoch}_$reason.json',
+    );
+    await file.writeAsString(payload, flush: true);
+  }
+}
+
+class PersistedState {
+  const PersistedState({required this.cards, required this.attachments});
+
+  final List<CardItem> cards;
+  final List<CardAttachment> attachments;
+}
+
+class MyHomePage extends StatefulWidget {
+  const MyHomePage({super.key, required this.title});
+
+  final String title;
+
+  @override
+  State<MyHomePage> createState() => _MyHomePageState();
+}
+
 class _MyHomePageState extends State<MyHomePage> {
-  static const String _legacyDocumentKey = 'document_content';
-  static const String _appStateKey = 'cards_state_v1';
+  static const MethodChannel _lifecycleChannel =
+      MethodChannel('localshare/lifecycle');
 
   final TextEditingController _composerController = TextEditingController();
   final TextEditingController _searchController = TextEditingController();
@@ -227,20 +428,21 @@ class _MyHomePageState extends State<MyHomePage> {
   final List<WebSocketChannel> _webSocketClients = <WebSocketChannel>[];
   final Random _random = Random();
 
-  HttpServer? _server;
-  StreamSubscription? _intentDataStreamSubscription;
-  Timer? _saveDebounceTimer;
-  Timer? _broadcastDebounceTimer;
-
   final List<CardItem> _cards = <CardItem>[];
   final Map<String, CardAttachment> _attachments = <String, CardAttachment>{};
   final List<_IncomingAttachmentPayload> _pendingAttachments =
       <_IncomingAttachmentPayload>[];
 
-  String _serverAddress = '服务器未启动';
+  LocalShareStorage? _storage;
+  HttpServer? _server;
+  StreamSubscription? _intentDataStreamSubscription;
+  Timer? _saveDebounceTimer;
+  Timer? _broadcastDebounceTimer;
+
+  String _serverAddress = '服务启动中';
   bool _isServerRunning = false;
   bool _isPickingFiles = false;
-  Directory? _storageDirectory;
+  bool _isLoading = true;
 
   @override
   void initState() {
@@ -249,14 +451,26 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _initializeApp() async {
-    await _ensureStorageDirectory();
-    await _loadAppState();
-    await _setupSharingHandlers();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_isServerRunning) {
-        _startServer();
+    try {
+      _storage = await LocalShareStorage.create();
+      final state = await _storage!.loadState();
+      _cards
+        ..clear()
+        ..addAll(state.cards);
+      _attachments
+        ..clear()
+        ..addEntries(state.attachments.map((e) => MapEntry(e.id, e)));
+      await _setupSharingHandlers();
+      await _startServer();
+    } catch (error) {
+      _showToast('初始化失败: $error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
       }
-    });
+    }
   }
 
   @override
@@ -294,82 +508,22 @@ class _MyHomePageState extends State<MyHomePage> {
     return items;
   }
 
-  Future<void> _ensureStorageDirectory() async {
-    if (_storageDirectory != null) {
+  Future<void> _persistStateNow() async {
+    if (_storage == null) {
       return;
     }
-    try {
-      final docsDir = await getApplicationDocumentsDirectory();
-      _storageDirectory = Directory('${docsDir.path}/localshare_attachments');
-    } catch (_) {
-      _storageDirectory =
-          Directory('${Directory.systemTemp.path}/localshare_attachments');
-    }
-    if (!await _storageDirectory!.exists()) {
-      await _storageDirectory!.create(recursive: true);
-    }
-  }
-
-  Future<void> _loadAppState() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final savedState = prefs.getString(_appStateKey);
-      if (savedState != null && savedState.isNotEmpty) {
-        final decoded = jsonDecode(savedState) as Map<String, dynamic>;
-        final cardsJson = decoded['cards'] as List<dynamic>? ?? <dynamic>[];
-        final attachmentsJson =
-            decoded['attachments'] as List<dynamic>? ?? <dynamic>[];
-        _cards
-          ..clear()
-          ..addAll(cardsJson
-              .map((item) => CardItem.fromJson(item as Map<String, dynamic>)));
-        _attachments
-          ..clear()
-          ..addEntries(attachmentsJson
-              .map((item) =>
-                  CardAttachment.fromJson(item as Map<String, dynamic>))
-              .map((attachment) => MapEntry(attachment.id, attachment)));
-      } else {
-        final legacyContent = prefs.getString(_legacyDocumentKey) ?? '';
-        if (legacyContent.trim().isNotEmpty) {
-          final now = DateTime.now();
-          _cards.add(
-            CardItem(
-              id: _generateId('card'),
-              text: legacyContent,
-              createdAt: now,
-              updatedAt: now,
-            ),
-          );
-          await prefs.remove(_legacyDocumentKey);
-          await _persistState();
-        }
-      }
-
-      if (mounted) {
-        setState(() {});
-      }
-    } catch (error) {
-      if (mounted) {
-        setState(() {});
-      }
-    }
-  }
-
-  Future<void> _persistState() async {
-    final prefs = await SharedPreferences.getInstance();
-    final state = jsonEncode({
-      'cards': _cards.map((card) => card.toJson()).toList(),
-      'attachments':
-          _attachments.values.map((attachment) => attachment.toJson()).toList(),
-    });
-    await prefs.setString(_appStateKey, state);
+    await _storage!.saveState(_cards, _attachments.values);
   }
 
   void _schedulePersist() {
     _saveDebounceTimer?.cancel();
-    _saveDebounceTimer = Timer(const Duration(milliseconds: 200), () {
-      _persistState();
+    _saveDebounceTimer = Timer(const Duration(milliseconds: 200), () async {
+      try {
+        await _persistStateNow();
+      } catch (error) {
+        _showToast('保存失败，请稍后重试');
+        debugPrint('persist failed: $error');
+      }
     });
   }
 
@@ -377,19 +531,22 @@ class _MyHomePageState extends State<MyHomePage> {
     try {
       _intentDataStreamSubscription = ReceiveSharingIntent.instance
           .getMediaStream()
-          .listen(_consumeSharedItems, onError: (Object error) {});
+          .listen((items) => _consumeSharedItems(items, autoClose: true));
       final initialItems =
           await ReceiveSharingIntent.instance.getInitialMedia();
       if (initialItems.isNotEmpty) {
-        await _consumeSharedItems(initialItems);
+        await _consumeSharedItems(initialItems, autoClose: true);
         await ReceiveSharingIntent.instance.reset();
       }
     } catch (_) {
-      // Ignore plugin failures in tests or unsupported platforms.
+      // Unsupported platform/test env.
     }
   }
 
-  Future<void> _consumeSharedItems(List<SharedMediaFile> files) async {
+  Future<void> _consumeSharedItems(
+    List<SharedMediaFile> files, {
+    required bool autoClose,
+  }) async {
     if (files.isEmpty) {
       return;
     }
@@ -425,13 +582,31 @@ class _MyHomePageState extends State<MyHomePage> {
     final textContent =
         textParts.where((value) => value.isNotEmpty).join('\n\n');
     final fallbackText = filePayloads.length == 1
-        ? '收到文件: ${filePayloads.first.name}'
+        ? '收到文件：${filePayloads.first.name}'
         : '收到 ${filePayloads.length} 个文件';
 
-    await _createCard(
-      text: textContent.isNotEmpty ? textContent : fallbackText,
-      attachments: filePayloads,
-    );
+    try {
+      await _createCard(
+        text: textContent.isNotEmpty ? textContent : fallbackText,
+        attachments: filePayloads,
+      );
+      _showToast('已保存到本地分享');
+      if (autoClose && Platform.isAndroid) {
+        await Future<void>.delayed(const Duration(milliseconds: 220));
+        await _closeAfterShareIfNeeded();
+      }
+    } catch (error) {
+      _showToast('保存分享内容失败');
+      debugPrint('share consume failed: $error');
+    }
+  }
+
+  Future<void> _closeAfterShareIfNeeded() async {
+    try {
+      await _lifecycleChannel.invokeMethod<void>('closeApp');
+    } catch (_) {
+      await SystemNavigator.pop();
+    }
   }
 
   String _basename(String path) {
@@ -466,7 +641,7 @@ class _MyHomePageState extends State<MyHomePage> {
       }
     }
 
-    _schedulePersist();
+    await _persistStateNow();
     if (notify) {
       _broadcastSnapshot();
     }
@@ -483,10 +658,14 @@ class _MyHomePageState extends State<MyHomePage> {
     required String mimeType,
     bool notify = true,
   }) async {
-    await _ensureStorageDirectory();
+    final storage = _storage;
+    if (storage == null) {
+      throw StateError('Storage not initialized');
+    }
+    await storage.ensureReady();
     final safeName = _sanitizeFileName(fileName ?? 'attachment');
     final attachmentId = _generateId('file');
-    final targetPath = '${_storageDirectory!.path}/$attachmentId-$safeName';
+    final targetPath = '${storage.attachmentsDir.path}/$attachmentId-$safeName';
     final file = File(targetPath);
     await file.writeAsBytes(bytes, flush: true);
 
@@ -508,8 +687,8 @@ class _MyHomePageState extends State<MyHomePage> {
       card.updatedAt = DateTime.now();
     }
 
-    _schedulePersist();
     if (notify) {
+      await _persistStateNow();
       _broadcastSnapshot();
     }
     return attachment;
@@ -539,7 +718,7 @@ class _MyHomePageState extends State<MyHomePage> {
       }
     }
     _cards.removeWhere((item) => item.id == cardId);
-    _schedulePersist();
+    await _persistStateNow();
     _broadcastSnapshot();
     if (mounted) {
       setState(() {});
@@ -548,11 +727,26 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Future<void> _copyCardText(String text) async {
     await Clipboard.setData(ClipboardData(text: text));
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('卡片内容已复制')),
-      );
+    _showToast(text.trim().isEmpty ? '空卡片已复制' : '卡片内容已复制');
+  }
+
+  void _showToast(String message) {
+    if (!mounted) {
+      return;
     }
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    messenger
+      ?..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _copyServerAddress() async {
+    if (!_isServerRunning) {
+      _showToast('服务尚未启动');
+      return;
+    }
+    await Clipboard.setData(ClipboardData(text: _serverAddress));
+    _showToast('访问地址已复制');
   }
 
   Future<void> _createCardFromComposer() async {
@@ -576,11 +770,7 @@ class _MyHomePageState extends State<MyHomePage> {
     final clipboardData = await Clipboard.getData(Clipboard.kTextPlain);
     final text = clipboardData?.text?.trim();
     if (text == null || text.isEmpty) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('剪贴板里没有可粘贴的文字')),
-        );
-      }
+      _showToast('剪贴板里没有可粘贴的文字');
       return;
     }
 
@@ -640,11 +830,7 @@ class _MyHomePageState extends State<MyHomePage> {
         });
       }
     } catch (error) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('选择文件失败: $error')),
-        );
-      }
+      _showToast('选择文件失败: $error');
     } finally {
       if (mounted) {
         setState(() {
@@ -725,7 +911,7 @@ class _MyHomePageState extends State<MyHomePage> {
         return router.call(request);
       }
 
-      _server = await shelf_io.serve(handler, ipAddress, 8080, shared: true);
+      _server = await shelf_io.serve(handler, ipAddress, 0, shared: true);
       if (mounted) {
         setState(() {
           _serverAddress = 'http://${_server!.address.host}:${_server!.port}';
@@ -765,10 +951,24 @@ class _MyHomePageState extends State<MyHomePage> {
     try {
       final wifiInfo = NetworkInfo();
       final ip = await wifiInfo.getWifiIP();
-      return ip ?? '127.0.0.1';
-    } catch (_) {
-      return '127.0.0.1';
-    }
+      if (ip != null && ip.isNotEmpty) {
+        return ip;
+      }
+    } catch (_) {}
+    try {
+      final interfaces = await NetworkInterface.list(
+        includeLoopback: false,
+        type: InternetAddressType.IPv4,
+      );
+      for (final interface in interfaces) {
+        for (final address in interface.addresses) {
+          if (!address.isLoopback) {
+            return address.address;
+          }
+        }
+      }
+    } catch (_) {}
+    return '127.0.0.1';
   }
 
   Map<String, dynamic> _buildSnapshot() {
@@ -779,6 +979,7 @@ class _MyHomePageState extends State<MyHomePage> {
       'type': 'cardsSnapshot',
       'cards': cards,
       'serverTime': DateTime.now().toIso8601String(),
+      'address': _serverAddress,
     };
   }
 
@@ -910,14 +1111,17 @@ class _MyHomePageState extends State<MyHomePage> {
     if (!await file.exists()) {
       return Response.notFound('File missing');
     }
+    final isPreview = request.url.queryParameters['view'] == '1';
     final bytes = await file.readAsBytes();
     return Response.ok(
       bytes,
       headers: {
         'content-type': attachment.mimeType,
         'content-length': bytes.length.toString(),
-        'content-disposition':
-            'inline; filename="${Uri.encodeComponent(attachment.name)}"',
+        'cache-control': 'no-cache',
+        'content-disposition': isPreview
+            ? 'inline; filename="${Uri.encodeComponent(attachment.name)}"'
+            : 'attachment; filename="${Uri.encodeComponent(attachment.name)}"',
       },
     );
   }
@@ -1070,424 +1274,405 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   String _generateHtmlPage() {
-    final wsUrl =
-        'ws://${_server?.address.host ?? '127.0.0.1'}:${_server?.port ?? 8080}/ws';
+    final host = _server?.address.host ?? '127.0.0.1';
+    final port = _server?.port ?? 0;
+    final wsUrl = 'ws://$host:$port/ws';
     return '''
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html class="light" lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>本地提效工具</title>
-  <style>
-    :root {
-      --bg: #f5f3ea;
-      --panel: rgba(255,255,255,0.88);
-      --line: rgba(18,39,64,0.12);
-      --text: #14263f;
-      --muted: #607088;
-      --accent: #0f6c5a;
-      --accent-soft: #d7f0e5;
-      --shadow: 0 18px 40px rgba(16,31,51,0.12);
-      --danger: #9c2f2f;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "PingFang SC", "Noto Sans SC", sans-serif;
-      color: var(--text);
-      background:
-        radial-gradient(circle at top right, rgba(15,108,90,0.14), transparent 28%),
-        linear-gradient(180deg, #f9f7f1 0%, var(--bg) 100%);
-    }
-    .shell {
-      max-width: 1120px;
-      margin: 0 auto;
-      padding: 18px 16px 120px;
-    }
-    .hero, .composer, .card {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(12px);
-      border-radius: 24px;
-    }
-    .hero {
-      padding: 18px;
-      margin-bottom: 16px;
-      display: grid;
-      gap: 12px;
-    }
-    .hero-top {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-    .hero h1 {
-      font-size: 28px;
-      margin: 0;
-      letter-spacing: -0.03em;
-    }
-    .status {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--muted);
-      font-size: 14px;
-    }
-    .dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 999px;
-      background: #c28c27;
-    }
-    .dot.connected { background: #0f6c5a; }
-    .hero-grid {
-      display: grid;
-      grid-template-columns: minmax(0, 1.5fr) minmax(240px, 0.9fr);
-      gap: 12px;
-    }
-    .hero-grid input, .composer textarea, .composer input {
-      width: 100%;
-      border: 1px solid rgba(20,38,63,0.14);
-      border-radius: 16px;
-      padding: 14px;
-      font: inherit;
-      background: rgba(255,255,255,0.85);
-      color: var(--text);
-    }
-    .composer {
-      padding: 18px;
-      margin-bottom: 18px;
-    }
-    .composer-actions, .toolbar {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin-top: 12px;
-    }
-    button {
-      border: 0;
-      border-radius: 999px;
-      padding: 10px 16px;
-      cursor: pointer;
-      font: inherit;
-      color: white;
-      background: var(--text);
-    }
-    button.secondary {
-      background: white;
-      color: var(--text);
-      border: 1px solid var(--line);
-    }
-    button.accent {
-      background: var(--accent);
-    }
-    button.danger {
-      background: var(--danger);
-    }
-    .toolbar {
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 10px;
-    }
-    .cards {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 14px;
-    }
-    .card {
-      padding: 16px;
-      display: grid;
-      gap: 12px;
-      align-content: start;
-    }
-    .card-meta {
-      color: var(--muted);
-      font-size: 13px;
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-    }
-    .card-text {
-      white-space: pre-wrap;
-      line-height: 1.5;
-      word-break: break-word;
-    }
-    .attachment-list {
-      display: grid;
-      gap: 8px;
-    }
-    .attachment {
-      border: 1px solid rgba(20,38,63,0.1);
-      border-radius: 18px;
-      padding: 10px;
-      background: rgba(15,108,90,0.05);
-      display: grid;
-      gap: 8px;
-    }
-    .attachment-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-    .preview {
-      width: 100%;
-      border-radius: 12px;
-      border: 1px solid rgba(20,38,63,0.08);
-      background: white;
-    }
-    .floating {
-      position: fixed;
-      right: 16px;
-      bottom: 16px;
-      display: grid;
-      gap: 10px;
-    }
-    .empty {
-      padding: 28px;
-      border: 1px dashed rgba(20,38,63,0.2);
-      border-radius: 24px;
-      color: var(--muted);
-      text-align: center;
-      background: rgba(255,255,255,0.7);
-    }
-    @media (max-width: 720px) {
-      .hero-grid {
-        grid-template-columns: 1fr;
-      }
-      .cards {
-        grid-template-columns: 1fr;
-      }
-      .floating {
-        right: 12px;
-        bottom: 12px;
-      }
-      .hero h1 {
-        font-size: 24px;
-      }
-    }
-  </style>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>本地分享 - 快速制卡</title>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;700;800&amp;family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet"/>
+<style>
+:root {
+  --primary: #1353d8;
+  --primary-dark: #002e88;
+  --secondary-container: #d0e1fb;
+  --background: #f7f9fb;
+  --surface: #ffffff;
+  --surface-2: #f2f4f6;
+  --text: #191c1e;
+  --muted: #667085;
+  --outline: #d8dee8;
+  --error: #ba1a1a;
+  --shadow: 0 18px 44px rgba(19,83,216,.09);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: Inter, sans-serif;
+  background: radial-gradient(circle at top left, rgba(19,83,216,.08), transparent 28%), var(--background);
+  color: var(--text);
+}
+a { color: inherit; }
+button, textarea, input { font: inherit; }
+button { cursor: pointer; }
+.shell { max-width: 1080px; margin: 0 auto; padding: 24px 18px 120px; }
+.header {
+  position: sticky; top: 0; z-index: 50; backdrop-filter: blur(18px);
+  background: rgba(247,249,251,.82); border-bottom: 1px solid rgba(216,222,232,.7);
+}
+.header-inner { max-width: 1080px; margin: 0 auto; padding: 14px 18px; display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.brand { display:flex; align-items:center; gap:10px; color: var(--primary-dark); font-weight:800; font-family: Manrope, sans-serif; font-size: 20px; }
+.hero h1 { margin: 0; font-family: Manrope, sans-serif; font-size: clamp(34px, 5vw, 48px); line-height: 1.02; color: var(--primary-dark); }
+.hero p { margin: 10px 0 0; max-width: 420px; color: var(--muted); line-height: 1.6; }
+.panel { background: rgba(255,255,255,.86); border: 1px solid rgba(216,222,232,.84); border-radius: 28px; box-shadow: var(--shadow); }
+.address-panel { margin-top: 22px; padding: 18px 20px; }
+.address-label { font-size: 11px; font-weight: 800; letter-spacing: .24em; color: rgba(19,83,216,.5); text-transform: uppercase; font-family: Manrope, sans-serif; }
+.address-code { display:block; margin-top: 8px; font-size: clamp(22px, 4vw, 34px); font-weight: 800; color: var(--primary-dark); text-decoration: none; word-break: break-all; }
+.address-hint { margin-top: 8px; display:flex; align-items:center; justify-content:space-between; gap:10px; color: var(--muted); font-size: 13px; }
+.composer { margin-top: 20px; padding: 12px; }
+.composer textarea {
+  width: 100%; min-height: 210px; padding: 24px; border: 0; resize: vertical; background: transparent; color: var(--text); outline: none;
+}
+.composer-toolbar { border-top: 1px solid rgba(216,222,232,.7); padding: 14px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.btn { border: 0; border-radius: 999px; padding: 12px 18px; transition: transform .15s ease, opacity .15s ease, background .15s ease; }
+.btn:active { transform: scale(.98); }
+.btn-primary { background: linear-gradient(90deg, var(--primary-dark), var(--primary)); color: white; font-weight: 800; box-shadow: 0 18px 34px rgba(19,83,216,.24); }
+.btn-soft { background: rgba(208,225,251,.62); color: #385171; font-weight: 700; }
+.btn-ghost { background: var(--surface-2); color: var(--muted); font-weight: 700; }
+.btn-danger { background: rgba(186,26,26,.08); color: var(--error); font-weight: 700; }
+.chips { display:flex; flex-wrap:wrap; gap:8px; margin-top: 12px; }
+.chip { padding: 8px 12px; border-radius: 999px; background: var(--surface-2); color: #435067; font-size: 13px; }
+.grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 18px; }
+.control { padding: 20px; display:flex; flex-direction:column; gap:12px; }
+.control .icon { width: 48px; height: 48px; border-radius: 999px; display:grid; place-items:center; background: rgba(19,83,216,.08); color: var(--primary); }
+.control.danger .icon { background: rgba(186,26,26,.08); color: var(--error); }
+.section-head { margin: 24px 0 12px; display:flex; align-items:flex-end; justify-content:space-between; gap:12px; }
+.section-title { font-family: Manrope, sans-serif; font-size: 22px; font-weight: 800; color: var(--primary-dark); }
+.section-subtitle { color: var(--muted); font-size: 14px; }
+.search-row { display:flex; gap:12px; flex-wrap:wrap; }
+.search-row input { flex: 1 1 280px; border: 1px solid var(--outline); background:white; border-radius: 18px; padding: 14px 16px; }
+.cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+.card { padding: 18px; }
+.card-top { display:flex; justify-content:space-between; gap:12px; color: var(--muted); font-size: 12px; }
+.card-text { margin-top: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 15px; }
+.attachment-list { display:grid; gap: 10px; margin-top: 14px; }
+.attachment { border: 1px solid var(--outline); background: #fbfcff; border-radius: 18px; padding: 12px; }
+.attachment-row { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+.preview { width: 100%; margin-top: 10px; border-radius: 14px; border: 1px solid rgba(216,222,232,.8); background: white; max-height: 320px; object-fit: cover; }
+.card-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top: 14px; }
+.empty { padding: 32px; text-align:center; color: var(--muted); border: 1px dashed var(--outline); border-radius: 28px; background: rgba(255,255,255,.72); }
+.toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px); opacity: 0; background: rgba(25,28,30,.92); color:white; padding: 12px 16px; border-radius: 14px; transition: all .22s ease; z-index: 120; pointer-events: none; }
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.status-dot { width: 10px; height: 10px; border-radius:999px; background:#98a2b3; display:inline-block; }
+.status-dot.connected { background:#12b76a; }
+@media (max-width: 720px) {
+  .shell { padding-top: 18px; }
+  .grid { grid-template-columns: 1fr; }
+  .cards { grid-template-columns: 1fr; }
+  .address-hint { align-items:flex-start; flex-direction:column; }
+}
+</style>
 </head>
 <body>
-  <div class="shell">
-    <section class="hero">
-      <div class="hero-top">
-        <h1>本地提效工具</h1>
-        <div class="status"><span id="statusDot" class="dot"></span><span id="statusText">连接中</span></div>
-      </div>
-      <div class="hero-grid">
-        <input id="searchInput" placeholder="搜索卡片内容或附件文件名">
-        <div class="status">默认排序: 最新优先</div>
-      </div>
-    </section>
+<header class="header">
+  <div class="header-inner">
+    <div class="brand"><span class="material-symbols-outlined">share</span><span>本地分享</span></div>
+    <div style="display:flex;align-items:center;gap:8px;color:#667085;font-size:14px;"><span id="statusDot" class="status-dot"></span><span id="statusText">连接中</span></div>
+  </div>
+</header>
+<main class="shell">
+  <section class="hero">
+    <h1>快速制卡</h1>
+    <p>支持直接输入文本、剪贴板获取或上传文件，一键生成统一风格的分享卡片，手机和电脑端显示保持一致。</p>
+  </section>
 
-    <section class="composer">
-      <textarea id="composerInput" rows="5" placeholder="输入文本后点击制卡，支持附加图片、音视频、文档和其它文件"></textarea>
-      <div class="composer-actions">
-        <button id="createBtn" class="accent">制卡</button>
-        <button id="clearBtn" class="secondary">清空输入框</button>
-        <button id="pickFilesBtn" class="secondary">选择附件</button>
-        <input id="fileInput" type="file" multiple hidden>
-      </div>
-      <div id="pickedFiles" class="status" style="margin-top:10px;">未选择附件</div>
-    </section>
-
-    <div class="toolbar">
-      <div id="countText" class="status">0 张卡片</div>
-      <button id="refreshBtn" class="secondary">刷新</button>
+  <section class="panel address-panel" id="copyAddressBtn" role="button" tabindex="0">
+    <div class="address-label">访问地址</div>
+    <code class="address-code" id="addressText"></code>
+    <div class="address-hint">
+      <span>点击复制当前真实访问地址，端口为自动分配。</span>
+      <span style="display:flex;align-items:center;gap:6px;color:rgba(19,83,216,.65);"><span class="material-symbols-outlined" style="font-size:18px;">content_copy</span>点击可复制</span>
     </div>
+  </section>
 
-    <div id="cardsRoot" class="cards"></div>
-  </div>
+  <section class="panel composer">
+    <textarea id="composerInput" placeholder="写一句灵感、贴一段内容，或先选择附件再制卡"></textarea>
+    <div id="pickedFiles" class="chips"></div>
+    <div class="composer-toolbar">
+      <button id="pickFilesBtn" class="btn btn-soft">选择文件</button>
+      <button id="pasteBtn" class="btn btn-ghost">粘贴文字</button>
+      <button id="clearBtn" class="btn btn-ghost">清空</button>
+      <div style="flex:1"></div>
+      <button id="createBtn" class="btn btn-primary">制卡</button>
+      <input id="fileInput" type="file" multiple hidden>
+    </div>
+  </section>
 
-  <div class="floating">
-    <button class="secondary" onclick="window.scrollTo({top: 0, behavior: 'smooth'})">到顶</button>
-    <button class="secondary" onclick="window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'})">到底</button>
-  </div>
+  <section class="grid">
+    <div class="panel control" id="startBtn">
+      <div class="icon"><span class="material-symbols-outlined">play_arrow</span></div>
+      <div>
+        <div style="font-weight:800;">启动服务</div>
+        <div style="margin-top:4px;color:#667085;font-size:12px;">随机端口 · 后台同步已就绪</div>
+      </div>
+    </div>
+    <div class="panel control danger" id="stopBtn">
+      <div class="icon"><span class="material-symbols-outlined">stop</span></div>
+      <div>
+        <div style="font-weight:800;">停止服务</div>
+        <div style="margin-top:4px;color:#667085;font-size:12px;">停止后网页访问会中断</div>
+      </div>
+    </div>
+  </section>
 
-  <script>
-    const wsUrl = ${jsonEncode(wsUrl)};
-    const cardsRoot = document.getElementById('cardsRoot');
-    const searchInput = document.getElementById('searchInput');
-    const composerInput = document.getElementById('composerInput');
-    const fileInput = document.getElementById('fileInput');
-    const pickedFiles = document.getElementById('pickedFiles');
-    const countText = document.getElementById('countText');
-    const statusText = document.getElementById('statusText');
-    const statusDot = document.getElementById('statusDot');
-    let cards = [];
-    let pendingFiles = [];
-    let socket;
+  <section class="section-head">
+    <div>
+      <div class="section-title">卡片列表</div>
+      <div class="section-subtitle" id="countText">0 张卡片</div>
+    </div>
+    <div class="search-row">
+      <input id="searchInput" placeholder="搜索卡片内容或附件文件名">
+      <button id="refreshBtn" class="btn btn-ghost">刷新</button>
+    </div>
+  </section>
 
-    function escapeHtml(value) {
-      return value
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;')
-        .replaceAll("'", '&#39;');
-    }
+  <section id="cardsRoot" class="cards"></section>
+</main>
+<div id="toast" class="toast"></div>
+<script>
+const wsUrl = ${jsonEncode(wsUrl)};
+const initialAddress = ${jsonEncode(_serverAddress)};
+const cardsRoot = document.getElementById('cardsRoot');
+const searchInput = document.getElementById('searchInput');
+const composerInput = document.getElementById('composerInput');
+const fileInput = document.getElementById('fileInput');
+const pickedFiles = document.getElementById('pickedFiles');
+const countText = document.getElementById('countText');
+const statusText = document.getElementById('statusText');
+const statusDot = document.getElementById('statusDot');
+const addressText = document.getElementById('addressText');
+const toast = document.getElementById('toast');
+let cards = [];
+let pendingFiles = [];
+let socket;
+addressText.textContent = initialAddress;
 
-    function formatBytes(bytes) {
-      if (bytes < 1024) return bytes + ' B';
-      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-      if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
-      return (bytes / 1024 / 1024 / 1024).toFixed(1) + ' GB';
-    }
+function showToast(message) {
+  toast.textContent = message;
+  toast.classList.add('show');
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => toast.classList.remove('show'), 1800);
+}
 
-    function renderCards() {
-      const query = searchInput.value.trim().toLowerCase();
-      const filtered = cards.filter(card => {
-        if (!query) return true;
-        if ((card.text || '').toLowerCase().includes(query)) return true;
-        return (card.attachments || []).some(file => (file.name || '').toLowerCase().includes(query));
-      });
+function escapeHtml(value) {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
 
-      countText.textContent = filtered.length + ' 张卡片';
-      if (!filtered.length) {
-        cardsRoot.innerHTML = '<div class="empty">没有匹配的卡片，试试更换关键词或先创建一张。</div>';
-        return;
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+  return (bytes / 1024 / 1024 / 1024).toFixed(1) + ' GB';
+}
+
+function renderPickedFiles() {
+  if (!pendingFiles.length) {
+    pickedFiles.innerHTML = '<span class="chip">未选择附件</span>';
+    return;
+  }
+  pickedFiles.innerHTML = pendingFiles.map(file => '<span class="chip">' + escapeHtml(file.name) + '</span>').join('');
+}
+
+function renderCards() {
+  const query = searchInput.value.trim().toLowerCase();
+  const filtered = cards.filter(card => {
+    if (!query) return true;
+    if ((card.text || '').toLowerCase().includes(query)) return true;
+    return (card.attachments || []).some(file => (file.name || '').toLowerCase().includes(query));
+  });
+
+  countText.textContent = filtered.length + ' 张卡片';
+  if (!filtered.length) {
+    cardsRoot.innerHTML = '<div class="empty">还没有匹配卡片。你可以先写点内容，或上传一个文件后制卡。</div>';
+    return;
+  }
+
+  cardsRoot.innerHTML = filtered.map(card => {
+    const attachments = (card.attachments || []).map(file => {
+      let preview = '';
+      if (file.previewable && file.kind === 'image') {
+        preview = '<img class="preview" src="' + file.previewUrl + '" alt="' + escapeHtml(file.name) + '">';
+      } else if (file.previewable && file.kind === 'audio') {
+        preview = '<audio class="preview" controls src="' + file.previewUrl + '"></audio>';
+      } else if (file.previewable && file.kind === 'video') {
+        preview = '<video class="preview" controls src="' + file.previewUrl + '"></video>';
+      } else if (file.previewable && file.mimeType === 'application/pdf') {
+        preview = '<iframe class="preview" style="min-height:280px;" src="' + file.previewUrl + '"></iframe>';
       }
-
-      cardsRoot.innerHTML = filtered.map(card => {
-        const attachments = (card.attachments || []).map(file => {
-          let preview = '';
-          if (file.kind === 'image') {
-            preview = '<img class="preview" src="' + file.downloadUrl + '" alt="' + escapeHtml(file.name) + '">';
-          } else if (file.kind === 'audio') {
-            preview = '<audio class="preview" controls src="' + file.downloadUrl + '"></audio>';
-          } else if (file.kind === 'video') {
-            preview = '<video class="preview" controls src="' + file.downloadUrl + '"></video>';
-          } else if (file.mimeType === 'application/pdf') {
-            preview = '<iframe class="preview" style="min-height:260px;" src="' + file.downloadUrl + '"></iframe>';
-          }
-          return '<div class="attachment">' +
-            '<div class="attachment-row"><strong>' + escapeHtml(file.name) + '</strong><span>' + formatBytes(file.size || 0) + '</span></div>' +
-            preview +
-            '<div class="attachment-row">' +
-              '<span>' + escapeHtml(file.kind || 'other') + '</span>' +
-              '<a href="' + file.downloadUrl + '" target="_blank" rel="noopener">打开/下载</a>' +
-            '</div>' +
-          '</div>';
-        }).join('');
-
-        return '<article class="card">' +
-          '<div class="card-meta"><span>创建: ' + new Date(card.createdAt).toLocaleString() + '</span><span>更新: ' + new Date(card.updatedAt).toLocaleString() + '</span></div>' +
-          '<div class="card-text">' + escapeHtml(card.text || '') + '</div>' +
-          (attachments ? '<div class="attachment-list">' + attachments + '</div>' : '') +
-          '<div class="composer-actions">' +
-            '<button class="secondary" onclick="copyCard(' + JSON.stringify(card.text || '') + ')">复制</button>' +
-            '<button class="danger" onclick="deleteCard(' + JSON.stringify(card.id) + ')">删除</button>' +
+      return '<div class="attachment">' +
+        '<div class="attachment-row"><strong>' + escapeHtml(file.name) + '</strong><span>' + formatBytes(file.size || 0) + '</span></div>' +
+        preview +
+        '<div class="attachment-row" style="margin-top:10px;">' +
+          '<span style="color:#667085;">' + escapeHtml(file.kind || 'other') + '</span>' +
+          '<div style="display:flex;gap:10px;flex-wrap:wrap;">' +
+            (file.previewable ? '<a href="' + file.previewUrl + '" target="_blank" rel="noopener">预览</a>' : '') +
+            '<a href="' + file.downloadUrl + '" download>下载</a>' +
           '</div>' +
-        '</article>';
-      }).join('');
-    }
+        '</div>' +
+      '</div>';
+    }).join('');
 
-    async function refreshCards() {
-      const response = await fetch('/api/cards');
-      const payload = await response.json();
+    return '<article class="panel card">' +
+      '<div class="card-top"><span>创建 ' + new Date(card.createdAt).toLocaleString() + '</span><span>更新 ' + new Date(card.updatedAt).toLocaleString() + '</span></div>' +
+      '<div class="card-text">' + escapeHtml(card.text || '无文本内容') + '</div>' +
+      (attachments ? '<div class="attachment-list">' + attachments + '</div>' : '') +
+      '<div class="card-actions">' +
+        '<button class="btn btn-ghost" onclick="copyCard(' + JSON.stringify(card.text || '') + ')">复制</button>' +
+        '<button class="btn btn-danger" onclick="deleteCard(' + JSON.stringify(card.id) + ')">删除</button>' +
+      '</div>' +
+    '</article>';
+  }).join('');
+}
+
+async function refreshCards() {
+  const response = await fetch('/api/cards');
+  const payload = await response.json();
+  cards = payload.cards || [];
+  if (payload.address) addressText.textContent = payload.address;
+  renderCards();
+}
+
+function connectWs() {
+  socket = new WebSocket(wsUrl);
+  statusText.textContent = '连接中';
+  statusDot.className = 'status-dot';
+  socket.onopen = () => {
+    statusText.textContent = '已连接';
+    statusDot.className = 'status-dot connected';
+  };
+  socket.onclose = () => {
+    statusText.textContent = '已断开，正在重连';
+    statusDot.className = 'status-dot';
+    setTimeout(connectWs, 1200);
+  };
+  socket.onmessage = event => {
+    const payload = JSON.parse(event.data);
+    if (payload.type === 'cardsSnapshot') {
       cards = payload.cards || [];
+      if (payload.address) addressText.textContent = payload.address;
       renderCards();
     }
+  };
+}
 
-    function connectWs() {
-      socket = new WebSocket(wsUrl);
-      statusText.textContent = '连接中';
-      statusDot.className = 'dot';
-      socket.onopen = () => {
-        statusText.textContent = '已连接';
-        statusDot.className = 'dot connected';
-      };
-      socket.onclose = () => {
-        statusText.textContent = '已断开，重连中';
-        statusDot.className = 'dot';
-        setTimeout(connectWs, 1200);
-      };
-      socket.onmessage = event => {
-        const payload = JSON.parse(event.data);
-        if (payload.type === 'cardsSnapshot') {
-          cards = payload.cards || [];
-          renderCards();
-        }
-      };
-    }
-
-    async function filesToPayload(files) {
-      return Promise.all(files.map(file => new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const result = String(reader.result || '');
-          const commaIndex = result.indexOf(',');
-          resolve({
-            name: file.name,
-            mimeType: file.type || 'application/octet-stream',
-            base64: commaIndex >= 0 ? result.slice(commaIndex + 1) : result,
-          });
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      })));
-    }
-
-    async function createCard() {
-      const text = composerInput.value.trim();
-      if (!text && pendingFiles.length === 0) return;
-      const attachments = await filesToPayload(pendingFiles);
-      await fetch('/api/cards', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({text, attachments}),
+async function filesToPayload(files) {
+  return Promise.all(files.map(file => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      const commaIndex = result.indexOf(',');
+      resolve({
+        name: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        base64: commaIndex >= 0 ? result.slice(commaIndex + 1) : result,
       });
-      composerInput.value = '';
-      pendingFiles = [];
-      fileInput.value = '';
-      pickedFiles.textContent = '未选择附件';
-      await refreshCards();
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  })));
+}
+
+async function createCard() {
+  const text = composerInput.value.trim();
+  if (!text && pendingFiles.length === 0) return;
+  const attachments = await filesToPayload(pendingFiles);
+  await fetch('/api/cards', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text, attachments}),
+  });
+  composerInput.value = '';
+  pendingFiles = [];
+  fileInput.value = '';
+  renderPickedFiles();
+  showToast('卡片已保存');
+  await refreshCards();
+}
+
+async function deleteCard(cardId) {
+  await fetch('/api/cards/' + encodeURIComponent(cardId) + '/delete', {method: 'POST'});
+  showToast('卡片已删除');
+  await refreshCards();
+}
+
+async function copyCard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_) {
+    const temp = document.createElement('textarea');
+    temp.value = text;
+    temp.style.position = 'fixed';
+    temp.style.opacity = '0';
+    document.body.appendChild(temp);
+    temp.focus();
+    temp.select();
+    document.execCommand('copy');
+    temp.remove();
+  }
+  showToast('已复制到剪贴板');
+}
+
+async function copyAddress() {
+  try {
+    await navigator.clipboard.writeText(addressText.textContent || '');
+    showToast('访问地址已复制');
+  } catch (_) {
+    showToast('复制失败，请手动复制');
+  }
+}
+
+async function pasteIntoComposer() {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (!text) {
+      showToast('剪贴板里没有可粘贴的文字');
+      return;
     }
+    composerInput.value = text;
+    showToast('已粘贴文字');
+  } catch (_) {
+    showToast('当前浏览器不支持直接读取剪贴板');
+  }
+}
 
-    async function deleteCard(cardId) {
-      await fetch('/api/cards/' + encodeURIComponent(cardId) + '/delete', {method: 'POST'});
-      await refreshCards();
-    }
-
-    async function copyCard(text) {
-      try {
-        await navigator.clipboard.writeText(text);
-      } catch (_) {
-        const temp = document.createElement('textarea');
-        temp.value = text;
-        document.body.appendChild(temp);
-        temp.select();
-        document.execCommand('copy');
-        temp.remove();
-      }
-    }
-
-    document.getElementById('pickFilesBtn').addEventListener('click', () => fileInput.click());
-    document.getElementById('createBtn').addEventListener('click', createCard);
-    document.getElementById('refreshBtn').addEventListener('click', refreshCards);
-    document.getElementById('clearBtn').addEventListener('click', () => {
-      composerInput.value = '';
-      pendingFiles = [];
-      fileInput.value = '';
-      pickedFiles.textContent = '未选择附件';
-    });
-    searchInput.addEventListener('input', renderCards);
-    fileInput.addEventListener('change', event => {
-      pendingFiles = Array.from(event.target.files || []);
-      pickedFiles.textContent = pendingFiles.length
-        ? '已选择 ' + pendingFiles.length + ' 个附件: ' + pendingFiles.map(file => file.name).join(', ')
-        : '未选择附件';
-    });
-
-    refreshCards();
-    connectWs();
-  </script>
+document.getElementById('pickFilesBtn').addEventListener('click', () => fileInput.click());
+document.getElementById('createBtn').addEventListener('click', createCard);
+document.getElementById('refreshBtn').addEventListener('click', refreshCards);
+document.getElementById('pasteBtn').addEventListener('click', pasteIntoComposer);
+document.getElementById('copyAddressBtn').addEventListener('click', copyAddress);
+document.getElementById('copyAddressBtn').addEventListener('keydown', event => {
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault();
+    copyAddress();
+  }
+});
+document.getElementById('startBtn').addEventListener('click', () => showToast('服务已在应用内自动启动'));
+document.getElementById('stopBtn').addEventListener('click', () => showToast('如需停止服务，请回到应用内操作'));
+document.getElementById('clearBtn').addEventListener('click', () => {
+  composerInput.value = '';
+  pendingFiles = [];
+  fileInput.value = '';
+  renderPickedFiles();
+});
+searchInput.addEventListener('input', renderCards);
+fileInput.addEventListener('change', event => {
+  pendingFiles = Array.from(event.target.files || []);
+  renderPickedFiles();
+});
+renderPickedFiles();
+refreshCards();
+connectWs();
+</script>
 </body>
 </html>
 ''';
@@ -1497,152 +1682,135 @@ class _MyHomePageState extends State<MyHomePage> {
   Widget build(BuildContext context) {
     final cards = _sortedCards;
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F1E8),
-      appBar: AppBar(
-        title: Text(widget.title),
-      ),
-      body: Stack(
-        children: [
-          Positioned.fill(
-            child: DecoratedBox(
-              decoration: const BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  colors: [Color(0xFFF4F1E8), Color(0xFFEAE6DA)],
-                ),
-              ),
-            ),
-          ),
-          Column(
-            children: [
-              Expanded(
-                child: ListView(
-                  controller: _scrollController,
-                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 112),
-                  children: [
-                    _buildSearchBar(),
-                    const SizedBox(height: 12),
-                    _buildComposerCard(),
-                    const SizedBox(height: 12),
-                    _buildStatusStrip(context),
-                    const SizedBox(height: 12),
-                    _buildCardsSection(cards),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          Positioned(
-            right: 16,
-            bottom: 20,
-            child: Column(
+      appBar: AppBar(title: Text(widget.title)),
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : Stack(
               children: [
-                FloatingActionButton.small(
-                  heroTag: 'scroll-top',
-                  onPressed: _scrollToTop,
-                  child: const Icon(Icons.vertical_align_top),
+                Positioned.fill(
+                  child: DecoratedBox(
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [Color(0xFFF7F9FB), Color(0xFFF1F4F9)],
+                      ),
+                    ),
+                  ),
                 ),
-                const SizedBox(height: 12),
-                FloatingActionButton.small(
-                  heroTag: 'scroll-bottom',
-                  onPressed: _scrollToBottom,
-                  child: const Icon(Icons.vertical_align_bottom),
+                Center(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 980),
+                    child: ListView(
+                      controller: _scrollController,
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 110),
+                      children: [
+                        _buildHero(),
+                        const SizedBox(height: 18),
+                        _buildAddressPanel(),
+                        const SizedBox(height: 18),
+                        _buildComposerCard(),
+                        const SizedBox(height: 18),
+                        _buildServiceControls(),
+                        const SizedBox(height: 24),
+                        _buildCardsSection(cards),
+                      ],
+                    ),
+                  ),
+                ),
+                Positioned(
+                  right: 16,
+                  bottom: 20,
+                  child: Column(
+                    children: [
+                      FloatingActionButton.small(
+                        heroTag: 'scroll-top',
+                        onPressed: _scrollToTop,
+                        child: const Icon(Icons.vertical_align_top),
+                      ),
+                      const SizedBox(height: 12),
+                      FloatingActionButton.small(
+                        heroTag: 'scroll-bottom',
+                        onPressed: _scrollToBottom,
+                        child: const Icon(Icons.vertical_align_bottom),
+                      ),
+                    ],
+                  ),
                 ),
               ],
             ),
+    );
+  }
+
+  Widget _buildHero() {
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            '快速制卡',
+            style: TextStyle(
+              fontSize: 40,
+              height: 1.0,
+              fontWeight: FontWeight.w900,
+              color: Color(0xFF002E88),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            '支持直接输入文本、剪贴板获取或上传文件，一键生成统一风格的分享卡片。',
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: const Color(0xFF5F6778),
+                  height: 1.6,
+                ),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildSearchBar() {
-    return Container(
-      decoration: _panelDecoration(
-        topColor: const Color(0xFFFFFCF7),
-        bottomColor: const Color(0xFFF1EBDF),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: TextField(
-          controller: _searchController,
-          decoration: InputDecoration(
-            prefixIcon: const Icon(Icons.search),
-            hintText: '搜索卡片内容或附件文件名',
-            filled: true,
-            fillColor: Colors.white.withValues(alpha: 0.92),
-            suffixIcon: _searchController.text.isEmpty
-                ? null
-                : IconButton(
-                    onPressed: () {
-                      setState(() {
-                        _searchController.clear();
-                      });
-                    },
-                    icon: const Icon(Icons.close),
-                  ),
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(18),
-              borderSide: const BorderSide(color: Color(0xFFD5D0C6)),
-            ),
-            enabledBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(18),
-              borderSide: const BorderSide(color: Color(0xFFD5D0C6)),
-            ),
-            focusedBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(18),
-              borderSide:
-                  const BorderSide(color: Color(0xFF355C9A), width: 1.4),
-            ),
-          ),
-          onChanged: (_) => setState(() {}),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildStatusStrip(BuildContext context) {
-    return Container(
-      decoration: _panelDecoration(
-        topColor: const Color(0xFFFFFCF7),
-        bottomColor: const Color(0xFFF1EBDF),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+  Widget _buildAddressPanel() {
+    return InkWell(
+      borderRadius: BorderRadius.circular(28),
+      onTap: _copyServerAddress,
+      child: Container(
+        decoration: _panelDecoration(),
+        padding: const EdgeInsets.fromLTRB(18, 18, 18, 16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            SelectableText(
-              _serverAddress,
-              maxLines: 1,
-              style: const TextStyle(
-                color: Color(0xFF1558B0),
-                fontWeight: FontWeight.w700,
-                fontSize: 16,
+            const Text(
+              '访问地址',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 3.2,
+                color: Color(0x801353D8),
               ),
             ),
-            const SizedBox(height: 10),
+            const SizedBox(height: 8),
+            SelectableText(
+              _serverAddress,
+              style: const TextStyle(
+                fontSize: 28,
+                height: 1.2,
+                fontWeight: FontWeight.w900,
+                color: Color(0xFF002E88),
+              ),
+            ),
+            const SizedBox(height: 8),
             Row(
-              children: [
+              children: const [
+                Icon(Icons.content_copy, size: 16, color: Color(0x801353D8)),
+                SizedBox(width: 6),
                 Expanded(
-                  child: _buildStatusTile(
-                    icon: Icons.wifi_tethering,
-                    label: _isServerRunning ? '服务在线' : '服务未启动',
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: _buildStatusTile(
-                    icon: Icons.layers_outlined,
-                    label: '${_cards.length} 张卡片',
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: _buildStatusTile(
-                    icon: Icons.attach_file,
-                    label: '${_attachments.length} 个附件',
+                  child: Text(
+                    '点击可复制当前真实访问地址，端口自动分配。',
+                    style: TextStyle(
+                      color: Color(0xFF6B7381),
+                      fontSize: 13,
+                    ),
                   ),
                 ),
               ],
@@ -1655,48 +1823,26 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Widget _buildComposerCard() {
     return Container(
-      decoration: _panelDecoration(
-        topColor: const Color(0xFF193D7A),
-        bottomColor: const Color(0xFF274E8F),
-      ),
+      decoration: _panelDecoration(),
       child: Padding(
-        padding: const EdgeInsets.all(18),
+        padding: const EdgeInsets.all(10),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            const Text(
-              '快速制卡',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 22,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-            const SizedBox(height: 6),
-            const Text(
-              '支持直接输入文本，也支持从手机里选择图片、音视频、文档等附件后一起制卡。',
-              style: TextStyle(color: Color(0xFFD7E2FF), height: 1.45),
-            ),
-            const SizedBox(height: 16),
             TextField(
               controller: _composerController,
-              minLines: 5,
-              maxLines: 9,
-              style: const TextStyle(color: Color(0xFF18212F)),
-              decoration: InputDecoration(
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(20),
-                  borderSide: BorderSide.none,
-                ),
-                filled: true,
-                fillColor: const Color(0xFFF8F6F0),
+              minLines: 8,
+              maxLines: 12,
+              decoration: const InputDecoration(
                 hintText: '写一句灵感、贴一段内容，或先选择附件再制卡',
-                hintStyle: const TextStyle(color: Color(0xFF6C7687)),
-                contentPadding: const EdgeInsets.all(16),
+                fillColor: Colors.transparent,
+                border: InputBorder.none,
+                enabledBorder: InputBorder.none,
+                focusedBorder: InputBorder.none,
               ),
             ),
-            const SizedBox(height: 12),
             if (_pendingAttachments.isNotEmpty) ...[
+              const SizedBox(height: 6),
               Wrap(
                 spacing: 8,
                 runSpacing: 8,
@@ -1720,69 +1866,43 @@ class _MyHomePageState extends State<MyHomePage> {
                   );
                 }).toList(),
               ),
-              const SizedBox(height: 12),
             ],
-            LayoutBuilder(
-              builder: (context, constraints) {
-                final buttonWidth = (constraints.maxWidth * 0.40)
-                    .clamp(132.0, 168.0)
-                    .toDouble();
-                return Column(
-                  children: [
-                    _buildComposerButtonRow(
-                      left: _buildComposerActionButton(
-                        icon: Icons.auto_awesome,
-                        label: '制卡',
-                        onPressed: _createCardFromComposer,
-                        isPrimary: true,
-                        width: buttonWidth,
-                      ),
-                      right: _buildComposerActionButton(
-                        icon: Icons.upload_file_outlined,
-                        label: _isPickingFiles ? '读取中...' : '选择文件',
-                        onPressed:
-                            _isPickingFiles ? null : _pickFilesFromDevice,
-                        width: buttonWidth,
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    _buildComposerButtonRow(
-                      left: _buildComposerActionButton(
-                        icon: Icons.clear_all,
-                        label: '清空',
-                        onPressed: () {
-                          setState(() {
-                            _composerController.clear();
-                            _pendingAttachments.clear();
-                          });
-                        },
-                        width: buttonWidth,
-                      ),
-                      right: _buildComposerActionButton(
-                        icon: Icons.content_paste_rounded,
-                        label: '粘贴文字',
-                        onPressed: _pasteTextToComposer,
-                        width: buttonWidth,
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    _buildComposerButtonRow(
-                      left: _buildServiceActionButton(
-                        icon: Icons.wifi_tethering,
-                        label: '启动服务',
-                        onPressed: _isServerRunning ? null : _startServer,
-                        width: buttonWidth,
-                      ),
-                      right: _buildServiceActionButton(
-                        icon: Icons.stop_circle_outlined,
-                        label: '停止服务',
-                        onPressed: _isServerRunning ? _stopServer : null,
-                        width: buttonWidth,
-                      ),
-                    ),
-                  ],
-                );
-              },
+            const Divider(height: 18, color: Color(0xFFE7EBF0)),
+            Wrap(
+              spacing: 10,
+              runSpacing: 10,
+              alignment: WrapAlignment.spaceBetween,
+              children: [
+                _buildCapsuleButton(
+                  label: _isPickingFiles ? '读取中...' : '选择文件',
+                  icon: Icons.attach_file,
+                  onTap: _isPickingFiles ? null : _pickFilesFromDevice,
+                  variant: _CapsuleButtonVariant.soft,
+                ),
+                _buildCapsuleButton(
+                  label: '粘贴文字',
+                  icon: Icons.content_paste,
+                  onTap: _pasteTextToComposer,
+                  variant: _CapsuleButtonVariant.ghost,
+                ),
+                _buildCapsuleButton(
+                  label: '清空',
+                  icon: Icons.delete_outline,
+                  onTap: () {
+                    setState(() {
+                      _composerController.clear();
+                      _pendingAttachments.clear();
+                    });
+                  },
+                  variant: _CapsuleButtonVariant.ghost,
+                ),
+                _buildCapsuleButton(
+                  label: '制卡',
+                  icon: Icons.auto_awesome,
+                  onTap: _createCardFromComposer,
+                  variant: _CapsuleButtonVariant.primary,
+                ),
+              ],
             ),
           ],
         ),
@@ -1790,59 +1910,122 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  Widget _buildCardsSection(List<CardItem> cards) {
-    if (cards.isEmpty) {
-      return Container(
-        decoration: _panelDecoration(),
-        child: Padding(
-          padding: const EdgeInsets.all(28),
-          child: Column(
-            children: [
-              const Icon(
-                Icons.dashboard_customize_outlined,
-                size: 44,
-                color: Color(0xFF677285),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                '还没有卡片。你可以直接输入文本点击“制卡”，或者先点“选择文件”把手机里的图片、音视频、文档加进来。',
-                style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                      color: const Color(0xFF475161),
-                      height: 1.5,
-                    ),
-                textAlign: TextAlign.center,
-              ),
-            ],
+  Widget _buildServiceControls() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final singleColumn = constraints.maxWidth < 620;
+        final items = [
+          _buildServiceCard(
+            icon: Icons.play_arrow,
+            label: '启动服务',
+            subtitle: '随机端口 · 后台同步已就绪',
+            onTap: _isServerRunning ? null : _startServer,
           ),
-        ),
-      );
-    }
+          _buildServiceCard(
+            icon: Icons.stop,
+            label: '停止服务',
+            subtitle: '停止后网页访问会中断',
+            onTap: _isServerRunning ? _stopServer : null,
+            isDanger: true,
+          ),
+        ];
+        if (singleColumn) {
+          return Column(children: [
+            for (final item in items) ...[item, const SizedBox(height: 12)]
+          ]);
+        }
+        return Row(
+          children: [
+            Expanded(child: items[0]),
+            const SizedBox(width: 12),
+            Expanded(child: items[1]),
+          ],
+        );
+      },
+    );
+  }
 
+  Widget _buildCardsSection(List<CardItem> cards) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Padding(
-          padding: const EdgeInsets.only(left: 4, bottom: 10),
-          child: Row(
-            children: [
-              Text(
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
                 '卡片列表',
-                style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                      color: const Color(0xFF18212F),
-                      fontWeight: FontWeight.w800,
-                    ),
+                style: TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w900,
+                  color: Color(0xFF002E88),
+                ),
               ),
-              const SizedBox(width: 10),
-              Text(
-                '按最近更新排序',
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: const Color(0xFF6B7381),
-                    ),
-              ),
-            ],
-          ),
+            ),
+            Text(
+              '${cards.length} 张卡片',
+              style: const TextStyle(color: Color(0xFF6B7381)),
+            ),
+          ],
         ),
-        ...cards.map(_buildCardTile),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _searchController,
+          decoration: InputDecoration(
+            prefixIcon: const Icon(Icons.search),
+            hintText: '搜索卡片内容或附件文件名',
+            suffixIcon: _searchController.text.isEmpty
+                ? null
+                : IconButton(
+                    onPressed: () {
+                      setState(() {
+                        _searchController.clear();
+                      });
+                    },
+                    icon: const Icon(Icons.close),
+                  ),
+          ),
+          onChanged: (_) => setState(() {}),
+        ),
+        const SizedBox(height: 16),
+        if (cards.isEmpty)
+          Container(
+            decoration: _panelDecoration(),
+            width: double.infinity,
+            padding: const EdgeInsets.all(28),
+            child: Column(
+              children: const [
+                Icon(Icons.blur_on, size: 48, color: Color(0x551353D8)),
+                SizedBox(height: 14),
+                Text(
+                  '还没有卡片。你可以直接输入文本点击“制卡”，或者先选择文件后一起保存。',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Color(0xFF6B7381), height: 1.6),
+                ),
+              ],
+            ),
+          )
+        else
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final columns = constraints.maxWidth > 860
+                  ? 3
+                  : constraints.maxWidth > 560
+                      ? 2
+                      : 1;
+              return GridView.builder(
+                itemCount: cards.length,
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: columns,
+                  crossAxisSpacing: 14,
+                  mainAxisSpacing: 14,
+                  mainAxisExtent: 340,
+                ),
+                itemBuilder: (context, index) => _buildCardTile(cards[index]),
+              );
+            },
+          ),
       ],
     );
   }
@@ -1854,299 +2037,239 @@ class _MyHomePageState extends State<MyHomePage> {
         .toList();
 
     return Container(
-      margin: const EdgeInsets.only(bottom: 14),
-      decoration: _panelDecoration(
-        topColor: Colors.white,
-        bottomColor: const Color(0xFFF7F4EC),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Container(
-              width: 44,
-              height: 5,
-              decoration: BoxDecoration(
-                color: const Color(0xFFB6C5E4),
-                borderRadius: BorderRadius.circular(999),
-              ),
-            ),
-            const SizedBox(height: 14),
-            Row(
-              children: [
-                _buildInfoPill(
-                  icon: Icons.schedule,
-                  label: _formatDateTime(card.updatedAt),
-                  dark: true,
+      decoration: _panelDecoration(),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '创建 ${_formatDateTime(card.createdAt)}',
+                  style: const TextStyle(
+                    color: Color(0xFF6B7381),
+                    fontSize: 12,
+                  ),
                 ),
-                const Spacer(),
-                if (cardAttachments.isNotEmpty)
-                  _buildInfoPill(
-                    icon: Icons.attach_file,
-                    label: '${cardAttachments.length} 个附件',
-                    dark: true,
-                  ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            Text(
-              card.text.isEmpty ? '无文本内容' : card.text,
-              style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                    height: 1.55,
-                    color: const Color(0xFF18212F),
-                    fontWeight: FontWeight.w500,
-                  ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              '创建 ${_formatDateTime(card.createdAt)}  ·  更新 ${_formatDateTime(card.updatedAt)}',
-              style: Theme.of(context)
-                  .textTheme
-                  .bodySmall
-                  ?.copyWith(color: Colors.grey[700]),
-            ),
-            if (cardAttachments.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              Column(
-                children: cardAttachments.map((attachment) {
-                  return Container(
-                    margin: const EdgeInsets.only(bottom: 8),
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 12, vertical: 10),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFECE8DC),
-                      borderRadius: BorderRadius.circular(16),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(_iconForAttachment(attachment),
-                            color: const Color(0xFF355C9A)),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                attachment.name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                    fontWeight: FontWeight.w600),
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                _attachmentLabel(attachment),
-                                style:
-                                    const TextStyle(color: Color(0xFF5E687A)),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Text(
-                          attachment.kind.name,
-                          style: const TextStyle(
-                            color: Color(0xFF5E687A),
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                    ),
-                  );
-                }).toList(),
+              ),
+              Text(
+                '更新 ${_formatDateTime(card.updatedAt)}',
+                style: const TextStyle(
+                  color: Color(0xFF6B7381),
+                  fontSize: 12,
+                ),
               ),
             ],
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 10,
-              runSpacing: 10,
-              children: [
-                OutlinedButton.icon(
-                  onPressed: () => _copyCardText(card.text),
-                  icon: const Icon(Icons.copy),
-                  label: const Text('复制'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () => _deleteCard(card.id),
-                  icon: const Icon(Icons.delete_outline),
-                  label: const Text('删除'),
-                ),
-              ],
+          ),
+          const SizedBox(height: 14),
+          Expanded(
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    card.text.isEmpty ? '无文本内容' : card.text,
+                    style: const TextStyle(
+                      color: Color(0xFF191C1E),
+                      fontSize: 15,
+                      height: 1.65,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  if (cardAttachments.isNotEmpty) ...[
+                    const SizedBox(height: 14),
+                    ...cardAttachments.map(
+                      (attachment) => Container(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFF5F7FB),
+                          borderRadius: BorderRadius.circular(18),
+                          border: Border.all(color: const Color(0xFFE0E3E5)),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(_iconForAttachment(attachment),
+                                color: const Color(0xFF1353D8)),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    attachment.name,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    _attachmentLabel(attachment),
+                                    style: const TextStyle(
+                                      color: Color(0xFF6B7381),
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
             ),
-          ],
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _buildCapsuleButton(
+                label: '复制',
+                icon: Icons.content_copy,
+                onTap: () => _copyCardText(card.text),
+                variant: _CapsuleButtonVariant.ghost,
+                compact: true,
+              ),
+              _buildCapsuleButton(
+                label: '删除',
+                icon: Icons.delete_outline,
+                onTap: () => _deleteCard(card.id),
+                variant: _CapsuleButtonVariant.danger,
+                compact: true,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildServiceCard({
+    required IconData icon,
+    required String label,
+    required String subtitle,
+    required VoidCallback? onTap,
+    bool isDanger = false,
+  }) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(24),
+      onTap: onTap,
+      child: Opacity(
+        opacity: onTap == null ? 0.5 : 1,
+        child: Container(
+          decoration: _panelDecoration(),
+          padding: const EdgeInsets.all(18),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: isDanger
+                      ? const Color(0x14BA1A1A)
+                      : const Color(0x141353D8),
+                ),
+                child: Icon(
+                  icon,
+                  color: isDanger
+                      ? const Color(0xFFBA1A1A)
+                      : const Color(0xFF1353D8),
+                ),
+              ),
+              const SizedBox(height: 14),
+              Text(
+                label,
+                style: const TextStyle(
+                  fontWeight: FontWeight.w800,
+                  fontSize: 18,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                subtitle,
+                style: const TextStyle(color: Color(0xFF6B7381)),
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  BoxDecoration _panelDecoration({
-    Color topColor = const Color(0xFFFFFCF6),
-    Color bottomColor = const Color(0xFFF2EDE1),
+  Widget _buildCapsuleButton({
+    required String label,
+    required IconData icon,
+    required VoidCallback? onTap,
+    required _CapsuleButtonVariant variant,
+    bool compact = false,
   }) {
-    return BoxDecoration(
-      gradient: LinearGradient(
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-        colors: [topColor, bottomColor],
+    late final Color background;
+    late final Color foreground;
+    switch (variant) {
+      case _CapsuleButtonVariant.primary:
+        background = const Color(0xFF1353D8);
+        foreground = Colors.white;
+      case _CapsuleButtonVariant.soft:
+        background = const Color(0x66D0E1FB);
+        foreground = const Color(0xFF385171);
+      case _CapsuleButtonVariant.ghost:
+        background = const Color(0xFFF2F4F6);
+        foreground = const Color(0xFF5A6475);
+      case _CapsuleButtonVariant.danger:
+        background = const Color(0x14BA1A1A);
+        foreground = const Color(0xFFBA1A1A);
+    }
+    return FilledButton.icon(
+      onPressed: onTap,
+      style: FilledButton.styleFrom(
+        backgroundColor: background,
+        foregroundColor: foreground,
+        elevation: 0,
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? 14 : 18,
+          vertical: compact ? 10 : 14,
+        ),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(999),
+        ),
       ),
+      icon: Icon(icon, size: compact ? 18 : 20),
+      label: Text(
+        label,
+        style: TextStyle(
+          fontWeight: FontWeight.w800,
+          fontSize: compact ? 13 : 15,
+        ),
+      ),
+    );
+  }
+
+  BoxDecoration _panelDecoration() {
+    return BoxDecoration(
+      color: Colors.white.withValues(alpha: 0.92),
       borderRadius: BorderRadius.circular(28),
-      border: Border.all(color: const Color(0xFFD8D2C7)),
+      border: Border.all(color: const Color(0xFFE0E3E5)),
       boxShadow: const [
         BoxShadow(
-          color: Color(0x160C1730),
-          blurRadius: 24,
-          offset: Offset(0, 12),
+          color: Color(0x141353D8),
+          blurRadius: 32,
+          offset: Offset(0, 16),
         ),
       ],
     );
   }
-
-  Widget _buildInfoPill({
-    required IconData icon,
-    required String label,
-    bool dark = false,
-  }) {
-    final background = dark ? const Color(0xFFE8E2D5) : const Color(0xFFEEE8DC);
-    final foreground = dark ? const Color(0xFF475161) : const Color(0xFF4B5565);
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: background,
-        borderRadius: BorderRadius.circular(999),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 16, color: foreground),
-          const SizedBox(width: 6),
-          Text(
-            label,
-            style: TextStyle(
-              color: foreground,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildStatusTile({
-    required IconData icon,
-    required String label,
-  }) {
-    return Container(
-      height: 54,
-      decoration: BoxDecoration(
-        color: const Color(0xFFEDE6D9),
-        borderRadius: BorderRadius.circular(18),
-      ),
-      padding: const EdgeInsets.symmetric(horizontal: 10),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(icon, size: 18, color: const Color(0xFF5B6474)),
-          const SizedBox(width: 8),
-          Flexible(
-            child: Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: Color(0xFF4D5564),
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildComposerActionButton({
-    required IconData icon,
-    required String label,
-    required VoidCallback? onPressed,
-    required double width,
-    bool isPrimary = false,
-  }) {
-    return SizedBox(
-      width: width,
-      height: 64,
-      child: FilledButton.icon(
-        onPressed: onPressed,
-        style: FilledButton.styleFrom(
-          backgroundColor: isPrimary
-              ? const Color(0xFFFFD166)
-              : Colors.white.withValues(alpha: 0.14),
-          foregroundColor: isPrimary ? const Color(0xFF18212F) : Colors.white,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(999),
-          ),
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        ),
-        icon: Icon(icon, size: 20),
-        label: Text(
-          label,
-          style: const TextStyle(
-            fontSize: 16,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildServiceActionButton({
-    required IconData icon,
-    required String label,
-    required VoidCallback? onPressed,
-    required double width,
-  }) {
-    return SizedBox(
-      width: width,
-      height: 60,
-      child: OutlinedButton.icon(
-        onPressed: onPressed,
-        style: OutlinedButton.styleFrom(
-          foregroundColor: Colors.white,
-          side: BorderSide(color: Colors.white.withValues(alpha: 0.35)),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(999),
-          ),
-        ),
-        icon: Icon(icon, size: 20),
-        label: Text(
-          label,
-          style: const TextStyle(
-            fontSize: 16,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildComposerButtonRow({
-    required Widget left,
-    required Widget right,
-  }) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [left, right],
-    );
-  }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  final String title;
-
-  @override
-  State<MyHomePage> createState() => _MyHomePageState();
-}
+enum _CapsuleButtonVariant { primary, soft, ghost, danger }
 
 class _IncomingAttachmentPayload {
   _IncomingAttachmentPayload({
