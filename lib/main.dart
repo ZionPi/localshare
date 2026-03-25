@@ -14,6 +14,7 @@ import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart' as shelf_router;
 import 'package:shelf_web_socket/shelf_web_socket.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 void main() {
@@ -440,6 +441,7 @@ class _MyHomePageState extends State<MyHomePage> {
   Timer? _broadcastDebounceTimer;
 
   String _serverAddress = '服务启动中';
+  String _publicHost = '127.0.0.1';
   bool _isServerRunning = false;
   bool _isPickingFiles = false;
   bool _isLoading = true;
@@ -749,6 +751,35 @@ class _MyHomePageState extends State<MyHomePage> {
     _showToast('访问地址已复制');
   }
 
+  Uri? _buildAttachmentUri(CardAttachment attachment, {bool preview = false}) {
+    if (!_isServerRunning) {
+      return null;
+    }
+    final baseUri = Uri.tryParse(_serverAddress);
+    if (baseUri == null) {
+      return null;
+    }
+    return baseUri.replace(
+      path: '/files/${attachment.id}',
+      queryParameters: preview ? <String, String>{'view': '1'} : null,
+    );
+  }
+
+  Future<void> _openAttachment(
+    CardAttachment attachment, {
+    bool preview = false,
+  }) async {
+    final uri = _buildAttachmentUri(attachment, preview: preview);
+    if (uri == null) {
+      _showToast('服务尚未启动');
+      return;
+    }
+    final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!launched) {
+      _showToast(preview ? '无法打开预览' : '无法打开下载链接');
+    }
+  }
+
   Future<void> _createCardFromComposer() async {
     final value = _composerController.text.trim();
     if (value.isEmpty && _pendingAttachments.isEmpty) {
@@ -911,10 +942,16 @@ class _MyHomePageState extends State<MyHomePage> {
         return router.call(request);
       }
 
-      _server = await shelf_io.serve(handler, ipAddress, 0, shared: true);
+      _server = await shelf_io.serve(
+        handler,
+        InternetAddress.anyIPv4,
+        0,
+        shared: true,
+      );
       if (mounted) {
         setState(() {
-          _serverAddress = 'http://${_server!.address.host}:${_server!.port}';
+          _publicHost = ipAddress;
+          _serverAddress = 'http://$_publicHost:${_server!.port}';
           _isServerRunning = true;
         });
       }
@@ -1274,7 +1311,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   String _generateHtmlPage() {
-    final host = _server?.address.host ?? '127.0.0.1';
+    final host = _publicHost;
     final port = _server?.port ?? 0;
     final wsUrl = 'ws://$host:$port/ws';
     return '''
@@ -1353,8 +1390,16 @@ button { cursor: pointer; }
 .attachment-list { display:grid; gap: 10px; margin-top: 14px; }
 .attachment { border: 1px solid var(--outline); background: #fbfcff; border-radius: 18px; padding: 12px; }
 .attachment-row { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+.attachment-actions { display:flex; gap:10px; flex-wrap:wrap; }
+.action-link {
+  display:inline-flex; align-items:center; justify-content:center;
+  min-width:72px; padding: 9px 14px; border-radius: 999px;
+  background: rgba(19,83,216,.08); color: var(--primary-dark);
+  text-decoration:none; font-weight:800; font-size: 13px;
+}
 .preview { width: 100%; margin-top: 10px; border-radius: 14px; border: 1px solid rgba(216,222,232,.8); background: white; max-height: 320px; object-fit: cover; }
-.card-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top: 14px; }
+.card-actions { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top: 14px; }
+.card-actions .btn { min-width: 96px; }
 .empty { padding: 32px; text-align:center; color: var(--muted); border: 1px dashed var(--outline); border-radius: 28px; background: rgba(255,255,255,.72); }
 .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px); opacity: 0; background: rgba(25,28,30,.92); color:white; padding: 12px 16px; border-radius: 14px; transition: all .22s ease; z-index: 120; pointer-events: none; }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
@@ -1514,9 +1559,9 @@ function renderCards() {
         preview +
         '<div class="attachment-row" style="margin-top:10px;">' +
           '<span style="color:#667085;">' + escapeHtml(file.kind || 'other') + '</span>' +
-          '<div style="display:flex;gap:10px;flex-wrap:wrap;">' +
-            (file.previewable ? '<a href="' + file.previewUrl + '" target="_blank" rel="noopener">预览</a>' : '') +
-            '<a href="' + file.downloadUrl + '" download>下载</a>' +
+          '<div class="attachment-actions">' +
+            (file.previewable ? '<a class="action-link" href="' + file.previewUrl + '" target="_blank" rel="noopener">预览</a>' : '') +
+            '<a class="action-link" href="' + file.downloadUrl + '" download>下载</a>' +
           '</div>' +
         '</div>' +
       '</div>';
@@ -1924,22 +1969,39 @@ connectWs();
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            TextField(
-              controller: _composerController,
-              minLines: 6,
-              maxLines: 10,
-              decoration: const InputDecoration(
-                hintText: '写一句灵感、贴一段内容，或先选择附件再制卡',
-                fillColor: Colors.transparent,
-                hintStyle: TextStyle(
-                  color: Color(0xFF9AA3B2),
-                  height: 1.65,
+            Stack(
+              children: [
+                TextField(
+                  controller: _composerController,
+                  minLines: 6,
+                  maxLines: 10,
+                  decoration: const InputDecoration(
+                    hintText: '写一句灵感、贴一段内容，或先选择附件再制卡',
+                    fillColor: Colors.transparent,
+                    hintStyle: TextStyle(
+                      color: Color(0xFF9AA3B2),
+                      height: 1.65,
+                    ),
+                    contentPadding: EdgeInsets.fromLTRB(12, 12, 50, 36),
+                    border: InputBorder.none,
+                    enabledBorder: InputBorder.none,
+                    focusedBorder: InputBorder.none,
+                  ),
                 ),
-                contentPadding: EdgeInsets.fromLTRB(12, 12, 12, 6),
-                border: InputBorder.none,
-                enabledBorder: InputBorder.none,
-                focusedBorder: InputBorder.none,
-              ),
+                Positioned(
+                  right: 6,
+                  bottom: 6,
+                  child: _buildCornerIconButton(
+                    icon: Icons.close_rounded,
+                    onTap: () {
+                      setState(() {
+                        _composerController.clear();
+                        _pendingAttachments.clear();
+                      });
+                    },
+                  ),
+                ),
+              ],
             ),
             if (_pendingAttachments.isNotEmpty) ...[
               const SizedBox(height: 6),
@@ -1968,32 +2030,25 @@ connectWs();
               ),
             ],
             const Divider(height: 18, color: Color(0xFFE8EDF5)),
-            Wrap(
-              spacing: 10,
-              runSpacing: 10,
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                _buildCapsuleButton(
-                  label: _isPickingFiles ? '读取中...' : '选择文件',
-                  icon: Icons.attach_file_rounded,
-                  onTap: _isPickingFiles ? null : _pickFilesFromDevice,
-                  variant: _CapsuleButtonVariant.soft,
+                Expanded(
+                  child: _buildCapsuleButton(
+                    label: _isPickingFiles ? '读取中...' : '选择文件',
+                    icon: Icons.attach_file_rounded,
+                    onTap: _isPickingFiles ? null : _pickFilesFromDevice,
+                    variant: _CapsuleButtonVariant.soft,
+                  ),
                 ),
-                _buildCapsuleButton(
-                  label: '粘贴文字',
-                  icon: Icons.content_paste_rounded,
-                  onTap: _pasteTextToComposer,
-                  variant: _CapsuleButtonVariant.ghost,
-                ),
-                _buildCapsuleButton(
-                  label: '清空',
-                  icon: Icons.delete_outline_rounded,
-                  onTap: () {
-                    setState(() {
-                      _composerController.clear();
-                      _pendingAttachments.clear();
-                    });
-                  },
-                  variant: _CapsuleButtonVariant.ghost,
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _buildCapsuleButton(
+                    label: '粘贴文字',
+                    icon: Icons.content_paste_rounded,
+                    onTap: _pasteTextToComposer,
+                    variant: _CapsuleButtonVariant.ghost,
+                  ),
                 ),
               ],
             ),
@@ -2123,17 +2178,13 @@ connectWs();
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Wrap(
-            spacing: 10,
-            runSpacing: 10,
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
             children: [
               _buildMetaPill('创建 ${_formatDateTime(card.createdAt)}'),
-              _buildMetaPill('更新 ${_formatDateTime(card.updatedAt)}'),
-              if (cardAttachments.isNotEmpty)
-                _buildMetaPill('${cardAttachments.length} 个附件'),
             ],
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 10),
           Text(
             card.text.isEmpty ? '无文本内容' : card.text,
             style: const TextStyle(
@@ -2154,44 +2205,78 @@ connectWs();
                   borderRadius: BorderRadius.circular(16),
                   border: Border.all(color: const Color(0xFFE2E7F1)),
                 ),
-                child: Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Container(
-                      width: 38,
-                      height: 38,
-                      decoration: BoxDecoration(
-                        color: const Color(0x141353D8),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Icon(
-                        _iconForAttachment(attachment),
-                        color: const Color(0xFF1353D8),
-                      ),
+                    Row(
+                      children: [
+                        Container(
+                          width: 38,
+                          height: 38,
+                          decoration: BoxDecoration(
+                            color: const Color(0x141353D8),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Icon(
+                            _iconForAttachment(attachment),
+                            color: const Color(0xFF1353D8),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                attachment.name,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                  fontSize: 14,
+                                ),
+                              ),
+                              const SizedBox(height: 3),
+                              Text(
+                                _attachmentLabel(attachment),
+                                style: const TextStyle(
+                                  color: Color(0xFF7A8497),
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
                     ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            attachment.name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontWeight: FontWeight.w800,
-                              fontSize: 14,
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        if (attachment.isPreviewable) ...[
+                          Expanded(
+                            child: _buildCapsuleButton(
+                              label: '预览',
+                              icon: Icons.visibility_outlined,
+                              onTap: () => _openAttachment(
+                                attachment,
+                                preview: true,
+                              ),
+                              variant: _CapsuleButtonVariant.soft,
+                              compact: true,
                             ),
                           ),
-                          const SizedBox(height: 3),
-                          Text(
-                            _attachmentLabel(attachment),
-                            style: const TextStyle(
-                              color: Color(0xFF7A8497),
-                              fontSize: 12,
-                            ),
-                          ),
+                          const SizedBox(width: 8),
                         ],
-                      ),
+                        Expanded(
+                          child: _buildCapsuleButton(
+                            label: '下载',
+                            icon: Icons.download_rounded,
+                            onTap: () => _openAttachment(attachment),
+                            variant: _CapsuleButtonVariant.primary,
+                            compact: true,
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),
@@ -2199,9 +2284,8 @@ connectWs();
             ),
           ],
           const SizedBox(height: 12),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               _buildCapsuleButton(
                 label: '复制',
@@ -2313,7 +2397,7 @@ connectWs();
         foregroundColor: foreground,
         elevation: 0,
         padding: EdgeInsets.symmetric(
-          horizontal: compact ? 14 : 16,
+          horizontal: compact ? 10 : 16,
           vertical: compact ? 9 : 11,
         ),
         shape: RoundedRectangleBorder(
@@ -2323,6 +2407,7 @@ connectWs();
       icon: Icon(icon, size: compact ? 18 : 20),
       label: Text(
         label,
+        textAlign: TextAlign.center,
         style: TextStyle(
           fontWeight: FontWeight.w800,
           fontSize: compact ? 13 : 15,
@@ -2331,9 +2416,31 @@ connectWs();
     );
   }
 
+  Widget _buildCornerIconButton({
+    required IconData icon,
+    required VoidCallback? onTap,
+  }) {
+    return IconButton(
+      onPressed: onTap,
+      style: IconButton.styleFrom(
+        backgroundColor: const Color(0x1A7C8699),
+        foregroundColor: const Color(0xB35C6980),
+        minimumSize: const Size(28, 28),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        visualDensity: VisualDensity.compact,
+        padding: const EdgeInsets.all(6),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(999),
+        ),
+      ),
+      icon: Icon(icon, size: 16),
+      tooltip: '清空',
+    );
+  }
+
   Widget _buildMetaPill(String text) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
         color: const Color(0xFFF4F7FC),
         borderRadius: BorderRadius.circular(999),
@@ -2341,9 +2448,9 @@ connectWs();
       child: Text(
         text,
         style: const TextStyle(
-          fontSize: 12,
+          fontSize: 11,
           color: Color(0xFF718097),
-          fontWeight: FontWeight.w700,
+          fontWeight: FontWeight.w600,
         ),
       ),
     );
