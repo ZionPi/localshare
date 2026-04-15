@@ -50,6 +50,7 @@ app.*.map.json
 
 # Native toolchains and local machine config
 **/.gradle/
+/android/.gradle-home/
 **/DerivedData/
 **/.symlinks/
 **/Pods/
@@ -60,3 +61,6 @@ ios/Flutter/flutter_export_environment.sh
 
 # Editor / workspace leftovers
 .vscode/
+
+# Local screenshots
+/flutter_*.png

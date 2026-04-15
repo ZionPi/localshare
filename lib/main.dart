@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
@@ -16,6 +17,10 @@ import 'package:shelf_router/shelf_router.dart' as shelf_router;
 import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+
+const String kLifecycleChannelName = 'localshare/lifecycle';
+const String kServiceChannelName = 'localshare/service';
+const String kClipboardChannelName = 'localshare/clipboard';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -183,6 +188,7 @@ class CardItem {
     required this.text,
     required this.createdAt,
     required this.updatedAt,
+    this.pinnedAt,
     List<String>? attachmentIds,
   }) : attachmentIds = attachmentIds ?? <String>[];
 
@@ -190,7 +196,10 @@ class CardItem {
   String text;
   final DateTime createdAt;
   DateTime updatedAt;
+  DateTime? pinnedAt;
   final List<String> attachmentIds;
+
+  bool get isPinned => pinnedAt != null;
 
   Map<String, dynamic> toJson() {
     return {
@@ -198,6 +207,7 @@ class CardItem {
       'text': text,
       'createdAt': createdAt.toIso8601String(),
       'updatedAt': updatedAt.toIso8601String(),
+      'pinnedAt': pinnedAt?.toIso8601String(),
       'attachmentIds': attachmentIds,
     };
   }
@@ -208,6 +218,8 @@ class CardItem {
       'text': text,
       'createdAt': createdAt.toIso8601String(),
       'updatedAt': updatedAt.toIso8601String(),
+      'pinnedAt': pinnedAt?.toIso8601String(),
+      'pinned': isPinned,
       'attachments': attachmentIds
           .map((attachmentId) => attachmentMap[attachmentId])
           .whereType<CardAttachment>()
@@ -224,6 +236,7 @@ class CardItem {
           DateTime.now(),
       updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ??
           DateTime.now(),
+      pinnedAt: DateTime.tryParse(json['pinnedAt'] as String? ?? ''),
       attachmentIds: (json['attachmentIds'] as List<dynamic>? ?? <dynamic>[])
           .map((value) => value as String)
           .toList(),
@@ -419,9 +432,18 @@ class MyHomePage extends StatefulWidget {
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
+class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
   static const MethodChannel _lifecycleChannel =
-      MethodChannel('localshare/lifecycle');
+      MethodChannel(kLifecycleChannelName);
+  static const MethodChannel _serviceChannel =
+      MethodChannel(kServiceChannelName);
+  static const MethodChannel _clipboardChannel =
+      MethodChannel(kClipboardChannelName);
+  static const String _preferredPortKey = 'preferred_server_port';
+  static const String _useFixedPortKey = 'use_fixed_server_port';
+  static const String _confirmDeleteKey = 'confirm_delete_before_remove';
+  static const int _defaultServerPort = 35773;
+  static const int _maxPinnedCards = 5;
 
   final TextEditingController _composerController = TextEditingController();
   final TextEditingController _searchController = TextEditingController();
@@ -439,22 +461,29 @@ class _MyHomePageState extends State<MyHomePage> {
   StreamSubscription? _intentDataStreamSubscription;
   Timer? _saveDebounceTimer;
   Timer? _broadcastDebounceTimer;
+  Timer? _stateRefreshTimer;
 
   String _serverAddress = '服务启动中';
   String _publicHost = '127.0.0.1';
+  int _preferredPort = _defaultServerPort;
+  bool _useFixedPort = false;
+  bool _confirmDelete = true;
   bool _isServerRunning = false;
   bool _isPickingFiles = false;
   bool _isLoading = true;
+  DateTime? _lastStateSyncAt;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initializeApp();
   }
 
   Future<void> _initializeApp() async {
     try {
       _storage = await LocalShareStorage.create();
+      await _loadPreferences();
       final state = await _storage!.loadState();
       _cards
         ..clear()
@@ -462,8 +491,10 @@ class _MyHomePageState extends State<MyHomePage> {
       _attachments
         ..clear()
         ..addEntries(state.attachments.map((e) => MapEntry(e.id, e)));
+      await _markStateSynced();
       await _setupSharingHandlers();
       await _startServer();
+      _startStateRefreshLoop();
     } catch (error) {
       _showToast('初始化失败: $error');
     } finally {
@@ -475,16 +506,49 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  Future<void> _loadPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    _useFixedPort = prefs.getBool(_useFixedPortKey) ?? false;
+    _confirmDelete = prefs.getBool(_confirmDeleteKey) ?? true;
+    final savedPort = prefs.getInt(_preferredPortKey);
+    if (savedPort != null && savedPort >= 1 && savedPort <= 65535) {
+      _preferredPort = savedPort;
+    }
+  }
+
+  Future<void> _savePortSettings({
+    required bool useFixedPort,
+    required int port,
+    required bool confirmDelete,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_useFixedPortKey, useFixedPort);
+    await prefs.setInt(_preferredPortKey, port);
+    await prefs.setBool(_confirmDeleteKey, confirmDelete);
+    _useFixedPort = useFixedPort;
+    _preferredPort = port;
+    _confirmDelete = confirmDelete;
+  }
+
   @override
   void dispose() {
-    _stopServer();
+    WidgetsBinding.instance.removeObserver(this);
+    unawaited(_stopServer());
     _composerController.dispose();
     _searchController.dispose();
     _scrollController.dispose();
     _saveDebounceTimer?.cancel();
     _broadcastDebounceTimer?.cancel();
+    _stateRefreshTimer?.cancel();
     _intentDataStreamSubscription?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_refreshStateFromStorageIfChanged(force: true));
+    }
   }
 
   List<CardItem> get _sortedCards {
@@ -506,7 +570,23 @@ class _MyHomePageState extends State<MyHomePage> {
       return false;
     }).toList();
 
-    items.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    return _sortCards(items);
+  }
+
+  List<CardItem> _sortCards(Iterable<CardItem> cards) {
+    final items = cards.toList();
+    items.sort((a, b) {
+      if (a.isPinned != b.isPinned) {
+        return a.isPinned ? -1 : 1;
+      }
+      if (a.isPinned && b.isPinned) {
+        final pinCompare = b.pinnedAt!.compareTo(a.pinnedAt!);
+        if (pinCompare != 0) {
+          return pinCompare;
+        }
+      }
+      return b.updatedAt.compareTo(a.updatedAt);
+    });
     return items;
   }
 
@@ -515,6 +595,7 @@ class _MyHomePageState extends State<MyHomePage> {
       return;
     }
     await _storage!.saveState(_cards, _attachments.values);
+    await _markStateSynced();
   }
 
   void _schedulePersist() {
@@ -527,6 +608,46 @@ class _MyHomePageState extends State<MyHomePage> {
         debugPrint('persist failed: $error');
       }
     });
+  }
+
+  Future<void> _markStateSynced() async {
+    final storage = _storage;
+    if (storage == null || !await storage.stateFile.exists()) {
+      return;
+    }
+    _lastStateSyncAt = await storage.stateFile.lastModified();
+  }
+
+  void _startStateRefreshLoop() {
+    _stateRefreshTimer?.cancel();
+    _stateRefreshTimer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => unawaited(_refreshStateFromStorageIfChanged()),
+    );
+  }
+
+  Future<void> _refreshStateFromStorageIfChanged({bool force = false}) async {
+    final storage = _storage;
+    if (storage == null || !await storage.stateFile.exists()) {
+      return;
+    }
+    final modifiedAt = await storage.stateFile.lastModified();
+    if (!force &&
+        _lastStateSyncAt != null &&
+        !modifiedAt.isAfter(_lastStateSyncAt!)) {
+      return;
+    }
+    final state = await storage.loadState();
+    _cards
+      ..clear()
+      ..addAll(state.cards);
+    _attachments
+      ..clear()
+      ..addEntries(state.attachments.map((entry) => MapEntry(entry.id, entry)));
+    _lastStateSyncAt = modifiedAt;
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   Future<void> _setupSharingHandlers() async {
@@ -665,20 +786,23 @@ class _MyHomePageState extends State<MyHomePage> {
       throw StateError('Storage not initialized');
     }
     await storage.ensureReady();
-    final safeName = _sanitizeFileName(fileName ?? 'attachment');
+    final displayName = (fileName == null || fileName.trim().isEmpty)
+        ? 'attachment'
+        : fileName.trim();
     final attachmentId = _generateId('file');
-    final targetPath = '${storage.attachmentsDir.path}/$attachmentId-$safeName';
+    final storedFileName = _buildStoredFileName(displayName, attachmentId);
+    final targetPath = '${storage.attachmentsDir.path}/$storedFileName';
     final file = File(targetPath);
     await file.writeAsBytes(bytes, flush: true);
 
     final attachment = CardAttachment(
       id: attachmentId,
       cardId: cardId,
-      name: safeName,
+      name: displayName,
       mimeType: mimeType,
       size: bytes.length,
       localPath: targetPath,
-      kind: _kindFromMimeType(mimeType, safeName),
+      kind: _kindFromMimeType(mimeType, displayName),
       createdAt: DateTime.now(),
     );
     _attachments[attachment.id] = attachment;
@@ -727,9 +851,139 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  Future<bool> _showDeleteConfirmDialog({
+    required String title,
+    required String message,
+    String confirmLabel = '删除',
+  }) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFBA1A1A),
+              foregroundColor: Colors.white,
+            ),
+            child: Text(confirmLabel),
+          ),
+        ],
+      ),
+    );
+    return confirmed ?? false;
+  }
+
+  Future<void> _deleteCardWithConfirm(CardItem card) async {
+    if (_confirmDelete) {
+      final confirmed = await _showDeleteConfirmDialog(
+        title: '删除卡片',
+        message: '删除后将同时移除这张卡片及其附件，确认继续吗？',
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+    await _deleteCard(card.id);
+  }
+
+  Future<void> _clearAllCards() async {
+    if (_cards.isEmpty) {
+      _showToast('当前没有可清空的卡片');
+      return;
+    }
+    final confirmed = await _showDeleteConfirmDialog(
+      title: '清空所有卡片',
+      message: '这会删除全部卡片和所有附件，且无法恢复。',
+      confirmLabel: '全部清空',
+    );
+    if (!confirmed) {
+      return;
+    }
+    for (final attachment in _attachments.values) {
+      final file = File(attachment.localPath);
+      if (await file.exists()) {
+        await file.delete();
+      }
+    }
+    _attachments.clear();
+    _cards.clear();
+    await _persistStateNow();
+    _broadcastSnapshot();
+    if (mounted) {
+      setState(() {});
+    }
+    _showToast('已清空所有卡片');
+  }
+
+  Future<void> _togglePinnedCard(CardItem card) async {
+    final nextPinnedAt = card.isPinned ? null : DateTime.now();
+    if (nextPinnedAt != null) {
+      final pinnedCount = _cards.where((item) => item.isPinned).length;
+      if (pinnedCount >= _maxPinnedCards) {
+        _showToast('最多只能置顶 $_maxPinnedCards 个卡片');
+        return;
+      }
+    }
+    card.pinnedAt = nextPinnedAt;
+    await _persistStateNow();
+    _broadcastSnapshot();
+    if (mounted) {
+      setState(() {});
+    }
+    _showToast(nextPinnedAt == null ? '已取消置顶' : '已置顶到卡片顶部');
+  }
+
   Future<void> _copyCardText(String text) async {
     await Clipboard.setData(ClipboardData(text: text));
     _showToast(text.trim().isEmpty ? '空卡片已复制' : '卡片内容已复制');
+  }
+
+  Uri? _extractStandaloneUrl(String text) {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty || trimmed.contains(RegExp(r'\s'))) {
+      return null;
+    }
+    final uri = Uri.tryParse(trimmed);
+    if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
+      return null;
+    }
+    if (uri.scheme != 'http' && uri.scheme != 'https') {
+      return null;
+    }
+    return uri;
+  }
+
+  Future<void> _openCardUrl(CardItem card) async {
+    final uri = _extractStandaloneUrl(card.text);
+    if (uri == null) {
+      _showToast('这张卡片不是可直接打开的链接');
+      return;
+    }
+    final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!launched) {
+      _showToast('无法打开该链接');
+    }
+  }
+
+  Future<void> _shareCard(CardItem card) async {
+    final text = card.text.trim();
+    if (text.isEmpty) {
+      _showToast('空卡片暂不支持分享');
+      return;
+    }
+    try {
+      await Share.share(text, subject: '本地分享');
+    } catch (error) {
+      _showToast('分享失败');
+      debugPrint('shareCard failed: $error');
+    }
   }
 
   void _showToast(String message) {
@@ -749,6 +1003,84 @@ class _MyHomePageState extends State<MyHomePage> {
     }
     await Clipboard.setData(ClipboardData(text: _serverAddress));
     _showToast('访问地址已复制');
+  }
+
+  Future<void> _syncForegroundService() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+    try {
+      await _serviceChannel.invokeMethod<void>('startForegroundService', {
+        'address': _serverAddress,
+        'port': _server?.port ?? _preferredPort,
+      });
+    } catch (error) {
+      debugPrint('startForegroundService failed: $error');
+    }
+  }
+
+  Future<void> _stopForegroundService() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+    try {
+      await _serviceChannel.invokeMethod<void>('stopForegroundService');
+    } catch (error) {
+      debugPrint('stopForegroundService failed: $error');
+    }
+  }
+
+  Future<void> _requestNotificationPermission() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+    try {
+      await _serviceChannel.invokeMethod<bool>('requestNotificationPermission');
+    } catch (error) {
+      debugPrint('requestNotificationPermission failed: $error');
+    }
+  }
+
+  Future<void> _openSettings() async {
+    final nextSettings = await Navigator.of(context).push<_PortSettingsResult>(
+      MaterialPageRoute<_PortSettingsResult>(
+        builder: (context) => LocalShareSettingsPage(
+          initialUseFixedPort: _useFixedPort,
+          initialPort: _preferredPort,
+          initialConfirmDelete: _confirmDelete,
+        ),
+      ),
+    );
+    if (nextSettings == null ||
+        (nextSettings.port == _preferredPort &&
+            nextSettings.useFixedPort == _useFixedPort &&
+            nextSettings.confirmDelete == _confirmDelete &&
+            !nextSettings.clearAllCards)) {
+      return;
+    }
+    await _savePortSettings(
+      useFixedPort: nextSettings.useFixedPort,
+      port: nextSettings.port,
+      confirmDelete: nextSettings.confirmDelete,
+    );
+    if (nextSettings.clearAllCards) {
+      await _clearAllCards();
+    }
+    _showToast(
+      nextSettings.clearAllCards
+          ? '设置已更新'
+          : nextSettings.useFixedPort
+              ? '固定端口已更新为 ${nextSettings.port}'
+              : '已切换为随机端口',
+    );
+    if (_isServerRunning) {
+      await _stopServer();
+      await _startServer();
+    } else if (mounted) {
+      setState(() {
+        _serverAddress = '服务未启动';
+      });
+    }
   }
 
   Uri? _buildAttachmentUri(CardAttachment attachment, {bool preview = false}) {
@@ -780,6 +1112,84 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  Future<void> _showImagePreview(CardAttachment attachment) async {
+    if (!mounted) {
+      return;
+    }
+    await showGeneralDialog<void>(
+      context: context,
+      barrierLabel: '图片预览',
+      barrierDismissible: true,
+      barrierColor: Colors.black.withValues(alpha: 0.88),
+      transitionDuration: const Duration(milliseconds: 220),
+      pageBuilder: (context, animation, secondaryAnimation) {
+        return SafeArea(
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: GestureDetector(
+                  onTap: () => Navigator.of(context).pop(),
+                  child: ColoredBox(
+                    color: Colors.black.withValues(alpha: 0.01),
+                    child: Center(
+                      child: InteractiveViewer(
+                        minScale: 0.8,
+                        maxScale: 4,
+                        child: Hero(
+                          tag: 'attachment-preview-${attachment.id}',
+                          child: Image.file(
+                            File(attachment.localPath),
+                            fit: BoxFit.contain,
+                            errorBuilder: (context, error, stackTrace) {
+                              return _buildImagePreviewFallback(compact: false);
+                            },
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              Positioned(
+                top: 12,
+                right: 12,
+                child: Material(
+                  color: Colors.transparent,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(999),
+                    onTap: () => Navigator.of(context).pop(),
+                    child: Ink(
+                      width: 44,
+                      height: 44,
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.34),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.close, color: Colors.white),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+      transitionBuilder: (context, animation, secondaryAnimation, child) {
+        final curved = CurvedAnimation(
+          parent: animation,
+          curve: Curves.easeOutCubic,
+        );
+        return FadeTransition(
+          opacity: curved,
+          child: ScaleTransition(
+            scale: Tween<double>(begin: 0.96, end: 1).animate(curved),
+            child: child,
+          ),
+        );
+      },
+    );
+  }
+
   Future<void> _createCardFromComposer() async {
     final value = _composerController.text.trim();
     if (value.isEmpty && _pendingAttachments.isEmpty) {
@@ -797,11 +1207,64 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  Future<void> _pasteTextToComposer() async {
+  Future<void> _pasteClipboardToComposer() async {
+    if (Platform.isAndroid) {
+      try {
+        final payload = await _clipboardChannel
+            .invokeMapMethod<String, dynamic>('readClipboardPayload');
+        final type = payload?['type'] as String? ?? 'empty';
+        if (type == 'image') {
+          final bytes = payload?['bytes'];
+          final imageBytes = switch (bytes) {
+            final List<int> list => list,
+            _ => <int>[],
+          };
+          if (imageBytes.isEmpty) {
+            _showToast('剪贴板图片读取失败');
+            return;
+          }
+          final mimeType =
+              payload?['mimeType'] as String? ?? 'application/octet-stream';
+          final name = payload?['name'] as String? ??
+              'pasted-image.${_extensionForMimeType(mimeType)}';
+          if (mounted) {
+            setState(() {
+              _pendingAttachments.add(
+                _IncomingAttachmentPayload(
+                  name: name,
+                  mimeType: mimeType,
+                  bytes: imageBytes,
+                ),
+              );
+            });
+          }
+          _showToast('已粘贴图片');
+          return;
+        }
+        if (type == 'text') {
+          final text = (payload?['text'] as String? ?? '').trim();
+          if (text.isNotEmpty) {
+            if (mounted) {
+              setState(() {
+                _composerController.text = text;
+                _composerController.selection = TextSelection.collapsed(
+                  offset: _composerController.text.length,
+                );
+              });
+            }
+            _showToast('已粘贴文本');
+            return;
+          }
+        }
+      } on PlatformException catch (error) {
+        debugPrint('pasteClipboardToComposer failed: $error');
+      }
+    }
+
     final clipboardData = await Clipboard.getData(Clipboard.kTextPlain);
     final text = clipboardData?.text?.trim();
     if (text == null || text.isEmpty) {
-      _showToast('剪贴板里没有可粘贴的文字');
+      _showToast('剪贴板里没有可粘贴的内容');
       return;
     }
 
@@ -813,6 +1276,7 @@ class _MyHomePageState extends State<MyHomePage> {
         );
       });
     }
+    _showToast('已粘贴文本');
   }
 
   Future<void> _pickFilesFromDevice() async {
@@ -901,6 +1365,7 @@ class _MyHomePageState extends State<MyHomePage> {
     }
 
     try {
+      await _requestNotificationPermission();
       final ipAddress = await _getLocalIpAddress();
       if (ipAddress == null) {
         setState(() {
@@ -942,10 +1407,11 @@ class _MyHomePageState extends State<MyHomePage> {
         return router.call(request);
       }
 
+      final targetPort = _useFixedPort ? _preferredPort : 0;
       _server = await shelf_io.serve(
         handler,
         InternetAddress.anyIPv4,
-        0,
+        targetPort,
         shared: true,
       );
       if (mounted) {
@@ -954,6 +1420,20 @@ class _MyHomePageState extends State<MyHomePage> {
           _serverAddress = 'http://$_publicHost:${_server!.port}';
           _isServerRunning = true;
         });
+      }
+      await _syncForegroundService();
+    } on SocketException catch (error) {
+      final addressInUse = error.osError?.errorCode == 48 ||
+          error.osError?.errorCode == 98 ||
+          error.message.contains('Address already in use');
+      if (mounted) {
+        setState(() {
+          _serverAddress =
+              addressInUse ? '端口 $_preferredPort 已被占用' : '服务器启动失败: $error';
+        });
+      }
+      if (addressInUse) {
+        _showToast('端口 $_preferredPort 已被占用，请到设置页修改');
       }
     } catch (error) {
       if (mounted) {
@@ -964,7 +1444,7 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  void _stopServer() {
+  Future<void> _stopServer() async {
     if (!_isServerRunning) {
       return;
     }
@@ -972,7 +1452,8 @@ class _MyHomePageState extends State<MyHomePage> {
       client.sink.close();
     }
     _webSocketClients.clear();
-    _server?.close();
+    await _stopForegroundService();
+    await _server?.close(force: true);
     _server = null;
     if (mounted) {
       setState(() {
@@ -1009,9 +1490,9 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Map<String, dynamic> _buildSnapshot() {
-    final cards = _cards.map((card) => card.toPublicJson(_attachments)).toList()
-      ..sort((a, b) => DateTime.parse(b['updatedAt'] as String)
-          .compareTo(DateTime.parse(a['updatedAt'] as String)));
+    final cards = _sortCards(_cards)
+        .map((card) => card.toPublicJson(_attachments))
+        .toList();
     return {
       'type': 'cardsSnapshot',
       'cards': cards,
@@ -1109,7 +1590,10 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<Response> _handleDeleteCard(Request request, String cardId) async {
-    await _deleteCard(cardId);
+    final card = _findCard(cardId);
+    if (card != null) {
+      await _deleteCard(card.id);
+    }
     return _jsonResponse({'ok': true});
   }
 
@@ -1156,9 +1640,10 @@ class _MyHomePageState extends State<MyHomePage> {
         'content-type': attachment.mimeType,
         'content-length': bytes.length.toString(),
         'cache-control': 'no-cache',
-        'content-disposition': isPreview
-            ? 'inline; filename="${Uri.encodeComponent(attachment.name)}"'
-            : 'attachment; filename="${Uri.encodeComponent(attachment.name)}"',
+        'content-disposition': _buildContentDisposition(
+          attachment.name,
+          inline: isPreview,
+        ),
       },
     );
   }
@@ -1192,8 +1677,21 @@ class _MyHomePageState extends State<MyHomePage> {
     return '$prefix-${DateTime.now().microsecondsSinceEpoch}-${_random.nextInt(1 << 32)}';
   }
 
-  String _sanitizeFileName(String input) {
-    return input.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+  String _buildStoredFileName(String fileName, String attachmentId) {
+    return '$attachmentId-${Uri.encodeComponent(fileName)}';
+  }
+
+  String _asciiFallbackFileName(String fileName) {
+    return fileName
+        .replaceAll(RegExp(r'[\r\n"]'), '_')
+        .replaceAll(RegExp(r'[^\x20-\x7E]'), '_');
+  }
+
+  String _buildContentDisposition(String fileName, {required bool inline}) {
+    final disposition = inline ? 'inline' : 'attachment';
+    final fallback = _asciiFallbackFileName(fileName);
+    final encoded = Uri.encodeComponent(fileName);
+    return "$disposition; filename=\"$fallback\"; filename*=UTF-8''$encoded";
   }
 
   String _guessMimeType(String fileName) {
@@ -1231,6 +1729,43 @@ class _MyHomePageState extends State<MyHomePage> {
       '7z': 'application/x-7z-compressed',
     };
     return mimeTypes[extension] ?? 'application/octet-stream';
+  }
+
+  String _extensionForMimeType(String mimeType) {
+    switch (mimeType) {
+      case 'image/png':
+        return 'png';
+      case 'image/jpeg':
+        return 'jpg';
+      case 'image/gif':
+        return 'gif';
+      case 'image/webp':
+        return 'webp';
+      case 'image/heic':
+        return 'heic';
+      case 'audio/mpeg':
+        return 'mp3';
+      case 'audio/wav':
+        return 'wav';
+      case 'audio/mp4':
+        return 'm4a';
+      case 'audio/aac':
+        return 'aac';
+      case 'video/mp4':
+        return 'mp4';
+      case 'video/quicktime':
+        return 'mov';
+      case 'video/x-matroska':
+        return 'mkv';
+      case 'video/x-msvideo':
+        return 'avi';
+      case 'application/pdf':
+        return 'pdf';
+      case 'text/plain':
+        return 'txt';
+      default:
+        return 'bin';
+    }
   }
 
   AttachmentKind _kindFromMimeType(String mimeType, String fileName) {
@@ -1308,6 +1843,54 @@ class _MyHomePageState extends State<MyHomePage> {
 
   String _attachmentLabel(CardAttachment attachment) {
     return '${attachment.name} · ${_formatBytes(attachment.size)}';
+  }
+
+  Widget _buildImageAttachmentPreview(CardAttachment attachment) {
+    return GestureDetector(
+      onTap: () => _showImagePreview(attachment),
+      child: Hero(
+        tag: 'attachment-preview-${attachment.id}',
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(18),
+          child: AspectRatio(
+            aspectRatio: 16 / 10,
+            child: Image.file(
+              File(attachment.localPath),
+              fit: BoxFit.cover,
+              errorBuilder: (context, error, stackTrace) {
+                return _buildImagePreviewFallback();
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildImagePreviewFallback({bool compact = true}) {
+    return Container(
+      color: const Color(0xFFF2F4F8),
+      alignment: Alignment.center,
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            Icons.broken_image_outlined,
+            size: compact ? 28 : 56,
+            color: const Color(0xFF8A93A5),
+          ),
+          SizedBox(height: compact ? 8 : 12),
+          Text(
+            '图片加载失败',
+            style: TextStyle(
+              color: const Color(0xFF6C7485),
+              fontSize: compact ? 12 : 16,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   String _generateHtmlPage() {
@@ -1398,8 +1981,8 @@ button { cursor: pointer; }
   text-decoration:none; font-weight:800; font-size: 13px;
 }
 .preview { width: 100%; margin-top: 10px; border-radius: 14px; border: 1px solid rgba(216,222,232,.8); background: white; max-height: 320px; object-fit: cover; }
-.card-actions { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top: 14px; }
-.card-actions .btn { min-width: 96px; }
+.card-actions { display:flex; align-items:center; gap:10px; margin-top: 14px; }
+.card-actions .btn { flex: 1 1 0; min-width: 0; }
 .empty { padding: 32px; text-align:center; color: var(--muted); border: 1px dashed var(--outline); border-radius: 28px; background: rgba(255,255,255,.72); }
 .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px); opacity: 0; background: rgba(25,28,30,.92); color:white; padding: 12px 16px; border-radius: 14px; transition: all .22s ease; z-index: 120; pointer-events: none; }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
@@ -1430,7 +2013,7 @@ button { cursor: pointer; }
     <div class="address-label">访问地址</div>
     <code class="address-code" id="addressText"></code>
     <div class="address-hint">
-      <span>点击复制当前真实访问地址，端口为自动分配。</span>
+      <span>点击复制当前真实访问地址，端口模式由设置页控制。</span>
       <span style="display:flex;align-items:center;gap:6px;color:rgba(19,83,216,.65);"><span class="material-symbols-outlined" style="font-size:18px;">content_copy</span>点击可复制</span>
     </div>
   </section>
@@ -1453,7 +2036,7 @@ button { cursor: pointer; }
       <div class="icon"><span class="material-symbols-outlined">play_arrow</span></div>
       <div>
         <div style="font-weight:800;">启动服务</div>
-        <div style="margin-top:4px;color:#667085;font-size:12px;">随机端口 · 后台同步已就绪</div>
+        <div style="margin-top:4px;color:#667085;font-size:12px;">端口模式可配置 · 后台同步已就绪</div>
       </div>
     </div>
     <div class="panel control danger" id="stopBtn">
@@ -1520,6 +2103,18 @@ function formatBytes(bytes) {
   return (bytes / 1024 / 1024 / 1024).toFixed(1) + ' GB';
 }
 
+function extractStandaloneUrl(text) {
+  const value = String(text || '').trim();
+  if (!value || /\\s/.test(value)) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'http:' || url.protocol === 'https:') {
+      return url.toString();
+    }
+  } catch (_) {}
+  return null;
+}
+
 function renderPickedFiles() {
   if (!pendingFiles.length) {
     pickedFiles.innerHTML = '<span class="chip">未选择附件</span>';
@@ -1543,6 +2138,7 @@ function renderCards() {
   }
 
   cardsRoot.innerHTML = filtered.map(card => {
+    const openUrl = extractStandaloneUrl(card.text || '');
     const attachments = (card.attachments || []).map(file => {
       let preview = '';
       if (file.previewable && file.kind === 'image') {
@@ -1568,12 +2164,13 @@ function renderCards() {
     }).join('');
 
     return '<article class="panel card">' +
-      '<div class="card-top"><span>创建 ' + new Date(card.createdAt).toLocaleString() + '</span><span>更新 ' + new Date(card.updatedAt).toLocaleString() + '</span></div>' +
+      '<div class="card-top"><span>' + (card.pinned ? '置顶' : '') + '</span><span>创建 ' + new Date(card.createdAt).toLocaleString() + '</span></div>' +
       '<div class="card-text">' + escapeHtml(card.text || '无文本内容') + '</div>' +
       (attachments ? '<div class="attachment-list">' + attachments + '</div>' : '') +
       '<div class="card-actions">' +
-        '<button class="btn btn-ghost" onclick="copyCard(' + JSON.stringify(card.text || '') + ')">复制</button>' +
-        '<button class="btn btn-danger" onclick="deleteCard(' + JSON.stringify(card.id) + ')">删除</button>' +
+        (openUrl ? '<button class="btn btn-soft" data-action="open-card" data-card-url="' + escapeHtml(openUrl) + '">打开</button>' : '') +
+        '<button class="btn btn-ghost" data-action="copy-card" data-card-id="' + escapeHtml(card.id) + '">复制</button>' +
+        '<button class="btn btn-danger" data-action="delete-card" data-card-id="' + escapeHtml(card.id) + '">删除</button>' +
       '</div>' +
     '</article>';
   }).join('');
@@ -1667,6 +2264,23 @@ async function copyCard(text) {
   showToast('已复制到剪贴板');
 }
 
+cardsRoot.addEventListener('click', async event => {
+  const target = event.target.closest('button[data-action]');
+  if (!target) return;
+  const cardId = target.dataset.cardId || '';
+  const card = cards.find(item => item.id === cardId);
+  if (!card) return;
+  if (target.dataset.action === 'copy-card') {
+    await copyCard(card.text || '');
+  } else if (target.dataset.action === 'open-card') {
+    const url = target.dataset.cardUrl || '';
+    if (!url) return;
+    window.open(url, '_blank', 'noopener');
+  } else if (target.dataset.action === 'delete-card') {
+    await deleteCard(card.id);
+  }
+});
+
 async function copyAddress() {
   try {
     await navigator.clipboard.writeText(addressText.textContent || '');
@@ -1739,6 +2353,11 @@ connectWs();
           ),
         ),
         actions: [
+          IconButton(
+            tooltip: '设置',
+            onPressed: _openSettings,
+            icon: const Icon(Icons.settings_outlined, size: 22),
+          ),
           IconButton(
             tooltip: '顶部',
             onPressed: _scrollToTop,
@@ -1947,8 +2566,10 @@ connectWs();
               ),
             ),
             const SizedBox(height: 8),
-            const Text(
-              '点击可复制当前真实访问地址，端口自动分配。',
+            Text(
+              _isServerRunning
+                  ? '点击可复制当前访问地址，端口模式由设置页控制。'
+                  : '可在设置页切换随机端口或固定端口。',
               style: TextStyle(
                 color: Color(0xFF758094),
                 fontSize: 12.5,
@@ -2044,9 +2665,9 @@ connectWs();
                 const SizedBox(width: 12),
                 Expanded(
                   child: _buildCapsuleButton(
-                    label: '粘贴文字',
+                    label: '粘贴',
                     icon: Icons.content_paste_rounded,
-                    onTap: _pasteTextToComposer,
+                    onTap: _pasteClipboardToComposer,
                     variant: _CapsuleButtonVariant.ghost,
                   ),
                 ),
@@ -2091,7 +2712,7 @@ connectWs();
           child: _buildServiceCard(
             icon: Icons.play_arrow_rounded,
             label: '启动服务',
-            subtitle: '后台同步已就绪',
+            subtitle: _useFixedPort ? '固定端口 $_preferredPort' : '随机端口',
             onTap: _isServerRunning ? null : _startServer,
           ),
         ),
@@ -2171,139 +2792,198 @@ connectWs();
         .map((id) => _attachments[id])
         .whereType<CardAttachment>()
         .toList();
+    final openUrl = _extractStandaloneUrl(card.text);
 
-    return Container(
-      decoration: _panelDecoration(radius: 24, shadowOpacity: 0.045),
-      padding: const EdgeInsets.all(12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.end,
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(24),
+        onLongPress: () => _togglePinnedCard(card),
+        child: Ink(
+          decoration: _panelDecoration(radius: 24, shadowOpacity: 0.045),
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _buildMetaPill('创建 ${_formatDateTime(card.createdAt)}'),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Text(
-            card.text.isEmpty ? '无文本内容' : card.text,
-            style: const TextStyle(
-              color: Color(0xFF1F2430),
-              fontSize: 14.5,
-              height: 1.6,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-          if (cardAttachments.isNotEmpty) ...[
-            const SizedBox(height: 14),
-            ...cardAttachments.map(
-              (attachment) => Container(
-                margin: const EdgeInsets.only(bottom: 10),
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFF7F9FD),
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: const Color(0xFFE2E7F1)),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Container(
-                          width: 38,
-                          height: 38,
-                          decoration: BoxDecoration(
-                            color: const Color(0x141353D8),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Icon(
-                            _iconForAttachment(attachment),
-                            color: const Color(0xFF1353D8),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                attachment.name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w800,
-                                  fontSize: 14,
-                                ),
-                              ),
-                              const SizedBox(height: 3),
-                              Text(
-                                _attachmentLabel(attachment),
-                                style: const TextStyle(
-                                  color: Color(0xFF7A8497),
-                                  fontSize: 12,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  AnimatedOpacity(
+                    opacity: card.isPinned ? 1 : 0,
+                    duration: const Duration(milliseconds: 160),
+                    child: IgnorePointer(
+                      ignoring: !card.isPinned,
+                      child: _buildMetaPill(
+                        '置顶',
+                        foregroundColor: const Color(0xFF0D44B3),
+                        backgroundColor: const Color(0xFFEAF1FF),
+                      ),
                     ),
-                    const SizedBox(height: 12),
-                    Row(
+                  ),
+                  _buildMetaPill('创建 ${_formatDateTime(card.createdAt)}'),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text(
+                card.text.isEmpty ? '无文本内容' : card.text,
+                style: const TextStyle(
+                  color: Color(0xFF1F2430),
+                  fontSize: 14.5,
+                  height: 1.6,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              if (cardAttachments.isNotEmpty) ...[
+                const SizedBox(height: 14),
+                ...cardAttachments.map(
+                  (attachment) => Container(
+                    margin: const EdgeInsets.only(bottom: 10),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF7F9FD),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: const Color(0xFFE2E7F1)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        if (attachment.isPreviewable) ...[
-                          Expanded(
-                            child: _buildCapsuleButton(
-                              label: '预览',
-                              icon: Icons.visibility_outlined,
-                              onTap: () => _openAttachment(
-                                attachment,
-                                preview: true,
-                              ),
-                              variant: _CapsuleButtonVariant.soft,
-                              compact: true,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
+                        if (attachment.kind == AttachmentKind.image) ...[
+                          _buildImageAttachmentPreview(attachment),
+                          const SizedBox(height: 12),
                         ],
-                        Expanded(
-                          child: _buildCapsuleButton(
-                            label: '下载',
-                            icon: Icons.download_rounded,
-                            onTap: () => _openAttachment(attachment),
-                            variant: _CapsuleButtonVariant.primary,
-                            compact: true,
-                          ),
+                        Row(
+                          children: [
+                            Container(
+                              width: 38,
+                              height: 38,
+                              decoration: BoxDecoration(
+                                color: const Color(0x141353D8),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: Icon(
+                                _iconForAttachment(attachment),
+                                color: const Color(0xFF1353D8),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    attachment.name,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w800,
+                                      fontSize: 14,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 3),
+                                  Text(
+                                    _attachmentLabel(attachment),
+                                    style: const TextStyle(
+                                      color: Color(0xFF7A8497),
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            if (attachment.isPreviewable &&
+                                attachment.kind != AttachmentKind.image) ...[
+                              Expanded(
+                                child: _buildCapsuleButton(
+                                  label: '预览',
+                                  icon: Icons.visibility_outlined,
+                                  onTap: () => _openAttachment(
+                                    attachment,
+                                    preview: true,
+                                  ),
+                                  variant: _CapsuleButtonVariant.soft,
+                                  compact: true,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                            ],
+                            Expanded(
+                              child: _buildCapsuleButton(
+                                label: attachment.kind == AttachmentKind.image
+                                    ? '原图'
+                                    : '下载',
+                                icon: Icons.download_rounded,
+                                onTap: () => _openAttachment(attachment),
+                                variant: _CapsuleButtonVariant.primary,
+                                compact: true,
+                              ),
+                            ),
+                          ],
                         ),
                       ],
                     ),
-                  ],
+                  ),
                 ),
-              ),
-            ),
-          ],
-          const SizedBox(height: 12),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              _buildCapsuleButton(
-                label: '复制',
-                icon: Icons.content_copy,
-                onTap: () => _copyCardText(card.text),
-                variant: _CapsuleButtonVariant.ghost,
-                compact: true,
-              ),
-              _buildCapsuleButton(
-                label: '删除',
-                icon: Icons.delete_outline,
-                onTap: () => _deleteCard(card.id),
-                variant: _CapsuleButtonVariant.danger,
-                compact: true,
+              ],
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  if (openUrl != null) ...[
+                    Expanded(
+                      child: _buildCapsuleButton(
+                        label: '打开',
+                        icon: Icons.open_in_new_rounded,
+                        onTap: () => _openCardUrl(card),
+                        variant: _CapsuleButtonVariant.soft,
+                        compact: true,
+                        stacked: true,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
+                  Expanded(
+                    child: _buildCapsuleButton(
+                      label: '分享',
+                      icon: Icons.ios_share_rounded,
+                      onTap: () => _shareCard(card),
+                      variant: _CapsuleButtonVariant.soft,
+                      compact: true,
+                      stacked: true,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _buildCapsuleButton(
+                      label: '复制',
+                      icon: Icons.content_copy,
+                      onTap: () => _copyCardText(card.text),
+                      variant: _CapsuleButtonVariant.ghost,
+                      compact: true,
+                      stacked: true,
+                      fontWeight: FontWeight.w900,
+                      foregroundOverride: const Color(0xFF111111),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _buildCapsuleButton(
+                      label: '删除',
+                      icon: Icons.delete_outline,
+                      onTap: () => _deleteCardWithConfirm(card),
+                      variant: _CapsuleButtonVariant.danger,
+                      compact: true,
+                      stacked: true,
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -2328,16 +3008,22 @@ connectWs();
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Container(
-                width: 42,
-                height: 42,
+                width: 48,
+                height: 48,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: isDanger
-                      ? const Color(0x14BA1A1A)
-                      : const Color(0x141353D8),
+                      ? const Color(0x22BA1A1A)
+                      : const Color(0x221353D8),
+                  border: Border.all(
+                    color: isDanger
+                        ? const Color(0x33BA1A1A)
+                        : const Color(0x331353D8),
+                  ),
                 ),
                 child: Icon(
                   icon,
+                  size: 26,
                   color: isDanger
                       ? const Color(0xFFBA1A1A)
                       : const Color(0xFF1353D8),
@@ -2373,9 +3059,12 @@ connectWs();
     required VoidCallback? onTap,
     required _CapsuleButtonVariant variant,
     bool compact = false,
+    bool stacked = false,
+    FontWeight? fontWeight,
+    Color? foregroundOverride,
   }) {
     late final Color background;
-    late final Color foreground;
+    Color foreground;
     switch (variant) {
       case _CapsuleButtonVariant.primary:
         background = const Color(0xFF1353D8);
@@ -2390,26 +3079,54 @@ connectWs();
         background = const Color(0x14BA1A1A);
         foreground = const Color(0xFFBA1A1A);
     }
+    foreground = foregroundOverride ?? foreground;
+    final style = FilledButton.styleFrom(
+      backgroundColor: background,
+      foregroundColor: foreground,
+      elevation: 0,
+      padding: EdgeInsets.symmetric(
+        horizontal: compact ? 8 : 16,
+        vertical: stacked ? 10 : (compact ? 9 : 11),
+      ),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(stacked ? 18 : 999),
+      ),
+    );
+    if (stacked) {
+      return FilledButton(
+        onPressed: onTap,
+        style: style,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              icon,
+              size: compact ? 18 : 20,
+              color: foreground,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              label,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontWeight: fontWeight ?? FontWeight.w800,
+                fontSize: compact ? 11.5 : 13,
+                height: 1.1,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
     return FilledButton.icon(
       onPressed: onTap,
-      style: FilledButton.styleFrom(
-        backgroundColor: background,
-        foregroundColor: foreground,
-        elevation: 0,
-        padding: EdgeInsets.symmetric(
-          horizontal: compact ? 10 : 16,
-          vertical: compact ? 9 : 11,
-        ),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(999),
-        ),
-      ),
+      style: style,
       icon: Icon(icon, size: compact ? 18 : 20),
       label: Text(
         label,
         textAlign: TextAlign.center,
         style: TextStyle(
-          fontWeight: FontWeight.w800,
+          fontWeight: fontWeight ?? FontWeight.w800,
           fontSize: compact ? 13 : 15,
         ),
       ),
@@ -2438,18 +3155,22 @@ connectWs();
     );
   }
 
-  Widget _buildMetaPill(String text) {
+  Widget _buildMetaPill(
+    String text, {
+    Color backgroundColor = const Color(0xFFF4F7FC),
+    Color foregroundColor = const Color(0xFF718097),
+  }) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: const Color(0xFFF4F7FC),
+        color: backgroundColor,
         borderRadius: BorderRadius.circular(999),
       ),
       child: Text(
         text,
-        style: const TextStyle(
+        style: TextStyle(
           fontSize: 11,
-          color: Color(0xFF718097),
+          color: foregroundColor,
           fontWeight: FontWeight.w600,
         ),
       ),
@@ -2473,6 +3194,191 @@ connectWs();
       ],
     );
   }
+}
+
+class LocalShareSettingsPage extends StatefulWidget {
+  const LocalShareSettingsPage({
+    super.key,
+    required this.initialPort,
+    required this.initialUseFixedPort,
+    required this.initialConfirmDelete,
+  });
+
+  final int initialPort;
+  final bool initialUseFixedPort;
+  final bool initialConfirmDelete;
+
+  @override
+  State<LocalShareSettingsPage> createState() => _LocalShareSettingsPageState();
+}
+
+class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
+  late final TextEditingController _portController =
+      TextEditingController(text: widget.initialPort.toString());
+  late bool _useFixedPort = widget.initialUseFixedPort;
+  late bool _confirmDelete = widget.initialConfirmDelete;
+
+  @override
+  void dispose() {
+    _portController.dispose();
+    super.dispose();
+  }
+
+  void _save({bool clearAllCards = false}) {
+    if (!_useFixedPort) {
+      Navigator.of(context).pop(
+        _PortSettingsResult(
+          useFixedPort: false,
+          port: widget.initialPort,
+          confirmDelete: _confirmDelete,
+          clearAllCards: clearAllCards,
+        ),
+      );
+      return;
+    }
+    final value = int.tryParse(_portController.text.trim());
+    if (value == null || value < 1 || value > 65535) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请输入 1 到 65535 之间的端口')),
+      );
+      return;
+    }
+    Navigator.of(context).pop(
+      _PortSettingsResult(
+        useFixedPort: true,
+        port: value,
+        confirmDelete: _confirmDelete,
+        clearAllCards: clearAllCards,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('设置')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(24),
+              border: Border.all(color: const Color(0xFFE6EBF3)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '服务端口',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w900,
+                    color: Color(0xFF0D44B3),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  '关闭时每次随机端口；开启后使用你指定的固定端口。',
+                  style: TextStyle(
+                    color: Color(0xFF6E7788),
+                    height: 1.5,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: _useFixedPort,
+                  title: const Text(
+                    '使用固定端口',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  subtitle: const Text('关闭则每次启动随机分配端口'),
+                  onChanged: (value) {
+                    setState(() {
+                      _useFixedPort = value;
+                    });
+                  },
+                ),
+                const SizedBox(height: 4),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: _confirmDelete,
+                  title: const Text(
+                    '删除前弹出确认',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  subtitle: const Text('开启后，删除单张卡片前会先确认'),
+                  onChanged: (value) {
+                    setState(() {
+                      _confirmDelete = value;
+                    });
+                  },
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _portController,
+                  enabled: _useFixedPort,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: '端口',
+                    hintText: '例如 35773',
+                  ),
+                ),
+                const SizedBox(height: 14),
+                OutlinedButton(
+                  onPressed: () => _save(clearAllCards: true),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFFBA1A1A),
+                    side: const BorderSide(color: Color(0x33BA1A1A)),
+                    minimumSize: const Size.fromHeight(48),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                  ),
+                  child: const Text(
+                    '清空所有卡片',
+                    style: TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                FilledButton(
+                  onPressed: () => _save(),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF1550D7),
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size.fromHeight(48),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                  ),
+                  child: const Text(
+                    '保存',
+                    style: TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PortSettingsResult {
+  const _PortSettingsResult({
+    required this.useFixedPort,
+    required this.port,
+    required this.confirmDelete,
+    this.clearAllCards = false,
+  });
+
+  final bool useFixedPort;
+  final int port;
+  final bool confirmDelete;
+  final bool clearAllCards;
 }
 
 enum _CapsuleButtonVariant { primary, soft, ghost, danger }
