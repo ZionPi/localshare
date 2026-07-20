@@ -7,7 +7,8 @@
     <application
         android:label="localshare"
         android:name="${applicationName}"
-        android:icon="@mipmap/launcher_icon">
+        android:icon="@mipmap/launcher_icon"
+        android:usesCleartextTraffic="true">
         <service
             android:name=".LocalShareForegroundService"
             android:enabled="true"

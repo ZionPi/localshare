@@ -66,9 +66,17 @@ install-release: release-apk
 	@echo "Using device: $(RESOLVED_DEVICE)"
 	$(ADB) $(ADB_TARGET) install -r $(RELEASE_APK)
 
-install-apk: install
+install-apk:
+	@test -n "$(RESOLVED_DEVICE)" || (echo "未找到可安装的 Android 设备" && exit 1)
+	@test -f "$(DEBUG_APK)" || (echo "未找到本地 debug APK: $(DEBUG_APK)" && exit 1)
+	@echo "Using device: $(RESOLVED_DEVICE)"
+	$(ADB) $(ADB_TARGET) install -r $(DEBUG_APK)
 
-install-release-apk: install-release
+install-release-apk:
+	@test -n "$(RESOLVED_DEVICE)" || (echo "未找到可安装的 Android 设备" && exit 1)
+	@test -f "$(RELEASE_APK)" || (echo "未找到本地 release APK: $(RELEASE_APK)" && exit 1)
+	@echo "Using device: $(RESOLVED_DEVICE)"
+	$(ADB) $(ADB_TARGET) install -r $(RELEASE_APK)
 
 run:
 	@test -n "$(RESOLVED_DEVICE)" || (echo "未找到可运行的 Android 设备" && exit 1)

@@ -3,6 +3,7 @@ package com.lix.localshare
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -36,12 +37,24 @@ class LocalShareForegroundService : Service() {
         } else {
             "本地分享服务运行中，端口 $port"
         }
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
+            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        val contentIntent = launchIntent?.let {
+            PendingIntent.getActivity(
+                this,
+                0,
+                it,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+        }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("本地分享")
             .setContentText(contentText)
             .setSmallIcon(R.mipmap.launcher_icon)
             .setOngoing(true)
             .setSilent(true)
+            .setContentIntent(contentIntent)
             .build()
     }
 

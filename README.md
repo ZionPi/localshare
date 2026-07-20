@@ -37,10 +37,10 @@ build/app/outputs/flutter-apk/app-release.apk
 
 ## 安装说明
 
-如果只是安装到新设备，可直接：
+如果只是安装本地已经构建好的 release APK，可直接：
 
 ```bash
-adb install build/app/outputs/flutter-apk/app-release.apk
+make install-release-apk
 ```
 
 如果设备上已经安装了旧版本并且要保留数据，需要保证**签名一致**后再覆盖安装：
@@ -48,6 +48,12 @@ adb install build/app/outputs/flutter-apk/app-release.apk
 ```bash
 adb install -r build/app/outputs/flutter-apk/app-release.apk
 ```
+
+其中：
+
+- `make release-apk`：只构建 release APK
+- `make install-release`：先构建，再安装 release APK
+- `make install-release-apk`：直接安装本地现成的 release APK，不会重新编译
 
 ## 签名注意事项
 

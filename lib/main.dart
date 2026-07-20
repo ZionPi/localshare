@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:network_info_plus/network_info_plus.dart';
@@ -21,6 +23,43 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 const String kLifecycleChannelName = 'localshare/lifecycle';
 const String kServiceChannelName = 'localshare/service';
 const String kClipboardChannelName = 'localshare/clipboard';
+const String kDownloadChannelName = 'localshare/download';
+const String kDiscoveryChannelName = 'localshare/discovery';
+
+String? _buildExportArchive(Map<String, dynamic> request) {
+  final stateJson = request['stateJson'] as String? ?? '';
+  final outputPath = request['outputPath'] as String? ?? '';
+  final attachments =
+      (request['attachments'] as List<dynamic>? ?? const <dynamic>[])
+          .cast<Map<dynamic, dynamic>>();
+  if (stateJson.isEmpty || outputPath.isEmpty) {
+    return null;
+  }
+  final archive = Archive();
+  final stateBytes = utf8.encode(stateJson);
+  archive.addFile(
+    ArchiveFile('cards_state_v2.json', stateBytes.length, stateBytes),
+  );
+  for (final attachment in attachments) {
+    final id = attachment['id'] as String? ?? '';
+    final path = attachment['path'] as String? ?? '';
+    if (id.isEmpty || path.isEmpty) {
+      continue;
+    }
+    final file = File(path);
+    if (!file.existsSync()) {
+      continue;
+    }
+    final bytes = file.readAsBytesSync();
+    archive.addFile(ArchiveFile('attachments/$id', bytes.length, bytes));
+  }
+  final encoded = ZipEncoder().encode(archive);
+  if (encoded == null || encoded.isEmpty) {
+    return null;
+  }
+  File(outputPath).writeAsBytesSync(encoded, flush: true);
+  return outputPath;
+}
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -213,6 +252,11 @@ class CardItem {
   }
 
   Map<String, dynamic> toPublicJson(Map<String, CardAttachment> attachmentMap) {
+    final attachments = attachmentIds
+        .map((attachmentId) => attachmentMap[attachmentId])
+        .whereType<CardAttachment>()
+        .map((attachment) => attachment.toPublicJson())
+        .toList();
     return {
       'id': id,
       'text': text,
@@ -220,11 +264,8 @@ class CardItem {
       'updatedAt': updatedAt.toIso8601String(),
       'pinnedAt': pinnedAt?.toIso8601String(),
       'pinned': isPinned,
-      'attachments': attachmentIds
-          .map((attachmentId) => attachmentMap[attachmentId])
-          .whereType<CardAttachment>()
-          .map((attachment) => attachment.toPublicJson())
-          .toList(),
+      'attachments': attachments,
+      'bundleDownloadUrl': attachments.isEmpty ? null : '/cards/$id/bundle',
     };
   }
 
@@ -382,15 +423,37 @@ class LocalShareStorage {
 
   Future<void> saveState(
     List<CardItem> cards,
-    Iterable<CardAttachment> attachments,
-  ) async {
+    Iterable<CardAttachment> attachments, {
+    bool allowDestructiveEmpty = false,
+  }) async {
     await ensureReady();
+    final attachmentsList = attachments.toList();
+    if (!allowDestructiveEmpty &&
+        cards.isEmpty &&
+        attachmentsList.isEmpty &&
+        await stateFile.exists()) {
+      final existing = await stateFile.readAsString();
+      try {
+        final existingState = _decodeState(existing, allowLegacyEnvelope: true);
+        if (existingState.cards.isNotEmpty ||
+            existingState.attachments.isNotEmpty) {
+          await _writeBackup('blocked-empty-overwrite', existing);
+          throw StateError(
+            'Refusing to overwrite non-empty phone data with an empty state',
+          );
+        }
+      } on StateError {
+        rethrow;
+      } catch (_) {
+        // If the existing state is unreadable, keep the normal backup path below.
+      }
+    }
     final payload = jsonEncode({
       'version': schemaVersion,
       'savedAt': DateTime.now().toIso8601String(),
       'cards': cards.map((card) => card.toJson()).toList(),
       'attachments':
-          attachments.map((attachment) => attachment.toJson()).toList(),
+          attachmentsList.map((attachment) => attachment.toJson()).toList(),
     });
 
     if (await stateFile.exists()) {
@@ -432,13 +495,18 @@ class MyHomePage extends StatefulWidget {
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
+class _MyHomePageState extends State<MyHomePage>
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const MethodChannel _lifecycleChannel =
       MethodChannel(kLifecycleChannelName);
   static const MethodChannel _serviceChannel =
       MethodChannel(kServiceChannelName);
   static const MethodChannel _clipboardChannel =
       MethodChannel(kClipboardChannelName);
+  static const MethodChannel _downloadChannel =
+      MethodChannel(kDownloadChannelName);
+  static const MethodChannel _discoveryChannel =
+      MethodChannel(kDiscoveryChannelName);
   static const String _preferredPortKey = 'preferred_server_port';
   static const String _useFixedPortKey = 'use_fixed_server_port';
   static const String _confirmDeleteKey = 'confirm_delete_before_remove';
@@ -448,6 +516,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
   final TextEditingController _composerController = TextEditingController();
   final TextEditingController _searchController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  final GlobalKey _cardsSectionKey = GlobalKey();
   final List<WebSocketChannel> _webSocketClients = <WebSocketChannel>[];
   final Random _random = Random();
 
@@ -462,20 +531,29 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
   Timer? _saveDebounceTimer;
   Timer? _broadcastDebounceTimer;
   Timer? _stateRefreshTimer;
+  late final AnimationController _addressGlowController;
+  double _addressCardDragOffset = 0;
 
   String _serverAddress = '服务启动中';
+  String? _discoveryHint;
+  String? _bookmarkAddress;
   String _publicHost = '127.0.0.1';
   int _preferredPort = _defaultServerPort;
   bool _useFixedPort = false;
   bool _confirmDelete = true;
   bool _isServerRunning = false;
   bool _isPickingFiles = false;
+  bool _isExporting = false;
   bool _isLoading = true;
   DateTime? _lastStateSyncAt;
 
   @override
   void initState() {
     super.initState();
+    _addressGlowController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2200),
+    )..repeat();
     WidgetsBinding.instance.addObserver(this);
     _initializeApp();
   }
@@ -534,6 +612,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     unawaited(_stopServer());
+    _addressGlowController.dispose();
     _composerController.dispose();
     _searchController.dispose();
     _scrollController.dispose();
@@ -548,6 +627,12 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       unawaited(_refreshStateFromStorageIfChanged(force: true));
+    }
+    if (_isServerRunning &&
+        (state == AppLifecycleState.resumed ||
+            state == AppLifecycleState.inactive ||
+            state == AppLifecycleState.paused)) {
+      unawaited(_syncForegroundService());
     }
   }
 
@@ -590,11 +675,15 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
     return items;
   }
 
-  Future<void> _persistStateNow() async {
+  Future<void> _persistStateNow({bool allowDestructiveEmpty = false}) async {
     if (_storage == null) {
       return;
     }
-    await _storage!.saveState(_cards, _attachments.values);
+    await _storage!.saveState(
+      _cards,
+      _attachments.values,
+      allowDestructiveEmpty: allowDestructiveEmpty,
+    );
     await _markStateSynced();
   }
 
@@ -638,6 +727,14 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
       return;
     }
     final state = await storage.loadState();
+    if (_wouldDropPhoneCards(state)) {
+      debugPrint('blocked destructive storage refresh; phone state kept');
+      await _persistStateNow();
+      if (mounted) {
+        _showToast('已阻止一次可能的数据覆盖，手机端数据保持为主');
+      }
+      return;
+    }
     _cards
       ..clear()
       ..addAll(state.cards);
@@ -648,6 +745,14 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
     if (mounted) {
       setState(() {});
     }
+  }
+
+  bool _wouldDropPhoneCards(PersistedState incomingState) {
+    if (_cards.isEmpty) {
+      return false;
+    }
+    final incomingIds = incomingState.cards.map((card) => card.id).toSet();
+    return _cards.any((card) => !incomingIds.contains(card.id));
   }
 
   Future<void> _setupSharingHandlers() async {
@@ -844,7 +949,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
       }
     }
     _cards.removeWhere((item) => item.id == cardId);
-    await _persistStateNow();
+    await _persistStateNow(allowDestructiveEmpty: true);
     _broadcastSnapshot();
     if (mounted) {
       setState(() {});
@@ -914,12 +1019,209 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
     }
     _attachments.clear();
     _cards.clear();
-    await _persistStateNow();
+    await _persistStateNow(allowDestructiveEmpty: true);
     _broadcastSnapshot();
     if (mounted) {
       setState(() {});
     }
     _showToast('已清空所有卡片');
+  }
+
+  Future<void> _exportAllCards() async {
+    final storage = _storage;
+    if (storage == null || _isExporting) {
+      return;
+    }
+    setState(() {
+      _isExporting = true;
+    });
+    _showToast('正在导出，请稍候');
+    try {
+      await _persistStateNow();
+      final stateJson = await storage.stateFile.readAsString();
+      final tempDir = await getTemporaryDirectory();
+      final fileName =
+          'localshare-export-${DateTime.now().toIso8601String().replaceAll(':', '').replaceAll('.', '-')}.zip';
+      final exportPath = '${tempDir.path}/$fileName';
+      final builtPath = await compute(_buildExportArchive, {
+        'stateJson': stateJson,
+        'outputPath': exportPath,
+        'attachments': _attachments.values
+            .map((attachment) => {
+                  'id': attachment.id,
+                  'path': attachment.localPath,
+                })
+            .toList(),
+      });
+      if (builtPath == null || builtPath.isEmpty) {
+        _showToast('导出失败');
+        return;
+      }
+      final savedPath = await _saveExportFile(builtPath, fileName: fileName);
+      _showToast(savedPath == null ? '已导出' : '已导出到 $savedPath');
+    } catch (error) {
+      _showToast('导出失败: $error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isExporting = false;
+        });
+      } else {
+        _isExporting = false;
+      }
+    }
+  }
+
+  Future<String?> _saveExportFile(
+    String sourcePath, {
+    required String fileName,
+  }) async {
+    if (Platform.isAndroid) {
+      return _downloadChannel.invokeMethod<String>('saveFileToDownloads', {
+        'sourcePath': sourcePath,
+        'fileName': fileName,
+        'mimeType': 'application/zip',
+      });
+    }
+    final downloadsDir = await getDownloadsDirectory();
+    final targetDir = downloadsDir ?? await getApplicationDocumentsDirectory();
+    final targetFile = File('${targetDir.path}/$fileName');
+    await File(sourcePath).copy(targetFile.path);
+    return targetFile.path;
+  }
+
+  Future<void> _importAllCards() async {
+    final storage = _storage;
+    if (storage == null) {
+      return;
+    }
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['zip'],
+    );
+    if (result == null || result.files.isEmpty) {
+      return;
+    }
+    final importPath = result.files.single.path;
+    if (importPath == null || importPath.isEmpty) {
+      _showToast('无法读取导入文件');
+      return;
+    }
+    final confirmed = await _showDeleteConfirmDialog(
+      title: '导入备份',
+      message: '导入会替换当前全部卡片和附件，确认继续吗？',
+      confirmLabel: '开始导入',
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      final bytes = await File(importPath).readAsBytes();
+      final archive = ZipDecoder().decodeBytes(bytes, verify: true);
+      ArchiveFile? stateEntry;
+      for (final file in archive.files) {
+        if (file.isFile && file.name == 'cards_state_v2.json') {
+          stateEntry = file;
+          break;
+        }
+      }
+      if (stateEntry == null) {
+        throw const FormatException('缺少 cards_state_v2.json');
+      }
+      final stateBytes = List<int>.from(stateEntry.content as List);
+      final importedState = storage._decodeState(
+        utf8.decode(stateBytes),
+        allowLegacyEnvelope: true,
+      );
+      if (importedState.cards.isEmpty && importedState.attachments.isEmpty) {
+        throw const FormatException('备份为空，已拒绝覆盖当前手机数据');
+      }
+      final attachmentBytesById = <String, List<int>>{};
+      for (final attachment in importedState.attachments) {
+        ArchiveFile? entry;
+        for (final file in archive.files) {
+          if (file.isFile && file.name == 'attachments/${attachment.id}') {
+            entry = file;
+            break;
+          }
+        }
+        if (entry == null) {
+          throw FormatException('缺少附件 ${attachment.name}');
+        }
+        attachmentBytesById[attachment.id] =
+            List<int>.from(entry.content as List);
+      }
+      await _replaceStateFromImport(
+        importedState,
+        attachmentBytesById: attachmentBytesById,
+      );
+      _showToast('已导入 ${importedState.cards.length} 张卡片');
+    } catch (error) {
+      _showToast('导入失败: $error');
+    }
+  }
+
+  Future<void> _replaceStateFromImport(
+    PersistedState importedState, {
+    required Map<String, List<int>> attachmentBytesById,
+  }) async {
+    final storage = _storage;
+    if (storage == null) {
+      throw StateError('Storage not initialized');
+    }
+    await storage.ensureReady();
+    for (final attachment in _attachments.values) {
+      final file = File(attachment.localPath);
+      if (await file.exists()) {
+        await file.delete();
+      }
+    }
+    final restoredCards = importedState.cards
+        .map(
+          (card) => CardItem(
+            id: card.id,
+            text: card.text,
+            createdAt: card.createdAt,
+            updatedAt: card.updatedAt,
+            pinnedAt: card.pinnedAt,
+            attachmentIds: List<String>.from(card.attachmentIds),
+          ),
+        )
+        .toList();
+    final restoredAttachments = <CardAttachment>[];
+    for (final attachment in importedState.attachments) {
+      final bytes = attachmentBytesById[attachment.id];
+      if (bytes == null) {
+        continue;
+      }
+      final storedFileName =
+          _buildStoredFileName(attachment.name, attachment.id);
+      final targetPath = '${storage.attachmentsDir.path}/$storedFileName';
+      await File(targetPath).writeAsBytes(bytes, flush: true);
+      restoredAttachments.add(
+        CardAttachment(
+          id: attachment.id,
+          cardId: attachment.cardId,
+          name: attachment.name,
+          mimeType: attachment.mimeType,
+          size: bytes.length,
+          localPath: targetPath,
+          kind: attachment.kind,
+          createdAt: attachment.createdAt,
+        ),
+      );
+    }
+    _cards
+      ..clear()
+      ..addAll(restoredCards);
+    _attachments
+      ..clear()
+      ..addEntries(restoredAttachments.map((item) => MapEntry(item.id, item)));
+    await _persistStateNow();
+    _broadcastSnapshot();
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   Future<void> _togglePinnedCard(CardItem card) async {
@@ -945,12 +1247,53 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
     _showToast(text.trim().isEmpty ? '空卡片已复制' : '卡片内容已复制');
   }
 
-  Uri? _extractStandaloneUrl(String text) {
-    final trimmed = text.trim();
-    if (trimmed.isEmpty || trimmed.contains(RegExp(r'\s'))) {
+  Future<void> _openCardEditor(CardItem card) async {
+    final result = await Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        builder: (context) => _CardEditorPage(initialText: card.text),
+        fullscreenDialog: true,
+      ),
+    );
+    if (result == null) {
+      return;
+    }
+    card
+      ..text = result
+      ..updatedAt = DateTime.now();
+    await _persistStateNow();
+    _broadcastSnapshot();
+    if (mounted) {
+      setState(() {});
+    }
+    _showToast('卡片已更新');
+  }
+
+  Future<void> _ensureCardsSectionVisible() async {
+    final targetContext = _cardsSectionKey.currentContext;
+    if (targetContext == null) {
+      return;
+    }
+    await Scrollable.ensureVisible(
+      targetContext,
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOutCubic,
+      alignment: 0,
+    );
+  }
+
+  Uri? _extractFirstUrl(String text) {
+    final match = RegExp(r'https?://[^\s<>()]+').firstMatch(text);
+    if (match == null) {
       return null;
     }
-    final uri = Uri.tryParse(trimmed);
+    final candidate = (match.group(0) ?? '').replaceFirst(
+      RegExp(r'[\]\)\}\.,;:!?]+$'),
+      '',
+    );
+    if (candidate.isEmpty) {
+      return null;
+    }
+    final uri = Uri.tryParse(candidate);
     if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
       return null;
     }
@@ -961,7 +1304,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _openCardUrl(CardItem card) async {
-    final uri = _extractStandaloneUrl(card.text);
+    final uri = _extractFirstUrl(card.text);
     if (uri == null) {
       _showToast('这张卡片不是可直接打开的链接');
       return;
@@ -996,15 +1339,6 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
       ..showSnackBar(SnackBar(content: Text(message)));
   }
 
-  Future<void> _copyServerAddress() async {
-    if (!_isServerRunning) {
-      _showToast('服务尚未启动');
-      return;
-    }
-    await Clipboard.setData(ClipboardData(text: _serverAddress));
-    _showToast('访问地址已复制');
-  }
-
   Future<void> _syncForegroundService() async {
     if (!Platform.isAndroid) {
       return;
@@ -1016,6 +1350,53 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
       });
     } catch (error) {
       debugPrint('startForegroundService failed: $error');
+    }
+  }
+
+  Future<void> _syncDiscoveryService() async {
+    if (!Platform.isAndroid || !_isServerRunning) {
+      return;
+    }
+    try {
+      final payload = await _discoveryChannel
+          .invokeMapMethod<String, dynamic>('registerHttpService', {
+        'port': _server?.port ?? _preferredPort,
+        'address': _publicHost,
+      });
+      final hint = (payload?['hint'] as String?)?.trim();
+      final bookmarkUrl = (payload?['bookmarkUrl'] as String?)?.trim();
+      if (!mounted) {
+        _discoveryHint = hint?.isEmpty == true ? null : hint;
+        _bookmarkAddress = bookmarkUrl?.isEmpty == true ? null : bookmarkUrl;
+        return;
+      }
+      setState(() {
+        _discoveryHint = hint?.isEmpty == true ? null : hint;
+        _bookmarkAddress = bookmarkUrl?.isEmpty == true ? null : bookmarkUrl;
+      });
+    } catch (error) {
+      debugPrint('registerHttpService failed: $error');
+    }
+  }
+
+  Future<void> _stopDiscoveryService() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+    try {
+      await _discoveryChannel.invokeMethod<void>('unregisterHttpService');
+    } catch (error) {
+      debugPrint('unregisterHttpService failed: $error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _discoveryHint = null;
+          _bookmarkAddress = null;
+        });
+      } else {
+        _discoveryHint = null;
+        _bookmarkAddress = null;
+      }
     }
   }
 
@@ -1035,7 +1416,11 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
       return;
     }
     try {
-      await _serviceChannel.invokeMethod<bool>('requestNotificationPermission');
+      final granted = await _serviceChannel
+          .invokeMethod<bool>('requestNotificationPermission');
+      if (granted == false) {
+        _showToast('未授予通知权限，后台保持服务可能不稳定');
+      }
     } catch (error) {
       debugPrint('requestNotificationPermission failed: $error');
     }
@@ -1048,6 +1433,8 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
           initialUseFixedPort: _useFixedPort,
           initialPort: _preferredPort,
           initialConfirmDelete: _confirmDelete,
+          onImportTap: _importAllCards,
+          onExportTap: _exportAllCards,
         ),
       ),
     );
@@ -1097,6 +1484,45 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
     );
   }
 
+  Uri? _buildCardBundleUri(CardItem card) {
+    if (!_isServerRunning) {
+      return null;
+    }
+    final baseUri = Uri.tryParse(_serverAddress);
+    if (baseUri == null) {
+      return null;
+    }
+    return baseUri.replace(path: '/cards/${card.id}/bundle');
+  }
+
+  Future<void> _downloadToAndroidDownloads({
+    required Uri uri,
+    required String fileName,
+    required String mimeType,
+    required String successMessage,
+  }) async {
+    try {
+      final savedFileName =
+          await _downloadChannel.invokeMethod<String>('enqueueDownload', {
+        'url': uri.toString(),
+        'fileName': fileName,
+        'mimeType': mimeType,
+      });
+      _showToast(
+        savedFileName == null || savedFileName.isEmpty
+            ? successMessage
+            : '$successMessage：$savedFileName',
+      );
+    } on PlatformException catch (error) {
+      debugPrint('enqueueDownload failed: $error');
+      final launched =
+          await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!launched) {
+        _showToast('无法开始下载');
+      }
+    }
+  }
+
   Future<void> _openAttachment(
     CardAttachment attachment, {
     bool preview = false,
@@ -1106,16 +1532,55 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
       _showToast('服务尚未启动');
       return;
     }
+    if (!preview && Platform.isAndroid) {
+      await _downloadToAndroidDownloads(
+        uri: uri,
+        fileName: attachment.name,
+        mimeType: attachment.mimeType,
+        successMessage: '已开始下载到下载目录',
+      );
+      return;
+    }
     final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
     if (!launched) {
       _showToast(preview ? '无法打开预览' : '无法打开下载链接');
     }
   }
 
-  Future<void> _showImagePreview(CardAttachment attachment) async {
+  Future<void> _downloadCardBundle(CardItem card) async {
+    final uri = _buildCardBundleUri(card);
+    if (uri == null) {
+      _showToast('服务尚未启动');
+      return;
+    }
+    final bundleName = _buildCardBundleFileName(card);
+    if (Platform.isAndroid) {
+      await _downloadToAndroidDownloads(
+        uri: uri,
+        fileName: bundleName,
+        mimeType: 'application/zip',
+        successMessage: '已开始打包下载到下载目录',
+      );
+      return;
+    }
+    final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!launched) {
+      _showToast('无法开始批量下载');
+    }
+  }
+
+  Future<void> _showImagePreview(
+    List<CardAttachment> images, {
+    required int initialIndex,
+  }) async {
+    if (images.isEmpty || initialIndex < 0 || initialIndex >= images.length) {
+      return;
+    }
     if (!mounted) {
       return;
     }
+    final pageController = PageController(initialPage: initialIndex);
+    var currentIndex = initialIndex;
     await showGeneralDialog<void>(
       context: context,
       barrierLabel: '图片预览',
@@ -1123,55 +1588,165 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
       barrierColor: Colors.black.withValues(alpha: 0.88),
       transitionDuration: const Duration(milliseconds: 220),
       pageBuilder: (context, animation, secondaryAnimation) {
-        return SafeArea(
-          child: Stack(
-            children: [
-              Positioned.fill(
-                child: GestureDetector(
-                  onTap: () => Navigator.of(context).pop(),
-                  child: ColoredBox(
-                    color: Colors.black.withValues(alpha: 0.01),
-                    child: Center(
-                      child: InteractiveViewer(
-                        minScale: 0.8,
-                        maxScale: 4,
-                        child: Hero(
-                          tag: 'attachment-preview-${attachment.id}',
-                          child: Image.file(
-                            File(attachment.localPath),
-                            fit: BoxFit.contain,
-                            errorBuilder: (context, error, stackTrace) {
-                              return _buildImagePreviewFallback(compact: false);
-                            },
-                          ),
+        return StatefulBuilder(
+          builder: (context, setOverlayState) {
+            return SafeArea(
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    child: GestureDetector(
+                      onTap: () => Navigator.of(context).pop(),
+                      child: ColoredBox(
+                        color: Colors.black.withValues(alpha: 0.01),
+                        child: PageView.builder(
+                          controller: pageController,
+                          itemCount: images.length,
+                          onPageChanged: (value) {
+                            setOverlayState(() {
+                              currentIndex = value;
+                            });
+                          },
+                          itemBuilder: (context, index) {
+                            final attachment = images[index];
+                            return Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 20,
+                                vertical: 28,
+                              ),
+                              child: Center(
+                                child: InteractiveViewer(
+                                  minScale: 0.8,
+                                  maxScale: 4,
+                                  child: Hero(
+                                    tag: 'attachment-preview-${attachment.id}',
+                                    child: Image.file(
+                                      File(attachment.localPath),
+                                      fit: BoxFit.contain,
+                                      errorBuilder:
+                                          (context, error, stackTrace) {
+                                        return _buildImagePreviewFallback(
+                                          compact: false,
+                                        );
+                                      },
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            );
+                          },
                         ),
                       ),
                     ),
                   ),
-                ),
-              ),
-              Positioned(
-                top: 12,
-                right: 12,
-                child: Material(
-                  color: Colors.transparent,
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(999),
-                    onTap: () => Navigator.of(context).pop(),
-                    child: Ink(
-                      width: 44,
-                      height: 44,
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.34),
-                        shape: BoxShape.circle,
+                  if (images.length > 1)
+                    Positioned(
+                      top: 16,
+                      left: 16,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.34),
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Text(
+                          '${currentIndex + 1} / ${images.length}',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
                       ),
-                      child: const Icon(Icons.close, color: Colors.white),
+                    ),
+                  if (images.length > 1) ...[
+                    Positioned(
+                      left: 12,
+                      top: 0,
+                      bottom: 0,
+                      child: Center(
+                        child: _buildGalleryArrowButton(
+                          icon: Icons.chevron_left_rounded,
+                          onTap: currentIndex == 0
+                              ? null
+                              : () {
+                                  pageController.previousPage(
+                                    duration: const Duration(milliseconds: 220),
+                                    curve: Curves.easeOutCubic,
+                                  );
+                                },
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      right: 12,
+                      top: 0,
+                      bottom: 0,
+                      child: Center(
+                        child: _buildGalleryArrowButton(
+                          icon: Icons.chevron_right_rounded,
+                          onTap: currentIndex == images.length - 1
+                              ? null
+                              : () {
+                                  pageController.nextPage(
+                                    duration: const Duration(milliseconds: 220),
+                                    curve: Curves.easeOutCubic,
+                                  );
+                                },
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      bottom: 18,
+                      left: 0,
+                      right: 0,
+                      child: Center(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.28),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: const Text(
+                            '左右滑动查看同卡图片',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                  Positioned(
+                    top: 12,
+                    right: 12,
+                    child: Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(999),
+                        onTap: () => Navigator.of(context).pop(),
+                        child: Ink(
+                          width: 44,
+                          height: 44,
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.34),
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(Icons.close, color: Colors.white),
+                        ),
+                      ),
                     ),
                   ),
-                ),
+                ],
               ),
-            ],
-          ),
+            );
+          },
         );
       },
       transitionBuilder: (context, animation, secondaryAnimation, child) {
@@ -1188,6 +1763,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
         );
       },
     );
+    pageController.dispose();
   }
 
   Future<void> _createCardFromComposer() async {
@@ -1337,25 +1913,14 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _scrollToTop() async {
+  void _jumpScrollByTitleBar() {
     if (!_scrollController.hasClients) {
       return;
     }
-    await _scrollController.animateTo(
-      0,
-      duration: const Duration(milliseconds: 260),
-      curve: Curves.easeOutCubic,
-    );
-  }
-
-  Future<void> _scrollToBottom() async {
-    if (!_scrollController.hasClients) {
-      return;
-    }
-    await _scrollController.animateTo(
-      _scrollController.position.maxScrollExtent,
-      duration: const Duration(milliseconds: 260),
-      curve: Curves.easeOutCubic,
+    final position = _scrollController.position;
+    final midpoint = position.maxScrollExtent / 2;
+    _scrollController.jumpTo(
+      position.pixels <= midpoint ? position.maxScrollExtent : 0,
     );
   }
 
@@ -1381,6 +1946,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
         ..post('/api/cards/<cardId>/delete', _handleDeleteCard)
         ..post('/api/cards/reorder', _handleReorderCards)
         ..post('/api/cards/<cardId>/attachments', _handleAddAttachments)
+        ..get('/cards/<cardId>/bundle', _handleDownloadCardBundle)
         ..get('/files/<attachmentId>', _handleGetFile);
 
       final wsHandler = webSocketHandler((webSocket, protocol) {
@@ -1422,6 +1988,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
         });
       }
       await _syncForegroundService();
+      await _syncDiscoveryService();
     } on SocketException catch (error) {
       final addressInUse = error.osError?.errorCode == 48 ||
           error.osError?.errorCode == 98 ||
@@ -1452,6 +2019,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
       client.sink.close();
     }
     _webSocketClients.clear();
+    await _stopDiscoveryService();
     await _stopForegroundService();
     await _server?.close(force: true);
     _server = null;
@@ -1498,6 +2066,8 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
       'cards': cards,
       'serverTime': DateTime.now().toIso8601String(),
       'address': _serverAddress,
+      'discoveryHint': _discoveryHint,
+      'bookmarkAddress': _bookmarkAddress,
     };
   }
 
@@ -1648,6 +2218,61 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
     );
   }
 
+  Future<Response> _handleDownloadCardBundle(
+    Request request,
+    String cardId,
+  ) async {
+    final card = _findCard(cardId);
+    if (card == null) {
+      return Response.notFound('Card not found');
+    }
+    final cardAttachments = card.attachmentIds
+        .map((id) => _attachments[id])
+        .whereType<CardAttachment>()
+        .toList();
+    if (cardAttachments.isEmpty) {
+      return Response.notFound('No attachments');
+    }
+
+    final archive = Archive();
+    final usedNames = <String>{};
+    for (final attachment in cardAttachments) {
+      final file = File(attachment.localPath);
+      if (!await file.exists()) {
+        continue;
+      }
+      final entryName = _dedupeArchiveEntryName(attachment.name, usedNames);
+      archive.addFile(
+        ArchiveFile(
+          entryName,
+          attachment.size,
+          await file.readAsBytes(),
+        ),
+      );
+    }
+    if (archive.isEmpty) {
+      return Response.notFound('Files missing');
+    }
+
+    final encoded = ZipEncoder().encode(archive);
+    if (encoded == null || encoded.isEmpty) {
+      return Response.internalServerError(body: 'Failed to encode archive');
+    }
+    final fileName = _buildCardBundleFileName(card);
+    return Response.ok(
+      Uint8List.fromList(encoded),
+      headers: {
+        'content-type': 'application/zip',
+        'content-length': encoded.length.toString(),
+        'cache-control': 'no-cache',
+        'content-disposition': _buildContentDisposition(
+          fileName,
+          inline: false,
+        ),
+      },
+    );
+  }
+
   void _applyReorder(List<String> cardIds) {
     if (cardIds.isEmpty) {
       return;
@@ -1679,6 +2304,35 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
 
   String _buildStoredFileName(String fileName, String attachmentId) {
     return '$attachmentId-${Uri.encodeComponent(fileName)}';
+  }
+
+  String _buildCardBundleFileName(CardItem card) {
+    final stamp = card.createdAt
+        .toLocal()
+        .toIso8601String()
+        .replaceAll(':', '')
+        .replaceAll('.', '-');
+    return 'localshare-$stamp-${card.id}.zip';
+  }
+
+  String _dedupeArchiveEntryName(String fileName, Set<String> usedNames) {
+    final trimmed = fileName.trim().isEmpty ? 'attachment' : fileName.trim();
+    if (usedNames.add(trimmed)) {
+      return trimmed;
+    }
+
+    final dotIndex = trimmed.lastIndexOf('.');
+    final hasExtension = dotIndex > 0 && dotIndex < trimmed.length - 1;
+    final baseName = hasExtension ? trimmed.substring(0, dotIndex) : trimmed;
+    final extension = hasExtension ? trimmed.substring(dotIndex) : '';
+    var counter = 2;
+    while (true) {
+      final candidate = '$baseName ($counter)$extension';
+      if (usedNames.add(candidate)) {
+        return candidate;
+      }
+      counter += 1;
+    }
   }
 
   String _asciiFallbackFileName(String fileName) {
@@ -1845,9 +2499,16 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
     return '${attachment.name} · ${_formatBytes(attachment.size)}';
   }
 
-  Widget _buildImageAttachmentPreview(CardAttachment attachment) {
+  Widget _buildImageAttachmentPreview(
+    CardAttachment attachment, {
+    required List<CardAttachment> imageAttachments,
+    required int initialIndex,
+  }) {
     return GestureDetector(
-      onTap: () => _showImagePreview(attachment),
+      onTap: () => _showImagePreview(
+        imageAttachments,
+        initialIndex: initialIndex,
+      ),
       child: Hero(
         tag: 'attachment-preview-${attachment.id}',
         child: ClipRRect(
@@ -1861,6 +2522,32 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
                 return _buildImagePreviewFallback();
               },
             ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGalleryArrowButton({
+    required IconData icon,
+    required VoidCallback? onTap,
+  }) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(999),
+        onTap: onTap,
+        child: Ink(
+          width: 46,
+          height: 46,
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: onTap == null ? 0.18 : 0.32),
+            shape: BoxShape.circle,
+          ),
+          child: Icon(
+            icon,
+            color: onTap == null ? Colors.white54 : Colors.white,
+            size: 30,
           ),
         ),
       ),
@@ -1954,6 +2641,13 @@ button { cursor: pointer; }
 .btn-primary { background: linear-gradient(90deg, var(--primary-dark), var(--primary)); color: white; font-weight: 800; box-shadow: 0 18px 34px rgba(19,83,216,.24); }
 .btn-soft { background: rgba(208,225,251,.62); color: #385171; font-weight: 700; }
 .btn-ghost { background: var(--surface-2); color: var(--muted); font-weight: 700; }
+.btn-paste {
+  background: rgba(19,83,216,.12);
+  color: var(--primary-dark);
+  font-weight: 800;
+  box-shadow: inset 0 0 0 1px rgba(19,83,216,.14);
+}
+.btn-icon { display:inline-flex; align-items:center; gap:8px; }
 .btn-danger { background: rgba(186,26,26,.08); color: var(--error); font-weight: 700; }
 .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top: 12px; }
 .chip { padding: 8px 12px; border-radius: 999px; background: var(--surface-2); color: #435067; font-size: 13px; }
@@ -1970,6 +2664,7 @@ button { cursor: pointer; }
 .card { padding: 18px; }
 .card-top { display:flex; justify-content:space-between; gap:12px; color: var(--muted); font-size: 12px; }
 .card-text { margin-top: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 15px; }
+.card-text a { color: var(--primary-dark); text-decoration: underline; text-decoration-thickness: 1.5px; text-underline-offset: 2px; }
 .attachment-list { display:grid; gap: 10px; margin-top: 14px; }
 .attachment { border: 1px solid var(--outline); background: #fbfcff; border-radius: 18px; padding: 12px; }
 .attachment-row { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
@@ -1981,6 +2676,53 @@ button { cursor: pointer; }
   text-decoration:none; font-weight:800; font-size: 13px;
 }
 .preview { width: 100%; margin-top: 10px; border-radius: 14px; border: 1px solid rgba(216,222,232,.8); background: white; max-height: 320px; object-fit: cover; }
+.preview-clickable { cursor: zoom-in; }
+.image-viewer {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(12,16,22,.94);
+  opacity: 0; pointer-events: none;
+  transition: opacity .18s ease;
+}
+.image-viewer.show { opacity: 1; pointer-events: auto; }
+.image-viewer-stage {
+  position:absolute; inset: 0;
+  display:flex; align-items:center; justify-content:center;
+  padding: 72px 22px 92px;
+}
+.image-viewer-image {
+  max-width: min(92vw, 1100px);
+  max-height: calc(100vh - 164px);
+  border-radius: 18px;
+  object-fit: contain;
+  box-shadow: 0 18px 48px rgba(0,0,0,.28);
+}
+.image-viewer-close, .image-viewer-arrow {
+  position:absolute; border:0; border-radius:999px;
+  width:48px; height:48px;
+  display:grid; place-items:center;
+  background: rgba(255,255,255,.14);
+  color: white;
+}
+.image-viewer-close { top: 16px; right: 16px; }
+.image-viewer-arrow { top: 50%; transform: translateY(-50%); }
+.image-viewer-arrow.prev { left: 16px; }
+.image-viewer-arrow.next { right: 16px; }
+.image-viewer-arrow[disabled] { opacity:.36; }
+.image-viewer-meta {
+  position:absolute; left: 16px; top: 16px;
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+}
+.image-viewer-pill {
+  padding: 8px 12px; border-radius: 999px;
+  background: rgba(255,255,255,.14); color: white;
+  font-size: 13px; font-weight: 700;
+}
+.image-viewer-caption {
+  position:absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
+  padding: 10px 14px; border-radius: 999px;
+  background: rgba(255,255,255,.12); color: white;
+  font-size: 12px; font-weight: 700;
+}
 .card-actions { display:flex; align-items:center; gap:10px; margin-top: 14px; }
 .card-actions .btn { flex: 1 1 0; min-width: 0; }
 .empty { padding: 32px; text-align:center; color: var(--muted); border: 1px dashed var(--outline); border-radius: 28px; background: rgba(255,255,255,.72); }
@@ -1993,6 +2735,8 @@ button { cursor: pointer; }
   .grid { grid-template-columns: 1fr; }
   .cards { grid-template-columns: 1fr; }
   .address-hint { align-items:flex-start; flex-direction:column; }
+  .image-viewer-stage { padding: 82px 14px 96px; }
+  .image-viewer-close, .image-viewer-arrow { width: 44px; height: 44px; }
 }
 </style>
 </head>
@@ -2006,12 +2750,15 @@ button { cursor: pointer; }
 <main class="shell">
   <section class="hero">
     <h1>快速制卡</h1>
-    <p>支持直接输入文本、剪贴板获取或上传文件，一键生成统一风格的分享卡片，手机和电脑端显示保持一致。</p>
   </section>
 
   <section class="panel address-panel" id="copyAddressBtn" role="button" tabindex="0">
     <div class="address-label">访问地址</div>
     <code class="address-code" id="addressText"></code>
+    <code class="address-code" id="bookmarkAddressText" style="display:none;margin-top:8px;font-size:14px;"></code>
+    <div class="address-hint" id="discoveryHintRow" style="display:none;">
+      <span id="discoveryHintText"></span>
+    </div>
     <div class="address-hint">
       <span>点击复制当前真实访问地址，端口模式由设置页控制。</span>
       <span style="display:flex;align-items:center;gap:6px;color:rgba(19,83,216,.65);"><span class="material-symbols-outlined" style="font-size:18px;">content_copy</span>点击可复制</span>
@@ -2023,7 +2770,7 @@ button { cursor: pointer; }
     <div id="pickedFiles" class="chips"></div>
     <div class="composer-toolbar">
       <button id="pickFilesBtn" class="btn btn-soft">选择文件</button>
-      <button id="pasteBtn" class="btn btn-ghost">粘贴文字</button>
+      <button id="pasteBtn" class="btn btn-paste btn-icon"><span class="material-symbols-outlined" style="font-size:18px;">content_paste_go</span><span>粘贴</span></button>
       <button id="clearBtn" class="btn btn-ghost">清空</button>
       <div style="flex:1"></div>
       <button id="createBtn" class="btn btn-primary">制卡</button>
@@ -2062,9 +2809,30 @@ button { cursor: pointer; }
   <section id="cardsRoot" class="cards"></section>
 </main>
 <div id="toast" class="toast"></div>
+<div id="imageViewer" class="image-viewer" aria-hidden="true">
+  <div class="image-viewer-meta">
+    <div id="imageViewerCount" class="image-viewer-pill"></div>
+    <div id="imageViewerName" class="image-viewer-pill"></div>
+  </div>
+  <button id="imageViewerClose" class="image-viewer-close" type="button" aria-label="关闭">
+    <span class="material-symbols-outlined">close</span>
+  </button>
+  <button id="imageViewerPrev" class="image-viewer-arrow prev" type="button" aria-label="上一张">
+    <span class="material-symbols-outlined">chevron_left</span>
+  </button>
+  <div class="image-viewer-stage">
+    <img id="imageViewerImg" class="image-viewer-image" alt="">
+  </div>
+  <button id="imageViewerNext" class="image-viewer-arrow next" type="button" aria-label="下一张">
+    <span class="material-symbols-outlined">chevron_right</span>
+  </button>
+  <div id="imageViewerHint" class="image-viewer-caption">左右滑动查看同卡图片</div>
+</div>
 <script>
 const wsUrl = ${jsonEncode(wsUrl)};
 const initialAddress = ${jsonEncode(_serverAddress)};
+const initialDiscoveryHint = ${jsonEncode(_discoveryHint)};
+const initialBookmarkAddress = ${jsonEncode(_bookmarkAddress)};
 const cardsRoot = document.getElementById('cardsRoot');
 const searchInput = document.getElementById('searchInput');
 const composerInput = document.getElementById('composerInput');
@@ -2074,17 +2842,43 @@ const countText = document.getElementById('countText');
 const statusText = document.getElementById('statusText');
 const statusDot = document.getElementById('statusDot');
 const addressText = document.getElementById('addressText');
+const bookmarkAddressText = document.getElementById('bookmarkAddressText');
+const discoveryHintRow = document.getElementById('discoveryHintRow');
+const discoveryHintText = document.getElementById('discoveryHintText');
 const toast = document.getElementById('toast');
+const imageViewer = document.getElementById('imageViewer');
+const imageViewerImg = document.getElementById('imageViewerImg');
+const imageViewerClose = document.getElementById('imageViewerClose');
+const imageViewerPrev = document.getElementById('imageViewerPrev');
+const imageViewerNext = document.getElementById('imageViewerNext');
+const imageViewerCount = document.getElementById('imageViewerCount');
+const imageViewerName = document.getElementById('imageViewerName');
+const imageViewerHint = document.getElementById('imageViewerHint');
 let cards = [];
 let pendingFiles = [];
 let socket;
+let viewerImages = [];
+let viewerIndex = 0;
+let viewerTouchStartX = null;
 addressText.textContent = initialAddress;
+renderBookmarkAddress(initialBookmarkAddress);
+renderDiscoveryHint(initialDiscoveryHint);
 
 function showToast(message) {
   toast.textContent = message;
   toast.classList.add('show');
   clearTimeout(showToast.timer);
   showToast.timer = setTimeout(() => toast.classList.remove('show'), 1800);
+}
+
+function renderDiscoveryHint(value) {
+  discoveryHintRow.style.display = 'none';
+  discoveryHintText.textContent = '';
+}
+
+function renderBookmarkAddress(value) {
+  bookmarkAddressText.style.display = 'none';
+  bookmarkAddressText.textContent = '';
 }
 
 function escapeHtml(value) {
@@ -2103,16 +2897,39 @@ function formatBytes(bytes) {
   return (bytes / 1024 / 1024 / 1024).toFixed(1) + ' GB';
 }
 
-function extractStandaloneUrl(text) {
-  const value = String(text || '').trim();
-  if (!value || /\\s/.test(value)) return null;
+function extractFirstUrl(text) {
+  const match = String(text || '').match(/https?:\\/\\/[^\\s<>()]+/i);
+  if (!match) return null;
+  const normalized = String(match[0] || '').replace(/[\\]\\)\\}\\.,;:!?]+\$/, '');
   try {
-    const url = new URL(value);
+    const url = new URL(normalized);
     if (url.protocol === 'http:' || url.protocol === 'https:') {
       return url.toString();
     }
   } catch (_) {}
   return null;
+}
+
+function renderCardText(text) {
+  const value = String(text || '');
+  if (!value.trim()) return '无文本内容';
+  const urlPattern = /https?:\\/\\/[^\\s<>()]+/gi;
+  let result = '';
+  let lastIndex = 0;
+  for (const match of value.matchAll(urlPattern)) {
+    const rawUrl = match[0] || '';
+    const start = match.index || 0;
+    const normalized = rawUrl.replace(/[\\]\\)\\}\\.,;:!?]+\$/, '');
+    const suffix = rawUrl.slice(normalized.length);
+    result += escapeHtml(value.slice(lastIndex, start));
+    result += '<a href="' + escapeHtml(normalized) + '" target="_blank" rel="noopener noreferrer">' +
+      escapeHtml(normalized) +
+      '</a>' +
+      escapeHtml(suffix);
+    lastIndex = start + rawUrl.length;
+  }
+  result += escapeHtml(value.slice(lastIndex));
+  return result;
 }
 
 function renderPickedFiles() {
@@ -2138,11 +2955,14 @@ function renderCards() {
   }
 
   cardsRoot.innerHTML = filtered.map(card => {
-    const openUrl = extractStandaloneUrl(card.text || '');
+    const openUrl = extractFirstUrl(card.text || '');
+    const bundleUrl = card.bundleDownloadUrl || '';
+    const imageFiles = (card.attachments || []).filter(file => file.kind === 'image');
     const attachments = (card.attachments || []).map(file => {
       let preview = '';
       if (file.previewable && file.kind === 'image') {
-        preview = '<img class="preview" src="' + file.previewUrl + '" alt="' + escapeHtml(file.name) + '">';
+        const imageIndex = imageFiles.findIndex(item => item.id === file.id);
+        preview = '<img class="preview preview-clickable" src="' + file.previewUrl + '" alt="' + escapeHtml(file.name) + '" data-action="image-preview" data-card-id="' + escapeHtml(card.id) + '" data-image-index="' + imageIndex + '">';
       } else if (file.previewable && file.kind === 'audio') {
         preview = '<audio class="preview" controls src="' + file.previewUrl + '"></audio>';
       } else if (file.previewable && file.kind === 'video') {
@@ -2165,7 +2985,10 @@ function renderCards() {
 
     return '<article class="panel card">' +
       '<div class="card-top"><span>' + (card.pinned ? '置顶' : '') + '</span><span>创建 ' + new Date(card.createdAt).toLocaleString() + '</span></div>' +
-      '<div class="card-text">' + escapeHtml(card.text || '无文本内容') + '</div>' +
+      '<div class="card-text">' + renderCardText(card.text || '') + '</div>' +
+      ((card.attachments || []).length > 1 && bundleUrl
+        ? '<div class="card-actions" style="margin-top:14px;"><a class="action-link" href="' + bundleUrl + '" download>全部下载</a></div>'
+        : '') +
       (attachments ? '<div class="attachment-list">' + attachments + '</div>' : '') +
       '<div class="card-actions">' +
         (openUrl ? '<button class="btn btn-soft" data-action="open-card" data-card-url="' + escapeHtml(openUrl) + '">打开</button>' : '') +
@@ -2176,11 +2999,52 @@ function renderCards() {
   }).join('');
 }
 
+function openImageViewer(cardId, imageIndex) {
+  const card = cards.find(item => item.id === cardId);
+  if (!card) return;
+  viewerImages = (card.attachments || []).filter(file => file.kind === 'image');
+  if (!viewerImages.length) return;
+  viewerIndex = Math.max(0, Math.min(imageIndex, viewerImages.length - 1));
+  renderImageViewer();
+  imageViewer.classList.add('show');
+  imageViewer.setAttribute('aria-hidden', 'false');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeImageViewer() {
+  imageViewer.classList.remove('show');
+  imageViewer.setAttribute('aria-hidden', 'true');
+  document.body.style.overflow = '';
+  viewerTouchStartX = null;
+}
+
+function stepImageViewer(offset) {
+  if (!viewerImages.length) return;
+  const nextIndex = viewerIndex + offset;
+  if (nextIndex < 0 || nextIndex >= viewerImages.length) return;
+  viewerIndex = nextIndex;
+  renderImageViewer();
+}
+
+function renderImageViewer() {
+  if (!viewerImages.length) return;
+  const file = viewerImages[viewerIndex];
+  imageViewerImg.src = file.previewUrl;
+  imageViewerImg.alt = file.name || 'image preview';
+  imageViewerCount.textContent = (viewerIndex + 1) + ' / ' + viewerImages.length;
+  imageViewerName.textContent = file.name || '图片';
+  imageViewerPrev.disabled = viewerIndex === 0;
+  imageViewerNext.disabled = viewerIndex === viewerImages.length - 1;
+  imageViewerHint.style.display = viewerImages.length > 1 ? 'block' : 'none';
+}
+
 async function refreshCards() {
   const response = await fetch('/api/cards');
   const payload = await response.json();
   cards = payload.cards || [];
   if (payload.address) addressText.textContent = payload.address;
+  renderBookmarkAddress(payload.bookmarkAddress || '');
+  renderDiscoveryHint(payload.discoveryHint || '');
   renderCards();
 }
 
@@ -2202,6 +3066,8 @@ function connectWs() {
     if (payload.type === 'cardsSnapshot') {
       cards = payload.cards || [];
       if (payload.address) addressText.textContent = payload.address;
+      renderBookmarkAddress(payload.bookmarkAddress || '');
+      renderDiscoveryHint(payload.discoveryHint || '');
       renderCards();
     }
   };
@@ -2265,18 +3131,32 @@ async function copyCard(text) {
 }
 
 cardsRoot.addEventListener('click', async event => {
+  const imageTarget = event.target.closest('[data-action="image-preview"]');
+  if (imageTarget) {
+    openImageViewer(
+      imageTarget.dataset.cardId || '',
+      Number(imageTarget.dataset.imageIndex || '0'),
+    );
+    return;
+  }
   const target = event.target.closest('button[data-action]');
   if (!target) return;
+  const action = target.dataset.action || '';
+  if (action === 'open-card') {
+    const url = target.dataset.cardUrl || '';
+    if (!url) return;
+    const opened = window.open(url, '_blank', 'noopener');
+    if (!opened) {
+      window.location.href = url;
+    }
+    return;
+  }
   const cardId = target.dataset.cardId || '';
   const card = cards.find(item => item.id === cardId);
   if (!card) return;
-  if (target.dataset.action === 'copy-card') {
+  if (action === 'copy-card') {
     await copyCard(card.text || '');
-  } else if (target.dataset.action === 'open-card') {
-    const url = target.dataset.cardUrl || '';
-    if (!url) return;
-    window.open(url, '_blank', 'noopener');
-  } else if (target.dataset.action === 'delete-card') {
+  } else if (action === 'delete-card') {
     await deleteCard(card.id);
   }
 });
@@ -2291,6 +3171,18 @@ async function copyAddress() {
 }
 
 async function pasteIntoComposer() {
+  if (!window.isSecureContext) {
+    composerInput.focus();
+    showToast('请直接在输入框按 Ctrl/Cmd+V 或长按粘贴，HTTP 页面不支持按钮读取剪贴板');
+    return;
+  }
+  const clipboardFiles = await readImagesFromClipboard();
+  if (clipboardFiles.length) {
+    pendingFiles = pendingFiles.concat(clipboardFiles);
+    renderPickedFiles();
+    showToast('已粘贴 ' + clipboardFiles.length + ' 张图片');
+    return;
+  }
   try {
     const text = await navigator.clipboard.readText();
     if (!text) {
@@ -2302,6 +3194,47 @@ async function pasteIntoComposer() {
   } catch (_) {
     showToast('当前浏览器不支持直接读取剪贴板');
   }
+}
+
+async function readImagesFromClipboard() {
+  if (!navigator.clipboard || typeof navigator.clipboard.read !== 'function') {
+    return [];
+  }
+  try {
+    const items = await navigator.clipboard.read();
+    const files = [];
+    for (const item of items) {
+      for (const type of item.types || []) {
+        if (!type.startsWith('image/')) continue;
+        const blob = await item.getType(type);
+        if (!blob || !blob.size) continue;
+        const extension = normalizedImageExtension(type);
+        files.push(new File(
+          [blob],
+          'pasted-image-' + Date.now() + '-' + (files.length + 1) + '.' + extension,
+          {type},
+        ));
+      }
+    }
+    return files;
+  } catch (_) {
+    return [];
+  }
+}
+
+function normalizedImageExtension(mimeType) {
+  const subtype = String(mimeType || '').split('/')[1] || 'png';
+  if (subtype === 'jpeg') return 'jpg';
+  if (subtype === 'svg+xml') return 'svg';
+  return subtype.replaceAll(/[^a-z0-9.+-]/gi, '') || 'png';
+}
+
+function readImageFilesFromPasteEvent(event) {
+  const clipboardItems = Array.from(event.clipboardData?.items || []);
+  return clipboardItems
+    .filter(item => item.kind === 'file' && String(item.type || '').startsWith('image/'))
+    .map(item => item.getAsFile())
+    .filter(file => file && file.size > 0);
 }
 
 document.getElementById('pickFilesBtn').addEventListener('click', () => fileInput.click());
@@ -2328,6 +3261,52 @@ fileInput.addEventListener('change', event => {
   pendingFiles = Array.from(event.target.files || []);
   renderPickedFiles();
 });
+composerInput.addEventListener('paste', event => {
+  const imageFiles = readImageFilesFromPasteEvent(event);
+  if (!imageFiles.length) return;
+  event.preventDefault();
+  pendingFiles = pendingFiles.concat(imageFiles);
+  renderPickedFiles();
+  showToast('已粘贴 ' + imageFiles.length + ' 张图片');
+});
+document.addEventListener('paste', event => {
+  if (document.activeElement !== composerInput) return;
+  const imageFiles = readImageFilesFromPasteEvent(event);
+  if (!imageFiles.length) return;
+  event.preventDefault();
+  pendingFiles = pendingFiles.concat(imageFiles);
+  renderPickedFiles();
+  showToast('已粘贴 ' + imageFiles.length + ' 张图片');
+});
+imageViewerClose.addEventListener('click', closeImageViewer);
+imageViewerPrev.addEventListener('click', () => stepImageViewer(-1));
+imageViewerNext.addEventListener('click', () => stepImageViewer(1));
+imageViewer.addEventListener('click', event => {
+  if (event.target === imageViewer) {
+    closeImageViewer();
+  }
+});
+imageViewer.addEventListener('touchstart', event => {
+  viewerTouchStartX = event.changedTouches[0]?.clientX ?? null;
+}, {passive: true});
+imageViewer.addEventListener('touchend', event => {
+  if (viewerTouchStartX == null) return;
+  const touchEndX = event.changedTouches[0]?.clientX ?? viewerTouchStartX;
+  const deltaX = touchEndX - viewerTouchStartX;
+  viewerTouchStartX = null;
+  if (Math.abs(deltaX) < 40) return;
+  stepImageViewer(deltaX < 0 ? 1 : -1);
+}, {passive: true});
+document.addEventListener('keydown', event => {
+  if (!imageViewer.classList.contains('show')) return;
+  if (event.key === 'Escape') {
+    closeImageViewer();
+  } else if (event.key === 'ArrowLeft') {
+    stepImageViewer(-1);
+  } else if (event.key === 'ArrowRight') {
+    stepImageViewer(1);
+  }
+});
 renderPickedFiles();
 refreshCards();
 connectWs();
@@ -2343,34 +3322,33 @@ connectWs();
     return Scaffold(
       appBar: AppBar(
         toolbarHeight: 60,
-        titleSpacing: 18,
-        title: const Text(
-          '本地分享',
-          style: TextStyle(
-            fontSize: 18,
-            fontWeight: FontWeight.w900,
-            color: Color(0xFF0D44B3),
+        titleSpacing: 0,
+        title: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onDoubleTap: _jumpScrollByTitleBar,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+            child: Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    '本地分享',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w900,
+                      color: Color(0xFF0D44B3),
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: '设置',
+                  onPressed: _openSettings,
+                  icon: const Icon(Icons.settings_outlined, size: 22),
+                ),
+              ],
+            ),
           ),
         ),
-        actions: [
-          IconButton(
-            tooltip: '设置',
-            onPressed: _openSettings,
-            icon: const Icon(Icons.settings_outlined, size: 22),
-          ),
-          IconButton(
-            tooltip: '顶部',
-            onPressed: _scrollToTop,
-            icon: const Icon(Icons.keyboard_double_arrow_up_rounded, size: 22),
-          ),
-          IconButton(
-            tooltip: '底部',
-            onPressed: _scrollToBottom,
-            icon:
-                const Icon(Icons.keyboard_double_arrow_down_rounded, size: 22),
-          ),
-          const SizedBox(width: 8),
-        ],
       ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
@@ -2430,53 +3408,54 @@ connectWs();
                       controller: _scrollController,
                       padding: const EdgeInsets.fromLTRB(12, 6, 12, 28),
                       children: [
-                        _buildSearchBar(),
-                        const SizedBox(height: 16),
-                        _buildHero(),
-                        const SizedBox(height: 14),
                         _buildAddressPanel(),
                         const SizedBox(height: 14),
                         _buildComposerCard(),
-                        const SizedBox(height: 14),
-                        _buildServiceControls(),
                         const SizedBox(height: 20),
                         _buildCardsSection(cards),
                       ],
                     ),
                   ),
                 ),
+                if (_isExporting)
+                  Positioned.fill(
+                    child: ColoredBox(
+                      color: const Color(0x660B1733),
+                      child: Center(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 16,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(18),
+                          ),
+                          child: const Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              SizedBox(
+                                width: 28,
+                                height: 28,
+                                child:
+                                    CircularProgressIndicator(strokeWidth: 3),
+                              ),
+                              SizedBox(height: 12),
+                              Text(
+                                '正在导出卡片',
+                                style: TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                  color: Color(0xFF163A85),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
               ],
             ),
-    );
-  }
-
-  Widget _buildHero() {
-    return const Padding(
-      padding: EdgeInsets.only(top: 2),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            '快速制卡',
-            style: TextStyle(
-              fontSize: 26,
-              height: 1.04,
-              fontWeight: FontWeight.w900,
-              color: Color(0xFF00359E),
-            ),
-          ),
-          SizedBox(height: 6),
-          Text(
-            '支持直接输入文本、剪贴板获取或上传文件，一键生成精致分享卡片。',
-            style: TextStyle(
-              color: Color(0xFF6E7788),
-              height: 1.5,
-              fontSize: 13.5,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-        ],
-      ),
     );
   }
 
@@ -2512,73 +3491,224 @@ connectWs();
         style: const TextStyle(fontSize: 14.5, fontWeight: FontWeight.w500),
         cursorColor: const Color(0xFF1353D8),
         onTapOutside: (_) => FocusScope.of(context).unfocus(),
-        onChanged: (_) => setState(() {}),
+        onChanged: (_) {
+          setState(() {});
+          if (_searchController.text.trim().isNotEmpty) {
+            unawaited(_ensureCardsSectionVisible());
+          }
+        },
       ),
     );
   }
 
   Widget _buildAddressPanel() {
-    return InkWell(
-      borderRadius: BorderRadius.circular(26),
-      onTap: _copyServerAddress,
-      child: Container(
-        decoration: _panelDecoration(radius: 26, shadowOpacity: 0.045),
-        padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
+    final statusColor =
+        _isServerRunning ? const Color(0xFF1E9B52) : const Color(0xFFC53B3B);
+    const maxDragOffset = 88.0;
+    return AnimatedBuilder(
+      animation: _addressGlowController,
+      builder: (context, child) {
+        final t = _addressGlowController.value;
+        final pulse = 0.5 + 0.5 * sin(t * pi * 2);
+        final glowOpacity = _isServerRunning ? (0.12 + pulse * 0.12) : 0.08;
+        final accentA = _isServerRunning
+            ? Color.lerp(
+                const Color(0xFF34D27B),
+                const Color(0xFF64E6FF),
+                pulse,
+              )!
+            : const Color(0xFFE15A5A);
+        final accentB = _isServerRunning
+            ? Color.lerp(
+                const Color(0xFF0FB36A),
+                const Color(0xFF2EB5FF),
+                1 - pulse,
+              )!
+            : const Color(0xFFB42318);
+        return DecoratedBox(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(24),
+            gradient: LinearGradient(
+              begin: Alignment(-1 + pulse * 2, -1),
+              end: Alignment(1 - pulse * 2, 1),
+              colors: [accentA, accentB, accentA],
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: statusColor.withValues(alpha: glowOpacity),
+                blurRadius: 28 + pulse * 12,
+                spreadRadius: 1 + pulse * 1.5,
+              ),
+            ],
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(1.5),
+            child: Stack(
               children: [
-                const Expanded(
-                  child: Text(
-                    '访问地址',
-                    style: TextStyle(
-                      fontSize: 11,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: 2.8,
-                      color: Color(0x7A1353D8),
+                Positioned.fill(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(22),
+                      gradient: LinearGradient(
+                        begin: Alignment.centerLeft,
+                        end: Alignment.centerRight,
+                        colors: _isServerRunning
+                            ? [
+                                const Color(0x10C53B3B),
+                                const Color(0x28C53B3B),
+                              ]
+                            : [
+                                const Color(0x101E9B52),
+                                const Color(0x281E9B52),
+                              ],
+                      ),
+                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 18),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Opacity(
+                            opacity: _isServerRunning
+                                ? (_addressCardDragOffset < 0
+                                    ? (_addressCardDragOffset.abs() /
+                                            maxDragOffset)
+                                        .clamp(0.0, 1.0)
+                                    : 0)
+                                : 0,
+                            child: const Align(
+                              alignment: Alignment.centerLeft,
+                              child: Text(
+                                '停止',
+                                style: TextStyle(
+                                  color: Color(0xFFB42318),
+                                  fontWeight: FontWeight.w900,
+                                  fontSize: 15,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        Expanded(
+                          child: Opacity(
+                            opacity: !_isServerRunning
+                                ? (_addressCardDragOffset > 0
+                                    ? (_addressCardDragOffset.abs() /
+                                            maxDragOffset)
+                                        .clamp(0.0, 1.0)
+                                    : 0)
+                                : 0,
+                            child: const Align(
+                              alignment: Alignment.centerRight,
+                              child: Text(
+                                '启动',
+                                style: TextStyle(
+                                  color: Color(0xFF157347),
+                                  fontWeight: FontWeight.w900,
+                                  fontSize: 15,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
-                Container(
-                  width: 34,
-                  height: 34,
-                  decoration: BoxDecoration(
-                    color: const Color(0x101353D8),
-                    borderRadius: BorderRadius.circular(17),
-                  ),
-                  child: const Icon(
-                    Icons.content_copy_rounded,
-                    size: 16,
-                    color: Color(0xFF1353D8),
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onHorizontalDragUpdate: (details) {
+                    setState(() {
+                      _addressCardDragOffset =
+                          (_addressCardDragOffset + details.delta.dx)
+                              .clamp(-maxDragOffset, maxDragOffset);
+                    });
+                  },
+                  onHorizontalDragEnd: (details) async {
+                    final velocity = details.primaryVelocity?.abs() ?? 0;
+                    final shouldToggle =
+                        _addressCardDragOffset.abs() > 12 || velocity > 80;
+                    setState(() {
+                      _addressCardDragOffset = 0;
+                    });
+                    if (!shouldToggle) {
+                      return;
+                    }
+                    if (_isServerRunning) {
+                      await _stopServer();
+                    } else {
+                      await _startServer();
+                    }
+                  },
+                  onHorizontalDragCancel: () {
+                    if (_addressCardDragOffset == 0) {
+                      return;
+                    }
+                    setState(() {
+                      _addressCardDragOffset = 0;
+                    });
+                  },
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 140),
+                    curve: Curves.easeOutCubic,
+                    transform: Matrix4.translationValues(
+                      _addressCardDragOffset,
+                      0,
+                      0,
+                    ),
+                    child: Container(
+                      decoration: _panelDecoration(
+                        radius: 22,
+                        shadowOpacity: 0.035,
+                        borderColor: Colors.transparent,
+                        glowColor: statusColor,
+                      ),
+                      padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              const Expanded(
+                                child: Text(
+                                  '访问地址',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w800,
+                                    letterSpacing: 2.8,
+                                    color: Color(0x7A1353D8),
+                                  ),
+                                ),
+                              ),
+                              _buildMetaPill(
+                                _isServerRunning ? '运行中' : '已停止',
+                                foregroundColor: statusColor,
+                                backgroundColor: statusColor.withValues(
+                                  alpha: 0.12,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            _serverAddress,
+                            style: const TextStyle(
+                              fontSize: 16,
+                              height: 1.28,
+                              fontWeight: FontWeight.w800,
+                              color: Color(0xFF1143AB),
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               ],
             ),
-            const SizedBox(height: 6),
-            SelectableText(
-              _serverAddress,
-              style: const TextStyle(
-                fontSize: 16,
-                height: 1.28,
-                fontWeight: FontWeight.w800,
-                color: Color(0xFF1143AB),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              _isServerRunning
-                  ? '点击可复制当前访问地址，端口模式由设置页控制。'
-                  : '可在设置页切换随机端口或固定端口。',
-              style: TextStyle(
-                color: Color(0xFF758094),
-                fontSize: 12.5,
-                height: 1.45,
-              ),
-            ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 
@@ -2660,15 +3790,18 @@ connectWs();
                     icon: Icons.attach_file_rounded,
                     onTap: _isPickingFiles ? null : _pickFilesFromDevice,
                     variant: _CapsuleButtonVariant.soft,
+                    iconColorOverride: const Color(0xFF163A85),
                   ),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
                   child: _buildCapsuleButton(
                     label: '粘贴',
-                    icon: Icons.content_paste_rounded,
+                    icon: Icons.content_paste_go_rounded,
                     onTap: _pasteClipboardToComposer,
-                    variant: _CapsuleButtonVariant.ghost,
+                    variant: _CapsuleButtonVariant.soft,
+                    foregroundOverride: const Color(0xFF0D44B3),
+                    iconColorOverride: const Color(0xFF163A85),
                   ),
                 ),
               ],
@@ -2705,35 +3838,13 @@ connectWs();
     );
   }
 
-  Widget _buildServiceControls() {
-    return Row(
-      children: [
-        Expanded(
-          child: _buildServiceCard(
-            icon: Icons.play_arrow_rounded,
-            label: '启动服务',
-            subtitle: _useFixedPort ? '固定端口 $_preferredPort' : '随机端口',
-            onTap: _isServerRunning ? null : _startServer,
-          ),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: _buildServiceCard(
-            icon: Icons.stop_rounded,
-            label: '停止服务',
-            subtitle: '停止后访问中断',
-            onTap: _isServerRunning ? _stopServer : null,
-            isDanger: true,
-          ),
-        ),
-      ],
-    );
-  }
-
   Widget _buildCardsSection(List<CardItem> cards) {
     return Column(
+      key: _cardsSectionKey,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        _buildSearchBar(),
+        const SizedBox(height: 14),
         Row(
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
@@ -2792,261 +3903,221 @@ connectWs();
         .map((id) => _attachments[id])
         .whereType<CardAttachment>()
         .toList();
-    final openUrl = _extractStandaloneUrl(card.text);
+    final imageAttachments = cardAttachments
+        .where((attachment) => attachment.kind == AttachmentKind.image)
+        .toList();
+    final openUrl = _extractFirstUrl(card.text);
 
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(24),
-        onLongPress: () => _togglePinnedCard(card),
-        child: Ink(
-          decoration: _panelDecoration(radius: 24, shadowOpacity: 0.045),
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  AnimatedOpacity(
-                    opacity: card.isPinned ? 1 : 0,
-                    duration: const Duration(milliseconds: 160),
-                    child: IgnorePointer(
-                      ignoring: !card.isPinned,
-                      child: _buildMetaPill(
-                        '置顶',
-                        foregroundColor: const Color(0xFF0D44B3),
-                        backgroundColor: const Color(0xFFEAF1FF),
+    return _SwipeRevealCard(
+      leftActions: [
+        _SwipeActionSpec(
+          label: '查看编辑',
+          icon: Icons.edit_note_rounded,
+          color: const Color(0xFF0D44B3),
+          onTap: () => _openCardEditor(card),
+        ),
+      ],
+      rightActions: [
+        _SwipeActionSpec(
+          label: card.isPinned ? '取消置顶' : '置顶',
+          icon:
+              card.isPinned ? Icons.push_pin_outlined : Icons.push_pin_rounded,
+          color: const Color(0xFF1353D8),
+          onTap: () => _togglePinnedCard(card),
+        ),
+        _SwipeActionSpec(
+          label: '删除',
+          icon: Icons.delete_outline,
+          color: const Color(0xFFBA1A1A),
+          onTap: () => _deleteCardWithConfirm(card),
+        ),
+      ],
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(24),
+          onLongPress: () => _copyCardText(card.text),
+          child: Ink(
+            decoration: _panelDecoration(radius: 24, shadowOpacity: 0.045),
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    AnimatedOpacity(
+                      opacity: card.isPinned ? 1 : 0,
+                      duration: const Duration(milliseconds: 160),
+                      child: IgnorePointer(
+                        ignoring: !card.isPinned,
+                        child: _buildMetaPill(
+                          '置顶',
+                          foregroundColor: const Color(0xFF0D44B3),
+                          backgroundColor: const Color(0xFFEAF1FF),
+                        ),
                       ),
                     ),
-                  ),
-                  _buildMetaPill('创建 ${_formatDateTime(card.createdAt)}'),
-                ],
-              ),
-              const SizedBox(height: 10),
-              Text(
-                card.text.isEmpty ? '无文本内容' : card.text,
-                style: const TextStyle(
-                  color: Color(0xFF1F2430),
-                  fontSize: 14.5,
-                  height: 1.6,
-                  fontWeight: FontWeight.w500,
+                    _buildMetaPill('创建 ${_formatDateTime(card.createdAt)}'),
+                  ],
                 ),
-              ),
-              if (cardAttachments.isNotEmpty) ...[
-                const SizedBox(height: 14),
-                ...cardAttachments.map(
-                  (attachment) => Container(
-                    margin: const EdgeInsets.only(bottom: 10),
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFF7F9FD),
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border.all(color: const Color(0xFFE2E7F1)),
+                const SizedBox(height: 10),
+                Text(
+                  card.text.isEmpty ? '无文本内容' : card.text,
+                  maxLines: 5,
+                  overflow: TextOverflow.fade,
+                  style: const TextStyle(
+                    color: Color(0xFF1F2430),
+                    fontSize: 14.5,
+                    height: 1.6,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                if (cardAttachments.isNotEmpty) ...[
+                  const SizedBox(height: 14),
+                  if (cardAttachments.length > 1) ...[
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: _buildCapsuleButton(
+                        label: '全部下载',
+                        icon: Icons.folder_zip_rounded,
+                        onTap: () => _downloadCardBundle(card),
+                        variant: _CapsuleButtonVariant.primary,
+                        compact: true,
+                      ),
                     ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        if (attachment.kind == AttachmentKind.image) ...[
-                          _buildImageAttachmentPreview(attachment),
-                          const SizedBox(height: 12),
-                        ],
-                        Row(
-                          children: [
-                            Container(
-                              width: 38,
-                              height: 38,
-                              decoration: BoxDecoration(
-                                color: const Color(0x141353D8),
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                              child: Icon(
-                                _iconForAttachment(attachment),
-                                color: const Color(0xFF1353D8),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    attachment.name,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      fontWeight: FontWeight.w800,
-                                      fontSize: 14,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 3),
-                                  Text(
-                                    _attachmentLabel(attachment),
-                                    style: const TextStyle(
-                                      color: Color(0xFF7A8497),
-                                      fontSize: 12,
-                                    ),
-                                  ),
-                                ],
+                    const SizedBox(height: 10),
+                  ],
+                  ...cardAttachments.map(
+                    (attachment) => Container(
+                      margin: const EdgeInsets.only(bottom: 10),
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF7F9FD),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(color: const Color(0xFFE2E7F1)),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          if (attachment.kind == AttachmentKind.image) ...[
+                            _buildImageAttachmentPreview(
+                              attachment,
+                              imageAttachments: imageAttachments,
+                              initialIndex: imageAttachments.indexWhere(
+                                (item) => item.id == attachment.id,
                               ),
                             ),
+                            const SizedBox(height: 12),
                           ],
-                        ),
-                        const SizedBox(height: 12),
-                        Row(
-                          children: [
-                            if (attachment.isPreviewable &&
-                                attachment.kind != AttachmentKind.image) ...[
+                          Row(
+                            children: [
+                              Container(
+                                width: 38,
+                                height: 38,
+                                decoration: BoxDecoration(
+                                  color: const Color(0x141353D8),
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Icon(
+                                  _iconForAttachment(attachment),
+                                  color: const Color(0xFF1353D8),
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      attachment.name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w800,
+                                        fontSize: 14,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 3),
+                                    Text(
+                                      _attachmentLabel(attachment),
+                                      style: const TextStyle(
+                                        color: Color(0xFF7A8497),
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              if (attachment.isPreviewable &&
+                                  attachment.kind != AttachmentKind.image) ...[
+                                Expanded(
+                                  child: _buildCapsuleButton(
+                                    label: '预览',
+                                    icon: Icons.visibility_outlined,
+                                    onTap: () => _openAttachment(
+                                      attachment,
+                                      preview: true,
+                                    ),
+                                    variant: _CapsuleButtonVariant.soft,
+                                    compact: true,
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                              ],
                               Expanded(
                                 child: _buildCapsuleButton(
-                                  label: '预览',
-                                  icon: Icons.visibility_outlined,
-                                  onTap: () => _openAttachment(
-                                    attachment,
-                                    preview: true,
-                                  ),
-                                  variant: _CapsuleButtonVariant.soft,
+                                  label: attachment.kind == AttachmentKind.image
+                                      ? '原图'
+                                      : '下载',
+                                  icon: Icons.download_rounded,
+                                  onTap: () => _openAttachment(attachment),
+                                  variant: _CapsuleButtonVariant.primary,
                                   compact: true,
                                 ),
                               ),
-                              const SizedBox(width: 8),
                             ],
-                            Expanded(
-                              child: _buildCapsuleButton(
-                                label: attachment.kind == AttachmentKind.image
-                                    ? '原图'
-                                    : '下载',
-                                icon: Icons.download_rounded,
-                                onTap: () => _openAttachment(attachment),
-                                variant: _CapsuleButtonVariant.primary,
-                                compact: true,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                ),
-              ],
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  if (openUrl != null) ...[
+                ],
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    if (openUrl != null) ...[
+                      Expanded(
+                        child: _buildCapsuleButton(
+                          label: '打开',
+                          icon: Icons.open_in_new_rounded,
+                          onTap: () => _openCardUrl(card),
+                          variant: _CapsuleButtonVariant.soft,
+                          compact: true,
+                          stacked: true,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
                     Expanded(
                       child: _buildCapsuleButton(
-                        label: '打开',
-                        icon: Icons.open_in_new_rounded,
-                        onTap: () => _openCardUrl(card),
+                        label: '分享',
+                        icon: Icons.ios_share_rounded,
+                        onTap: () => _shareCard(card),
                         variant: _CapsuleButtonVariant.soft,
                         compact: true,
                         stacked: true,
                       ),
                     ),
-                    const SizedBox(width: 8),
                   ],
-                  Expanded(
-                    child: _buildCapsuleButton(
-                      label: '分享',
-                      icon: Icons.ios_share_rounded,
-                      onTap: () => _shareCard(card),
-                      variant: _CapsuleButtonVariant.soft,
-                      compact: true,
-                      stacked: true,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: _buildCapsuleButton(
-                      label: '复制',
-                      icon: Icons.content_copy,
-                      onTap: () => _copyCardText(card.text),
-                      variant: _CapsuleButtonVariant.ghost,
-                      compact: true,
-                      stacked: true,
-                      fontWeight: FontWeight.w900,
-                      foregroundOverride: const Color(0xFF111111),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: _buildCapsuleButton(
-                      label: '删除',
-                      icon: Icons.delete_outline,
-                      onTap: () => _deleteCardWithConfirm(card),
-                      variant: _CapsuleButtonVariant.danger,
-                      compact: true,
-                      stacked: true,
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildServiceCard({
-    required IconData icon,
-    required String label,
-    required String subtitle,
-    required VoidCallback? onTap,
-    bool isDanger = false,
-  }) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(28),
-      onTap: onTap,
-      child: Opacity(
-        opacity: onTap == null ? 0.5 : 1,
-        child: Container(
-          constraints: const BoxConstraints(minHeight: 142),
-          decoration: _panelDecoration(radius: 24, shadowOpacity: 0.04),
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: isDanger
-                      ? const Color(0x22BA1A1A)
-                      : const Color(0x221353D8),
-                  border: Border.all(
-                    color: isDanger
-                        ? const Color(0x33BA1A1A)
-                        : const Color(0x331353D8),
-                  ),
                 ),
-                child: Icon(
-                  icon,
-                  size: 26,
-                  color: isDanger
-                      ? const Color(0xFFBA1A1A)
-                      : const Color(0xFF1353D8),
-                ),
-              ),
-              const SizedBox(height: 14),
-              Text(
-                label,
-                style: const TextStyle(
-                  fontWeight: FontWeight.w800,
-                  fontSize: 15,
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                subtitle,
-                style: const TextStyle(
-                  color: Color(0xFF7C8699),
-                  fontSize: 12.5,
-                  height: 1.4,
-                ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -3062,6 +4133,7 @@ connectWs();
     bool stacked = false,
     FontWeight? fontWeight,
     Color? foregroundOverride,
+    Color? iconColorOverride,
   }) {
     late final Color background;
     Color foreground;
@@ -3070,8 +4142,8 @@ connectWs();
         background = const Color(0xFF1353D8);
         foreground = Colors.white;
       case _CapsuleButtonVariant.soft:
-        background = const Color(0x66D0E1FB);
-        foreground = const Color(0xFF385171);
+        background = const Color(0xFFEAF1FF);
+        foreground = const Color(0xFF0D44B3);
       case _CapsuleButtonVariant.ghost:
         background = const Color(0xFFF2F4F6);
         foreground = const Color(0xFF5A6475);
@@ -3102,7 +4174,7 @@ connectWs();
             Icon(
               icon,
               size: compact ? 18 : 20,
-              color: foreground,
+              color: iconColorOverride ?? foreground,
             ),
             const SizedBox(height: 4),
             Text(
@@ -3121,7 +4193,11 @@ connectWs();
     return FilledButton.icon(
       onPressed: onTap,
       style: style,
-      icon: Icon(icon, size: compact ? 18 : 20),
+      icon: Icon(
+        icon,
+        size: compact ? 18 : 20,
+        color: iconColorOverride ?? foreground,
+      ),
       label: Text(
         label,
         textAlign: TextAlign.center,
@@ -3180,14 +4256,16 @@ connectWs();
   BoxDecoration _panelDecoration({
     double radius = 28,
     double shadowOpacity = 0.08,
+    Color borderColor = const Color(0xFFE6EBF3),
+    Color glowColor = const Color(0xFF1353D8),
   }) {
     return BoxDecoration(
-      color: Colors.white.withValues(alpha: 0.96),
+      color: Colors.white,
       borderRadius: BorderRadius.circular(radius),
-      border: Border.all(color: const Color(0xFFE6EBF3)),
+      border: Border.all(color: borderColor),
       boxShadow: [
         BoxShadow(
-          color: Color(0xFF1353D8).withValues(alpha: shadowOpacity),
+          color: glowColor.withValues(alpha: shadowOpacity),
           blurRadius: 24,
           offset: const Offset(0, 12),
         ),
@@ -3202,11 +4280,15 @@ class LocalShareSettingsPage extends StatefulWidget {
     required this.initialPort,
     required this.initialUseFixedPort,
     required this.initialConfirmDelete,
+    required this.onImportTap,
+    required this.onExportTap,
   });
 
   final int initialPort;
   final bool initialUseFixedPort;
   final bool initialConfirmDelete;
+  final Future<void> Function() onImportTap;
+  final Future<void> Function() onExportTap;
 
   @override
   State<LocalShareSettingsPage> createState() => _LocalShareSettingsPageState();
@@ -3327,6 +4409,42 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
                   ),
                 ),
                 const SizedBox(height: 14),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    Navigator.of(context).pop();
+                    await widget.onExportTap();
+                  },
+                  icon: const Icon(Icons.ios_share_rounded),
+                  label: const Text(
+                    '导出全部卡片',
+                    style: TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size.fromHeight(48),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    Navigator.of(context).pop();
+                    await widget.onImportTap();
+                  },
+                  icon: const Icon(Icons.file_upload_outlined),
+                  label: const Text(
+                    '导入备份',
+                    style: TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size.fromHeight(48),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
                 OutlinedButton(
                   onPressed: () => _save(clearAllCards: true),
                   style: OutlinedButton.styleFrom(
@@ -3359,6 +4477,241 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
                   ),
                 ),
               ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CardEditorPage extends StatefulWidget {
+  const _CardEditorPage({required this.initialText});
+
+  final String initialText;
+
+  @override
+  State<_CardEditorPage> createState() => _CardEditorPageState();
+}
+
+class _CardEditorPageState extends State<_CardEditorPage> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initialText);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('编辑卡片'),
+        leading: IconButton(
+          onPressed: () => Navigator.of(context).pop(),
+          icon: const Icon(Icons.close_rounded),
+          tooltip: '取消',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(_controller.text.trim()),
+            child: const Text(
+              '保存',
+              style: TextStyle(fontWeight: FontWeight.w900),
+            ),
+          ),
+          const SizedBox(width: 6),
+        ],
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: EdgeInsets.fromLTRB(
+            16,
+            10,
+            16,
+            16 + MediaQuery.of(context).viewInsets.bottom,
+          ),
+          child: TextField(
+            controller: _controller,
+            expands: true,
+            maxLines: null,
+            minLines: null,
+            autofocus: true,
+            textAlignVertical: TextAlignVertical.top,
+            decoration: const InputDecoration(
+              hintText: '修改卡片内容',
+              alignLabelWithHint: true,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SwipeActionSpec {
+  const _SwipeActionSpec({
+    required this.label,
+    required this.icon,
+    required this.color,
+    required this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final Color color;
+  final VoidCallback onTap;
+}
+
+class _SwipeRevealCard extends StatefulWidget {
+  const _SwipeRevealCard({
+    required this.child,
+    required this.leftActions,
+    required this.rightActions,
+  });
+
+  final Widget child;
+  final List<_SwipeActionSpec> leftActions;
+  final List<_SwipeActionSpec> rightActions;
+
+  @override
+  State<_SwipeRevealCard> createState() => _SwipeRevealCardState();
+}
+
+class _SwipeRevealCardState extends State<_SwipeRevealCard> {
+  static const double _actionWidth = 72;
+  double _offset = 0;
+
+  double get _maxLeftOffset => widget.leftActions.length * _actionWidth;
+  double get _maxRightOffset => widget.rightActions.length * _actionWidth;
+
+  void _handleDragUpdate(DragUpdateDetails details) {
+    final next = _offset + details.delta.dx;
+    setState(() {
+      _offset = next.clamp(-_maxRightOffset, _maxLeftOffset);
+    });
+  }
+
+  void _handleDragEnd(DragEndDetails details) {
+    final shouldOpenLeft = _offset > _maxLeftOffset * 0.35;
+    final shouldOpenRight = _offset < -_maxRightOffset * 0.35;
+    setState(() {
+      if (shouldOpenLeft) {
+        _offset = _maxLeftOffset;
+      } else if (shouldOpenRight) {
+        _offset = -_maxRightOffset;
+      } else {
+        _offset = 0;
+      }
+    });
+  }
+
+  void _close() {
+    if (_offset == 0) {
+      return;
+    }
+    setState(() {
+      _offset = 0;
+    });
+  }
+
+  Widget _buildActionRail(
+    List<_SwipeActionSpec> actions, {
+    required Alignment alignment,
+  }) {
+    if (actions.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return Align(
+      alignment: alignment,
+      child: SizedBox(
+        width: actions.length * _actionWidth,
+        child: Row(
+          mainAxisAlignment: alignment == Alignment.centerLeft
+              ? MainAxisAlignment.start
+              : MainAxisAlignment.end,
+          children: [
+            for (final action in actions)
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: FilledButton(
+                    onPressed: () {
+                      _close();
+                      action.onTap();
+                    },
+                    style: FilledButton.styleFrom(
+                      backgroundColor: action.color,
+                      foregroundColor: Colors.white,
+                      minimumSize: const Size.fromHeight(86),
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(action.icon, size: 18),
+                        const SizedBox(height: 6),
+                        Text(
+                          action.label,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w800,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onHorizontalDragUpdate: _handleDragUpdate,
+      onHorizontalDragEnd: _handleDragEnd,
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: _buildActionRail(
+                      widget.leftActions,
+                      alignment: Alignment.centerLeft,
+                    ),
+                  ),
+                  Expanded(
+                    child: _buildActionRail(
+                      widget.rightActions,
+                      alignment: Alignment.centerRight,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            curve: Curves.easeOutCubic,
+            transform: Matrix4.translationValues(_offset, 0, 0),
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _close,
+              child: widget.child,
             ),
           ),
         ],
