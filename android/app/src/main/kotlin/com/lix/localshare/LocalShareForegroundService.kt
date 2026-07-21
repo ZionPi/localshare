@@ -7,16 +7,23 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
 class LocalShareForegroundService : Service() {
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
+                releaseConnectionLocks()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
@@ -25,9 +32,77 @@ class LocalShareForegroundService : Service() {
                 val address = intent?.getStringExtra(EXTRA_ADDRESS).orEmpty()
                 val port = intent?.getIntExtra(EXTRA_PORT, 0) ?: 0
                 startForeground(NOTIFICATION_ID, buildNotification(address, port))
+                acquireConnectionLocks()
                 return START_STICKY
             }
         }
+    }
+
+    override fun onDestroy() {
+        releaseConnectionLocks()
+        super.onDestroy()
+    }
+
+    private fun acquireConnectionLocks() {
+        if (wakeLock == null) {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:localshare-server")
+                .apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+        } else if (wakeLock?.isHeld != true) {
+            wakeLock?.acquire()
+        }
+
+        val wifiManager =
+            applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
+        if (wifiLock == null) {
+            @Suppress("DEPRECATION")
+            wifiLock = wifiManager
+                .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "$packageName:localshare-wifi")
+                .apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+        } else if (wifiLock?.isHeld != true) {
+            wifiLock?.acquire()
+        }
+
+        if (multicastLock == null) {
+            multicastLock = wifiManager
+                .createMulticastLock("$packageName:localshare-mdns")
+                .apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+        } else if (multicastLock?.isHeld != true) {
+            multicastLock?.acquire()
+        }
+    }
+
+    private fun releaseConnectionLocks() {
+        runCatching {
+            if (multicastLock?.isHeld == true) {
+                multicastLock?.release()
+            }
+        }
+        multicastLock = null
+
+        runCatching {
+            if (wifiLock?.isHeld == true) {
+                wifiLock?.release()
+            }
+        }
+        wifiLock = null
+
+        runCatching {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        }
+        wakeLock = null
     }
 
     private fun buildNotification(address: String, port: Int): Notification {

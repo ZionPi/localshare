@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math';
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter_background/flutter_background.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -697,6 +698,7 @@ class _MyHomePageState extends State<MyHomePage>
   String? _discoveryHint;
   String? _bookmarkAddress;
   String _publicHost = '127.0.0.1';
+  bool _hasObservedWebAddress = false;
   int _preferredPort = _defaultServerPort;
   bool _useFixedPort = false;
   bool _confirmDelete = true;
@@ -706,6 +708,7 @@ class _MyHomePageState extends State<MyHomePage>
   File? _exportCancelFile;
   bool _isLoading = true;
   DateTime? _lastStateSyncAt;
+  bool _backgroundExecutionReady = false;
 
   @override
   void initState() {
@@ -740,6 +743,7 @@ class _MyHomePageState extends State<MyHomePage>
         );
       await _markStateSynced();
       await _setupSharingHandlers();
+      await _initializeBackgroundExecution();
       await _startServer();
       _startStateRefreshLoop();
     } catch (error) {
@@ -1816,6 +1820,58 @@ class _MyHomePageState extends State<MyHomePage>
     }
   }
 
+  Future<void> _initializeBackgroundExecution() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+    try {
+      final initialized = await FlutterBackground.initialize(
+        androidConfig: const FlutterBackgroundAndroidConfig(
+          notificationTitle: '本地分享',
+          notificationText: '正在保持网页连接',
+          notificationImportance: AndroidNotificationImportance.normal,
+          notificationIcon: AndroidResource(
+            name: 'launcher_icon',
+            defType: 'mipmap',
+          ),
+          enableWifiLock: true,
+          showBadge: false,
+          shouldRequestBatteryOptimizationsOff: true,
+        ),
+      );
+      _backgroundExecutionReady = initialized;
+    } catch (error) {
+      _backgroundExecutionReady = false;
+      debugPrint('initializeBackgroundExecution failed: $error');
+    }
+  }
+
+  Future<void> _enableBackgroundExecution() async {
+    if (!Platform.isAndroid || !_backgroundExecutionReady) {
+      return;
+    }
+    if (FlutterBackground.isBackgroundExecutionEnabled) {
+      return;
+    }
+    try {
+      await FlutterBackground.enableBackgroundExecution();
+    } catch (error) {
+      debugPrint('enableBackgroundExecution failed: $error');
+    }
+  }
+
+  Future<void> _disableBackgroundExecution() async {
+    if (!Platform.isAndroid ||
+        !FlutterBackground.isBackgroundExecutionEnabled) {
+      return;
+    }
+    try {
+      await FlutterBackground.disableBackgroundExecution();
+    } catch (error) {
+      debugPrint('disableBackgroundExecution failed: $error');
+    }
+  }
+
   Future<void> _syncDiscoveryService() async {
     if (!Platform.isAndroid || !_isServerRunning) {
       return;
@@ -1836,20 +1892,22 @@ class _MyHomePageState extends State<MyHomePage>
             .invokeMapMethod<String, dynamic>('getRegisteredHttpService');
       }
       final hint = (payload?['hint'] as String?)?.trim();
-      final bookmarkUrl = (payload?['bookmarkUrl'] as String?)?.trim();
-      final displayAddress = bookmarkUrl == null || bookmarkUrl.isEmpty
-          ? 'http://Android.local:${_server?.port ?? _preferredPort}'
-          : bookmarkUrl;
+      final displayAddress = _ipServerAddress ??
+          'http://$_publicHost:${_server?.port ?? _preferredPort}';
       if (!mounted) {
         _discoveryHint = hint?.isEmpty == true ? null : hint;
-        _bookmarkAddress = bookmarkUrl?.isEmpty == true ? null : bookmarkUrl;
-        _serverAddress = displayAddress;
+        _bookmarkAddress = null;
+        if (!_hasObservedWebAddress) {
+          _serverAddress = displayAddress;
+        }
         return;
       }
       setState(() {
         _discoveryHint = hint?.isEmpty == true ? null : hint;
-        _bookmarkAddress = bookmarkUrl?.isEmpty == true ? null : bookmarkUrl;
-        _serverAddress = displayAddress;
+        _bookmarkAddress = null;
+        if (!_hasObservedWebAddress) {
+          _serverAddress = displayAddress;
+        }
       });
     } catch (error) {
       debugPrint('registerHttpService failed: $error');
@@ -2541,6 +2599,7 @@ class _MyHomePageState extends State<MyHomePage>
       });
 
       Future<Response> handler(Request request) async {
+        _recordObservedRequestAddress(request);
         if (request.url.path == 'ws') {
           return wsHandler(request);
         }
@@ -2558,12 +2617,14 @@ class _MyHomePageState extends State<MyHomePage>
         setState(() {
           _publicHost = ipAddress;
           _ipServerAddress = 'http://$_publicHost:${_server!.port}';
-          _serverAddress = 'http://Android.local:${_server!.port}';
-          _bookmarkAddress = _serverAddress;
+          _serverAddress = _ipServerAddress!;
+          _bookmarkAddress = null;
+          _hasObservedWebAddress = false;
           _isServerRunning = true;
         });
       }
       await _syncForegroundService();
+      await _enableBackgroundExecution();
       await _syncDiscoveryService();
     } on SocketException catch (error) {
       final addressInUse = error.osError?.errorCode == 48 ||
@@ -2597,6 +2658,7 @@ class _MyHomePageState extends State<MyHomePage>
     _webSocketClients.clear();
     await _stopDiscoveryService();
     await _stopForegroundService();
+    await _disableBackgroundExecution();
     await _server?.close(force: true);
     _server = null;
     if (mounted) {
@@ -2648,6 +2710,45 @@ class _MyHomePageState extends State<MyHomePage>
       'bookmarkAddress': _bookmarkAddress,
       'chatMessages': _buildChatSnapshot()['messages'],
     };
+  }
+
+  void _recordObservedRequestAddress(Request request) {
+    final rawHost = request.headers['host']?.trim();
+    if (rawHost == null || rawHost.isEmpty) {
+      return;
+    }
+    if (rawHost.contains(RegExp(r'[\s/\\]'))) {
+      return;
+    }
+
+    final hostOnly = rawHost.startsWith('[')
+        ? rawHost.split(']').first.replaceFirst('[', '')
+        : rawHost.split(':').first;
+    final normalizedHost = hostOnly.toLowerCase();
+    if (normalizedHost == 'localhost' ||
+        normalizedHost == '0.0.0.0' ||
+        normalizedHost == '::1' ||
+        normalizedHost.startsWith('127.')) {
+      return;
+    }
+
+    final hasPort = rawHost.startsWith('[')
+        ? rawHost.contains(']:')
+        : rawHost.contains(':');
+    final hostWithPort =
+        hasPort ? rawHost : '$rawHost:${_server?.port ?? _preferredPort}';
+    final observedAddress = 'http://$hostWithPort';
+    if (observedAddress == _serverAddress) {
+      return;
+    }
+
+    _hasObservedWebAddress = true;
+    _serverAddress = observedAddress;
+    if (mounted) {
+      setState(() {});
+    }
+    _broadcastSnapshot();
+    unawaited(_syncForegroundService());
   }
 
   void _broadcastSnapshot() {
@@ -3261,9 +3362,6 @@ class _MyHomePageState extends State<MyHomePage>
   }
 
   String _generateHtmlPage() {
-    final host = _publicHost;
-    final port = _server?.port ?? 0;
-    final wsUrl = 'ws://$host:$port/ws';
     return '''
 <!DOCTYPE html>
 <html class="light" lang="zh-CN">
@@ -3341,12 +3439,22 @@ button { cursor: pointer; }
 .search-row { display:flex; gap:12px; flex-wrap:wrap; }
 .search-row input { flex: 1 1 280px; border: 1px solid var(--outline); background:white; border-radius: 18px; padding: 14px 16px; }
 .cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-.card { padding: 18px; }
-.card.collapsed .card-body { display:none; }
+.card { padding: 18px; min-height: 176px; max-height: 460px; display:flex; flex-direction:column; overflow:hidden; }
+.card.collapsed { height: 210px; }
+.card-body { min-height:0; overflow:auto; }
+.card.collapsed .card-body { display:block; overflow:hidden; }
+.card.collapsed .attachment-list { display:none; }
+.card.collapsed .card-text {
+  display:-webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+  max-height: calc(1.7em * 5);
+  overflow:hidden;
+}
 .card-select { width:18px; height:18px; accent-color: var(--primary); }
 .batch-toolbar { margin: 12px 0 14px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
 .card-top { display:flex; justify-content:space-between; gap:12px; color: var(--muted); font-size: 12px; }
-.card-text { margin-top: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 15px; }
+.card-text { margin-top: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 15px; max-height: 260px; overflow:auto; }
 .card-text a { color: var(--primary-dark); text-decoration: underline; text-decoration-thickness: 1.5px; text-underline-offset: 2px; }
 .attachment-list { display:grid; gap: 10px; margin-top: 14px; }
 .attachment { border: 1px solid var(--outline); background: #fbfcff; border-radius: 18px; padding: 12px; }
@@ -3450,14 +3558,14 @@ button { cursor: pointer; }
   </section>
 
   <section class="panel address-panel" id="copyAddressBtn" role="button" tabindex="0">
-    <div class="address-label">推荐收藏地址</div>
+    <div class="address-label">当前访问地址</div>
     <code class="address-code" id="addressText"></code>
     <code class="address-code" id="bookmarkAddressText" style="display:none;margin-top:8px;font-size:14px;"></code>
     <div class="address-hint" id="discoveryHintRow" style="display:none;">
       <span id="discoveryHintText"></span>
     </div>
     <div class="address-hint">
-      <span>建议把这个 .local 地址加入浏览器收藏夹，手机 IP 变化后也不用重新输入。</span>
+      <span>如果显示 .local 地址，可以收藏；如果显示 IP 地址，请以手机当前显示为准。</span>
       <span style="display:flex;align-items:center;gap:6px;color:rgba(19,83,216,.65);"><span class="material-symbols-outlined" style="font-size:18px;">content_copy</span>点击可复制</span>
     </div>
   </section>
@@ -3552,7 +3660,7 @@ button { cursor: pointer; }
   <div id="imageViewerHint" class="image-viewer-caption">左右滑动查看同卡图片</div>
 </div>
 <script>
-const wsUrl = ${jsonEncode(wsUrl)};
+const wsUrl = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host + '/ws';
 const initialAddress = ${jsonEncode(_serverAddress)};
 const initialDiscoveryHint = ${jsonEncode(_discoveryHint)};
 const initialBookmarkAddress = ${jsonEncode(_bookmarkAddress)};
@@ -3591,7 +3699,7 @@ let viewerImages = [];
 let viewerIndex = 0;
 let viewerTouchStartX = null;
 let selectedCardIds = new Set();
-let collapsedCardIds = new Set();
+let expandedCardIds = new Set();
 let currentFilteredIds = [];
 addressText.textContent = initialAddress;
 renderBookmarkAddress(initialBookmarkAddress);
@@ -3770,7 +3878,7 @@ function renderCards() {
     const openUrl = extractFirstUrl(card.text || '');
     const bundleUrl = card.bundleDownloadUrl || '';
     const imageFiles = (card.attachments || []).filter(file => file.kind === 'image');
-    const collapsed = collapsedCardIds.has(card.id);
+    const collapsed = !expandedCardIds.has(card.id);
     const selected = selectedCardIds.has(card.id);
     const attachments = (card.attachments || []).map(file => {
       let preview = '';
@@ -4005,7 +4113,7 @@ cardsRoot.addEventListener('click', async event => {
     if (target.checked) selectedCardIds.add(card.id); else selectedCardIds.delete(card.id);
     updateSelectedCount();
   } else if (action === 'toggle-collapse') {
-    if (collapsedCardIds.has(card.id)) collapsedCardIds.delete(card.id); else collapsedCardIds.add(card.id);
+    if (expandedCardIds.has(card.id)) expandedCardIds.delete(card.id); else expandedCardIds.add(card.id);
     renderCards();
   }
 });
@@ -4150,8 +4258,8 @@ composerInput.addEventListener('paste', event => {
 document.getElementById('selectAllBtn').addEventListener('click', () => { currentFilteredIds.forEach(id => selectedCardIds.add(id)); renderCards(); });
 document.getElementById('clearSelectionBtn').addEventListener('click', () => { selectedCardIds.clear(); renderCards(); });
 document.getElementById('deleteSelectedBtn').addEventListener('click', deleteSelectedCards);
-document.getElementById('collapseAllBtn').addEventListener('click', () => { currentFilteredIds.forEach(id => collapsedCardIds.add(id)); renderCards(); });
-document.getElementById('expandAllBtn').addEventListener('click', () => { currentFilteredIds.forEach(id => collapsedCardIds.delete(id)); renderCards(); });
+document.getElementById('collapseAllBtn').addEventListener('click', () => { currentFilteredIds.forEach(id => expandedCardIds.delete(id)); renderCards(); });
+document.getElementById('expandAllBtn').addEventListener('click', () => { currentFilteredIds.forEach(id => expandedCardIds.add(id)); renderCards(); });
 imageViewerClose.addEventListener('click', closeImageViewer);
 imageViewerPrev.addEventListener('click', () => stepImageViewer(-1));
 imageViewerNext.addEventListener('click', () => stepImageViewer(1));
@@ -4434,7 +4542,7 @@ connectWs();
                     children: [
                       const Expanded(
                         child: Text(
-                          '推荐收藏地址',
+                          '当前访问地址',
                           style: TextStyle(
                             fontSize: 11,
                             fontWeight: FontWeight.w800,
@@ -4492,7 +4600,7 @@ connectWs();
                                   await Clipboard.setData(
                                     ClipboardData(text: _serverAddress),
                                   );
-                                  _showToast('已复制推荐收藏地址');
+                                  _showToast('已复制当前访问地址');
                                 }
                               : null,
                           variant: _CapsuleButtonVariant.soft,
@@ -5537,7 +5645,7 @@ class _LocalShareCardManagePageState extends State<LocalShareCardManagePage> {
                 ),
                 const SizedBox(height: 10),
                 DropdownButtonFormField<String>(
-                  initialValue: _filter,
+                  value: _filter,
                   decoration: const InputDecoration(
                     labelText: '筛选条件',
                     prefixIcon: Icon(Icons.filter_alt_outlined),
