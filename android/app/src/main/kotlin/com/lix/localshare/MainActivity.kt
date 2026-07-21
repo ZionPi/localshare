@@ -217,8 +217,12 @@ class MainActivity: FlutterActivity() {
         val hostname = registeredDiscoveryHostname
         val port = registeredDiscoveryPort
         if (!hostname.isNullOrBlank() && port != null && port > 0) {
-            payload["hostname"] = hostname
-            payload["bookmarkUrl"] = "http://$hostname.local:$port"
+            val normalizedHostname = hostname
+                .trim()
+                .removeSuffix(".")
+                .let { if (it.endsWith(".local", ignoreCase = true)) it else "$it.local" }
+            payload["hostname"] = normalizedHostname
+            payload["bookmarkUrl"] = "http://$normalizedHostname:$port"
         }
         return payload
     }
@@ -259,7 +263,7 @@ class MainActivity: FlutterActivity() {
             ""
         }
         val suffix = rawId.takeLast(6).ifBlank { "local" }
-        return sanitizeServiceName("localshare-$suffix")
+        return DISCOVERY_SERVICE_NAME
     }
 
     private fun sanitizeServiceName(name: String): String {
@@ -414,5 +418,6 @@ class MainActivity: FlutterActivity() {
     companion object {
         private const val REQUEST_POST_NOTIFICATIONS = 35773
         private const val DISCOVERY_SERVICE_TYPE = "_http._tcp."
+        private const val DISCOVERY_SERVICE_NAME = "localshare"
     }
 }

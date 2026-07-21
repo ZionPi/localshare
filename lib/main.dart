@@ -2,8 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-
-import 'package:archive/archive.dart';
+import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -29,36 +28,56 @@ const String kDiscoveryChannelName = 'localshare/discovery';
 String? _buildExportArchive(Map<String, dynamic> request) {
   final stateJson = request['stateJson'] as String? ?? '';
   final outputPath = request['outputPath'] as String? ?? '';
+  final cancelPath = request['cancelPath'] as String? ?? '';
   final attachments =
       (request['attachments'] as List<dynamic>? ?? const <dynamic>[])
           .cast<Map<dynamic, dynamic>>();
   if (stateJson.isEmpty || outputPath.isEmpty) {
     return null;
   }
-  final archive = Archive();
-  final stateBytes = utf8.encode(stateJson);
-  archive.addFile(
-    ArchiveFile('cards_state_v2.json', stateBytes.length, stateBytes),
-  );
-  for (final attachment in attachments) {
-    final id = attachment['id'] as String? ?? '';
-    final path = attachment['path'] as String? ?? '';
-    if (id.isEmpty || path.isEmpty) {
-      continue;
+
+  bool isCancelled() => cancelPath.isNotEmpty && File(cancelPath).existsSync();
+
+  final encoder = ZipFileEncoder();
+  try {
+    encoder.create(outputPath, level: ZipFileEncoder.STORE);
+    if (isCancelled()) {
+      return null;
     }
-    final file = File(path);
-    if (!file.existsSync()) {
-      continue;
+    final stateBytes = utf8.encode(stateJson);
+    encoder.addArchiveFile(
+      ArchiveFile('cards_state_v2.json', stateBytes.length, stateBytes),
+    );
+    for (final attachment in attachments) {
+      if (isCancelled()) {
+        return null;
+      }
+      final id = attachment['id'] as String? ?? '';
+      final path = attachment['path'] as String? ?? '';
+      if (id.isEmpty || path.isEmpty) {
+        continue;
+      }
+      final file = File(path);
+      if (!file.existsSync()) {
+        continue;
+      }
+      encoder.addFile(file, 'attachments/$id', ZipFileEncoder.STORE);
     }
-    final bytes = file.readAsBytesSync();
-    archive.addFile(ArchiveFile('attachments/$id', bytes.length, bytes));
+    encoder.closeSync();
+    if (isCancelled()) {
+      File(outputPath).deleteSync();
+      return null;
+    }
+    return outputPath;
+  } catch (_) {
+    try {
+      encoder.closeSync();
+    } catch (_) {}
+    try {
+      File(outputPath).deleteSync();
+    } catch (_) {}
+    rethrow;
   }
-  final encoded = ZipEncoder().encode(archive);
-  if (encoded == null || encoded.isEmpty) {
-    return null;
-  }
-  File(outputPath).writeAsBytesSync(encoded, flush: true);
-  return outputPath;
 }
 
 void main() {
@@ -285,11 +304,142 @@ class CardItem {
   }
 }
 
+class TempChatAttachment {
+  TempChatAttachment({
+    required this.id,
+    required this.messageId,
+    required this.name,
+    required this.mimeType,
+    required this.size,
+    required this.localPath,
+    required this.kind,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String messageId;
+  final String name;
+  final String mimeType;
+  final int size;
+  final String localPath;
+  final AttachmentKind kind;
+  final DateTime createdAt;
+
+  bool get isPreviewable =>
+      kind == AttachmentKind.image ||
+      kind == AttachmentKind.audio ||
+      kind == AttachmentKind.video ||
+      mimeType == 'application/pdf';
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'messageId': messageId,
+        'name': name,
+        'mimeType': mimeType,
+        'size': size,
+        'localPath': localPath,
+        'kind': kind.name,
+        'createdAt': createdAt.toIso8601String(),
+      };
+
+  Map<String, dynamic> toPublicJson() => {
+        'id': id,
+        'messageId': messageId,
+        'name': name,
+        'mimeType': mimeType,
+        'size': size,
+        'kind': kind.name,
+        'createdAt': createdAt.toIso8601String(),
+        'downloadUrl': '/chat/files/$id',
+        'previewUrl': '/chat/files/$id?view=1',
+        'previewable': isPreviewable,
+      };
+
+  factory TempChatAttachment.fromJson(Map<String, dynamic> json) {
+    return TempChatAttachment(
+      id: json['id'] as String,
+      messageId: json['messageId'] as String,
+      name: json['name'] as String? ?? 'attachment',
+      mimeType: json['mimeType'] as String? ?? 'application/octet-stream',
+      size: (json['size'] as num?)?.toInt() ?? 0,
+      localPath: json['localPath'] as String,
+      kind: AttachmentKind.values.firstWhere(
+        (value) => value.name == json['kind'],
+        orElse: () => AttachmentKind.other,
+      ),
+      createdAt: DateTime.tryParse(json['createdAt'] as String? ?? '') ??
+          DateTime.now(),
+    );
+  }
+}
+
+class TempChatMessage {
+  TempChatMessage({
+    required this.id,
+    required this.text,
+    required this.sender,
+    required this.createdAt,
+    List<String>? attachmentIds,
+  }) : attachmentIds = attachmentIds ?? <String>[];
+
+  final String id;
+  final String text;
+  final String sender;
+  final DateTime createdAt;
+  final List<String> attachmentIds;
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'text': text,
+        'sender': sender,
+        'createdAt': createdAt.toIso8601String(),
+        'attachmentIds': attachmentIds,
+      };
+
+  Map<String, dynamic> toPublicJson(
+    Map<String, TempChatAttachment> attachmentMap,
+  ) {
+    return {
+      'id': id,
+      'text': text,
+      'sender': sender,
+      'createdAt': createdAt.toIso8601String(),
+      'attachments': attachmentIds
+          .map((id) => attachmentMap[id])
+          .whereType<TempChatAttachment>()
+          .map((attachment) => attachment.toPublicJson())
+          .toList(),
+    };
+  }
+
+  factory TempChatMessage.fromJson(Map<String, dynamic> json) {
+    return TempChatMessage(
+      id: json['id'] as String,
+      text: json['text'] as String? ?? '',
+      sender: json['sender'] as String? ?? 'web',
+      createdAt: DateTime.tryParse(json['createdAt'] as String? ?? '') ??
+          DateTime.now(),
+      attachmentIds: (json['attachmentIds'] as List<dynamic>? ?? <dynamic>[])
+          .map((value) => value as String)
+          .toList(),
+    );
+  }
+}
+
+class TempChatState {
+  const TempChatState({required this.messages, required this.attachments});
+
+  final List<TempChatMessage> messages;
+  final List<TempChatAttachment> attachments;
+}
+
 class LocalShareStorage {
   LocalShareStorage._(this.rootDir)
       : attachmentsDir = Directory('${rootDir.path}/attachments'),
         stateFile = File('${rootDir.path}/cards_state_v2.json'),
-        backupDir = Directory('${rootDir.path}/backups');
+        backupDir = Directory('${rootDir.path}/backups'),
+        chatAttachmentsDir = Directory('${rootDir.path}/temp_chat_attachments'),
+        chatStateFile = File('${rootDir.path}/temp_chat_state_v1.json');
 
   static const String legacyDocumentKey = 'document_content';
   static const String legacyAppStateKey = 'cards_state_v1';
@@ -299,6 +449,8 @@ class LocalShareStorage {
   final Directory attachmentsDir;
   final File stateFile;
   final Directory backupDir;
+  final Directory chatAttachmentsDir;
+  final File chatStateFile;
 
   static Future<LocalShareStorage> create() async {
     Directory baseDir;
@@ -324,6 +476,9 @@ class LocalShareStorage {
     }
     if (!await backupDir.exists()) {
       await backupDir.create(recursive: true);
+    }
+    if (!await chatAttachmentsDir.exists()) {
+      await chatAttachmentsDir.create(recursive: true);
     }
   }
 
@@ -522,6 +677,10 @@ class _MyHomePageState extends State<MyHomePage>
 
   final List<CardItem> _cards = <CardItem>[];
   final Map<String, CardAttachment> _attachments = <String, CardAttachment>{};
+  final List<TempChatMessage> _chatMessages = <TempChatMessage>[];
+  final Map<String, TempChatAttachment> _chatAttachments =
+      <String, TempChatAttachment>{};
+  final Set<String> _selectedCardIds = <String>{};
   final List<_IncomingAttachmentPayload> _pendingAttachments =
       <_IncomingAttachmentPayload>[];
 
@@ -532,9 +691,9 @@ class _MyHomePageState extends State<MyHomePage>
   Timer? _broadcastDebounceTimer;
   Timer? _stateRefreshTimer;
   late final AnimationController _addressGlowController;
-  double _addressCardDragOffset = 0;
 
   String _serverAddress = '服务启动中';
+  String? _ipServerAddress;
   String? _discoveryHint;
   String? _bookmarkAddress;
   String _publicHost = '127.0.0.1';
@@ -544,6 +703,7 @@ class _MyHomePageState extends State<MyHomePage>
   bool _isServerRunning = false;
   bool _isPickingFiles = false;
   bool _isExporting = false;
+  File? _exportCancelFile;
   bool _isLoading = true;
   DateTime? _lastStateSyncAt;
 
@@ -569,6 +729,15 @@ class _MyHomePageState extends State<MyHomePage>
       _attachments
         ..clear()
         ..addEntries(state.attachments.map((e) => MapEntry(e.id, e)));
+      final chatState = await _loadTempChatState();
+      _chatMessages
+        ..clear()
+        ..addAll(chatState.messages);
+      _chatAttachments
+        ..clear()
+        ..addEntries(
+          chatState.attachments.map((entry) => MapEntry(entry.id, entry)),
+        );
       await _markStateSynced();
       await _setupSharingHandlers();
       await _startServer();
@@ -586,7 +755,7 @@ class _MyHomePageState extends State<MyHomePage>
 
   Future<void> _loadPreferences() async {
     final prefs = await SharedPreferences.getInstance();
-    _useFixedPort = prefs.getBool(_useFixedPortKey) ?? false;
+    _useFixedPort = prefs.getBool(_useFixedPortKey) ?? true;
     _confirmDelete = prefs.getBool(_confirmDeleteKey) ?? true;
     final savedPort = prefs.getInt(_preferredPortKey);
     if (savedPort != null && savedPort >= 1 && savedPort <= 65535) {
@@ -697,6 +866,198 @@ class _MyHomePageState extends State<MyHomePage>
         debugPrint('persist failed: $error');
       }
     });
+  }
+
+  Future<TempChatState> _loadTempChatState() async {
+    final storage = _storage;
+    if (storage == null) {
+      return const TempChatState(
+        messages: <TempChatMessage>[],
+        attachments: <TempChatAttachment>[],
+      );
+    }
+    await storage.ensureReady();
+    if (!await storage.chatStateFile.exists()) {
+      return const TempChatState(
+        messages: <TempChatMessage>[],
+        attachments: <TempChatAttachment>[],
+      );
+    }
+    try {
+      final decoded = jsonDecode(await storage.chatStateFile.readAsString())
+          as Map<String, dynamic>;
+      return TempChatState(
+        messages: (decoded['messages'] as List<dynamic>? ?? <dynamic>[])
+            .map((item) =>
+                TempChatMessage.fromJson(item as Map<String, dynamic>))
+            .toList(),
+        attachments: (decoded['attachments'] as List<dynamic>? ?? <dynamic>[])
+            .map((item) =>
+                TempChatAttachment.fromJson(item as Map<String, dynamic>))
+            .toList(),
+      );
+    } catch (error) {
+      debugPrint('load temp chat failed: $error');
+      return const TempChatState(
+        messages: <TempChatMessage>[],
+        attachments: <TempChatAttachment>[],
+      );
+    }
+  }
+
+  Future<void> _persistTempChatState() async {
+    final storage = _storage;
+    if (storage == null) {
+      return;
+    }
+    await storage.ensureReady();
+    final payload = jsonEncode({
+      'version': 1,
+      'savedAt': DateTime.now().toIso8601String(),
+      'messages': _chatMessages.map((message) => message.toJson()).toList(),
+      'attachments': _chatAttachments.values
+          .map((attachment) => attachment.toJson())
+          .toList(),
+    });
+    final tempFile = File('${storage.chatStateFile.path}.tmp');
+    await tempFile.writeAsString(payload, flush: true);
+    if (await storage.chatStateFile.exists()) {
+      await storage.chatStateFile.delete();
+    }
+    await tempFile.rename(storage.chatStateFile.path);
+  }
+
+  Map<String, dynamic> _buildChatSnapshot() {
+    return {
+      'type': 'chatSnapshot',
+      'messages': _chatMessages
+          .map((message) => message.toPublicJson(_chatAttachments))
+          .toList(),
+      'serverTime': DateTime.now().toIso8601String(),
+    };
+  }
+
+  void _broadcastChatSnapshot() {
+    final message = jsonEncode(_buildChatSnapshot());
+    for (final client in _webSocketClients) {
+      client.sink.add(message);
+    }
+  }
+
+  Future<TempChatMessage> _createTempChatMessage({
+    required String text,
+    required String sender,
+    List<_IncomingAttachmentPayload>? attachments,
+  }) async {
+    final storage = _storage;
+    if (storage == null) {
+      throw StateError('Storage not initialized');
+    }
+    await storage.ensureReady();
+    final now = DateTime.now();
+    final message = TempChatMessage(
+      id: _generateId('chat'),
+      text: text.trim(),
+      sender: sender.trim().isEmpty ? 'web' : sender.trim(),
+      createdAt: now,
+    );
+    _chatMessages.add(message);
+    for (final payload in attachments ?? const <_IncomingAttachmentPayload>[]) {
+      final displayName =
+          payload.name.trim().isEmpty ? 'attachment' : payload.name.trim();
+      final attachmentId = _generateId('chat-file');
+      final storedFileName = _buildStoredFileName(displayName, attachmentId);
+      final targetPath = '${storage.chatAttachmentsDir.path}/$storedFileName';
+      await File(targetPath).writeAsBytes(payload.bytes, flush: true);
+      final attachment = TempChatAttachment(
+        id: attachmentId,
+        messageId: message.id,
+        name: displayName,
+        mimeType: payload.mimeType,
+        size: payload.bytes.length,
+        localPath: targetPath,
+        kind: _kindFromMimeType(payload.mimeType, displayName),
+        createdAt: now,
+      );
+      _chatAttachments[attachment.id] = attachment;
+      message.attachmentIds.add(attachment.id);
+    }
+    while (_chatMessages.length > 300) {
+      await _deleteTempChatMessage(_chatMessages.first.id, persist: false);
+    }
+    await _persistTempChatState();
+    _broadcastChatSnapshot();
+    return message;
+  }
+
+  Future<void> _deleteTempChatMessage(
+    String messageId, {
+    bool persist = true,
+  }) async {
+    final message = _chatMessages
+        .cast<TempChatMessage?>()
+        .firstWhere((item) => item?.id == messageId, orElse: () => null);
+    if (message == null) {
+      return;
+    }
+    for (final attachmentId in message.attachmentIds) {
+      final attachment = _chatAttachments.remove(attachmentId);
+      if (attachment != null) {
+        final file = File(attachment.localPath);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      }
+    }
+    _chatMessages.removeWhere((item) => item.id == messageId);
+    if (persist) {
+      await _persistTempChatState();
+      _broadcastChatSnapshot();
+    }
+  }
+
+  Future<void> _clearTempChat() async {
+    for (final attachment in _chatAttachments.values) {
+      final file = File(attachment.localPath);
+      if (await file.exists()) {
+        await file.delete();
+      }
+    }
+    _chatAttachments.clear();
+    _chatMessages.clear();
+    await _persistTempChatState();
+    _broadcastChatSnapshot();
+  }
+
+  Future<CardItem?> _saveTempChatMessageAsCard(String messageId) async {
+    final message = _chatMessages
+        .cast<TempChatMessage?>()
+        .firstWhere((item) => item?.id == messageId, orElse: () => null);
+    if (message == null) {
+      return null;
+    }
+    final payloads = <_IncomingAttachmentPayload>[];
+    for (final attachmentId in message.attachmentIds) {
+      final attachment = _chatAttachments[attachmentId];
+      if (attachment == null) {
+        continue;
+      }
+      final file = File(attachment.localPath);
+      if (!await file.exists()) {
+        continue;
+      }
+      payloads.add(
+        _IncomingAttachmentPayload(
+          name: attachment.name,
+          mimeType: attachment.mimeType,
+          bytes: await file.readAsBytes(),
+        ),
+      );
+    }
+    return _createCard(
+      text: message.text.isEmpty ? '临时对话附件' : message.text,
+      attachments: payloads,
+    );
   }
 
   Future<void> _markStateSynced() async {
@@ -949,6 +1310,7 @@ class _MyHomePageState extends State<MyHomePage>
       }
     }
     _cards.removeWhere((item) => item.id == cardId);
+    _selectedCardIds.remove(cardId);
     await _persistStateNow(allowDestructiveEmpty: true);
     _broadcastSnapshot();
     if (mounted) {
@@ -998,6 +1360,62 @@ class _MyHomePageState extends State<MyHomePage>
     await _deleteCard(card.id);
   }
 
+  Future<int> _deleteCardsByIds(Iterable<String> cardIds) async {
+    final ids = cardIds.toSet().toList();
+    var deleted = 0;
+    for (final cardId in ids) {
+      if (_findCard(cardId) == null) {
+        continue;
+      }
+      await _deleteCard(cardId);
+      deleted += 1;
+    }
+    _selectedCardIds.removeAll(ids);
+    if (mounted) {
+      setState(() {});
+    }
+    return deleted;
+  }
+
+  Future<void> _deleteSelectedCards() async {
+    final selectedIds = _selectedCardIds.toList();
+    if (selectedIds.isEmpty) {
+      _showToast('请先选择要删除的卡片');
+      return;
+    }
+    if (_confirmDelete) {
+      final confirmed = await _showDeleteConfirmDialog(
+        title: '批量删除',
+        message: '将删除选中的 ${selectedIds.length} 张卡片及其附件，确认继续吗？',
+        confirmLabel: '批量删除',
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+    final deleted = await _deleteCardsByIds(selectedIds);
+    _selectedCardIds.clear();
+    _showToast('已删除 $deleted 张卡片');
+  }
+
+  void _toggleCardSelection(CardItem card) {
+    setState(() {
+      if (_selectedCardIds.contains(card.id)) {
+        _selectedCardIds.remove(card.id);
+      } else {
+        _selectedCardIds.add(card.id);
+      }
+    });
+  }
+
+  void _selectAllVisibleCards(List<CardItem> cards) {
+    setState(() {
+      _selectedCardIds
+        ..clear()
+        ..addAll(cards.map((card) => card.id));
+    });
+  }
+
   Future<void> _clearAllCards() async {
     if (_cards.isEmpty) {
       _showToast('当前没有可清空的卡片');
@@ -1035,7 +1453,6 @@ class _MyHomePageState extends State<MyHomePage>
     setState(() {
       _isExporting = true;
     });
-    _showToast('正在导出，请稍候');
     try {
       await _persistStateNow();
       final stateJson = await storage.stateFile.readAsString();
@@ -1043,9 +1460,14 @@ class _MyHomePageState extends State<MyHomePage>
       final fileName =
           'localshare-export-${DateTime.now().toIso8601String().replaceAll(':', '').replaceAll('.', '-')}.zip';
       final exportPath = '${tempDir.path}/$fileName';
+      final cancelFile = File(
+          '${tempDir.path}/localshare-export-cancel-${DateTime.now().microsecondsSinceEpoch}.flag');
+      _exportCancelFile = cancelFile;
+      _showExportSnackBar();
       final builtPath = await compute(_buildExportArchive, {
         'stateJson': stateJson,
         'outputPath': exportPath,
+        'cancelPath': cancelFile.path,
         'attachments': _attachments.values
             .map((attachment) => {
                   'id': attachment.id,
@@ -1053,6 +1475,10 @@ class _MyHomePageState extends State<MyHomePage>
                 })
             .toList(),
       });
+      if (await cancelFile.exists()) {
+        _showToast('已取消导出');
+        return;
+      }
       if (builtPath == null || builtPath.isEmpty) {
         _showToast('导出失败');
         return;
@@ -1062,6 +1488,13 @@ class _MyHomePageState extends State<MyHomePage>
     } catch (error) {
       _showToast('导出失败: $error');
     } finally {
+      try {
+        final cancelFile = _exportCancelFile;
+        if (cancelFile != null && await cancelFile.exists()) {
+          await cancelFile.delete();
+        }
+      } catch (_) {}
+      _exportCancelFile = null;
       if (mounted) {
         setState(() {
           _isExporting = false;
@@ -1070,6 +1503,36 @@ class _MyHomePageState extends State<MyHomePage>
         _isExporting = false;
       }
     }
+  }
+
+  void _showExportSnackBar() {
+    if (!mounted) {
+      return;
+    }
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    messenger
+      ?..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: const Text('正在导出，请稍候；大附件会流式写入，避免内存爆掉'),
+          duration: const Duration(days: 1),
+          action: SnackBarAction(
+            label: '停止',
+            onPressed: _cancelExport,
+          ),
+        ),
+      );
+  }
+
+  Future<void> _cancelExport() async {
+    final cancelFile = _exportCancelFile;
+    if (cancelFile == null) {
+      return;
+    }
+    try {
+      await cancelFile.writeAsString('cancel');
+      _showToast('正在停止导出');
+    } catch (_) {}
   }
 
   Future<String?> _saveExportFile(
@@ -1358,21 +1821,35 @@ class _MyHomePageState extends State<MyHomePage>
       return;
     }
     try {
-      final payload = await _discoveryChannel
+      var payload = await _discoveryChannel
           .invokeMapMethod<String, dynamic>('registerHttpService', {
         'port': _server?.port ?? _preferredPort,
         'address': _publicHost,
       });
+      for (var attempt = 0; attempt < 10; attempt += 1) {
+        final bookmarkUrl = (payload?['bookmarkUrl'] as String?)?.trim();
+        if (bookmarkUrl != null && bookmarkUrl.isNotEmpty) {
+          break;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        payload = await _discoveryChannel
+            .invokeMapMethod<String, dynamic>('getRegisteredHttpService');
+      }
       final hint = (payload?['hint'] as String?)?.trim();
       final bookmarkUrl = (payload?['bookmarkUrl'] as String?)?.trim();
+      final displayAddress = bookmarkUrl == null || bookmarkUrl.isEmpty
+          ? 'http://Android.local:${_server?.port ?? _preferredPort}'
+          : bookmarkUrl;
       if (!mounted) {
         _discoveryHint = hint?.isEmpty == true ? null : hint;
         _bookmarkAddress = bookmarkUrl?.isEmpty == true ? null : bookmarkUrl;
+        _serverAddress = displayAddress;
         return;
       }
       setState(() {
         _discoveryHint = hint?.isEmpty == true ? null : hint;
         _bookmarkAddress = bookmarkUrl?.isEmpty == true ? null : bookmarkUrl;
+        _serverAddress = displayAddress;
       });
     } catch (error) {
       debugPrint('registerHttpService failed: $error');
@@ -1435,6 +1912,17 @@ class _MyHomePageState extends State<MyHomePage>
           initialConfirmDelete: _confirmDelete,
           onImportTap: _importAllCards,
           onExportTap: _exportAllCards,
+          onManageCardsTap: (settingsContext) async {
+            await Navigator.of(settingsContext).push<void>(
+              MaterialPageRoute<void>(
+                builder: (_) => LocalShareCardManagePage(
+                  cards: _sortCards(_cards),
+                  attachmentMap: _attachments,
+                  onDeleteCards: _deleteCardsByIds,
+                ),
+              ),
+            );
+          },
         ),
       ),
     );
@@ -1474,7 +1962,7 @@ class _MyHomePageState extends State<MyHomePage>
     if (!_isServerRunning) {
       return null;
     }
-    final baseUri = Uri.tryParse(_serverAddress);
+    final baseUri = Uri.tryParse(_ipServerAddress ?? _serverAddress);
     if (baseUri == null) {
       return null;
     }
@@ -1488,7 +1976,7 @@ class _MyHomePageState extends State<MyHomePage>
     if (!_isServerRunning) {
       return null;
     }
-    final baseUri = Uri.tryParse(_serverAddress);
+    final baseUri = Uri.tryParse(_ipServerAddress ?? _serverAddress);
     if (baseUri == null) {
       return null;
     }
@@ -1523,6 +2011,57 @@ class _MyHomePageState extends State<MyHomePage>
     }
   }
 
+  Future<String?> _saveLocalFileToAndroidDownloads({
+    required String sourcePath,
+    required String fileName,
+    required String mimeType,
+  }) async {
+    return _downloadChannel.invokeMethod<String>('saveFileToDownloads', {
+      'sourcePath': sourcePath,
+      'fileName': fileName,
+      'mimeType': mimeType,
+    });
+  }
+
+  Future<String?> _buildCardBundleTempFile(CardItem card) async {
+    final cardAttachments = card.attachmentIds
+        .map((id) => _attachments[id])
+        .whereType<CardAttachment>()
+        .toList();
+    if (cardAttachments.isEmpty) {
+      return null;
+    }
+    final tempDir = await getTemporaryDirectory();
+    final bundleName = _buildCardBundleFileName(card);
+    final outputPath = '${tempDir.path}/$bundleName';
+    final encoder = ZipFileEncoder();
+    final usedNames = <String>{};
+    encoder.create(outputPath, level: ZipFileEncoder.STORE);
+    try {
+      for (final attachment in cardAttachments) {
+        final file = File(attachment.localPath);
+        if (!await file.exists()) {
+          continue;
+        }
+        encoder.addFile(
+          file,
+          _dedupeArchiveEntryName(attachment.name, usedNames),
+          ZipFileEncoder.STORE,
+        );
+      }
+      await encoder.close();
+    } catch (_) {
+      try {
+        await encoder.close();
+      } catch (_) {}
+      try {
+        await File(outputPath).delete();
+      } catch (_) {}
+      rethrow;
+    }
+    return outputPath;
+  }
+
   Future<void> _openAttachment(
     CardAttachment attachment, {
     bool preview = false,
@@ -1533,12 +2072,22 @@ class _MyHomePageState extends State<MyHomePage>
       return;
     }
     if (!preview && Platform.isAndroid) {
-      await _downloadToAndroidDownloads(
-        uri: uri,
-        fileName: attachment.name,
-        mimeType: attachment.mimeType,
-        successMessage: '已开始下载到下载目录',
-      );
+      try {
+        final savedPath = await _saveLocalFileToAndroidDownloads(
+          sourcePath: attachment.localPath,
+          fileName: attachment.name,
+          mimeType: attachment.mimeType,
+        );
+        _showToast(savedPath == null ? '已保存到下载目录' : '已保存到 $savedPath');
+      } catch (error) {
+        debugPrint('save local attachment failed: $error');
+        await _downloadToAndroidDownloads(
+          uri: uri,
+          fileName: attachment.name,
+          mimeType: attachment.mimeType,
+          successMessage: '已开始下载到下载目录',
+        );
+      }
       return;
     }
     final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
@@ -1555,12 +2104,27 @@ class _MyHomePageState extends State<MyHomePage>
     }
     final bundleName = _buildCardBundleFileName(card);
     if (Platform.isAndroid) {
-      await _downloadToAndroidDownloads(
-        uri: uri,
-        fileName: bundleName,
-        mimeType: 'application/zip',
-        successMessage: '已开始打包下载到下载目录',
-      );
+      try {
+        final localBundlePath = await _buildCardBundleTempFile(card);
+        if (localBundlePath == null) {
+          _showToast('没有可下载的附件');
+          return;
+        }
+        final savedPath = await _saveLocalFileToAndroidDownloads(
+          sourcePath: localBundlePath,
+          fileName: bundleName,
+          mimeType: 'application/zip',
+        );
+        _showToast(savedPath == null ? '已保存到下载目录' : '已保存到 $savedPath');
+      } catch (error) {
+        debugPrint('save local bundle failed: $error');
+        await _downloadToAndroidDownloads(
+          uri: uri,
+          fileName: bundleName,
+          mimeType: 'application/zip',
+          successMessage: '已开始打包下载到下载目录',
+        );
+      }
       return;
     }
     final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
@@ -1934,7 +2498,8 @@ class _MyHomePageState extends State<MyHomePage>
       final ipAddress = await _getLocalIpAddress();
       if (ipAddress == null) {
         setState(() {
-          _serverAddress = '无法获取本机 IP';
+          _serverAddress = '未连接局域网，服务不可用';
+          _isServerRunning = false;
         });
         return;
       }
@@ -1944,10 +2509,19 @@ class _MyHomePageState extends State<MyHomePage>
         ..get('/api/cards', _handleGetCards)
         ..post('/api/cards', _handleCreateCard)
         ..post('/api/cards/<cardId>/delete', _handleDeleteCard)
+        ..post('/api/cards/delete', _handleDeleteCards)
         ..post('/api/cards/reorder', _handleReorderCards)
         ..post('/api/cards/<cardId>/attachments', _handleAddAttachments)
+        ..get('/api/chat', _handleGetChat)
+        ..post('/api/chat/messages', _handleCreateChatMessage)
+        ..post(
+            '/api/chat/messages/<messageId>/delete', _handleDeleteChatMessage)
+        ..post('/api/chat/messages/<messageId>/save-card',
+            _handleSaveChatMessageAsCard)
+        ..post('/api/chat/clear', _handleClearChat)
         ..get('/cards/<cardId>/bundle', _handleDownloadCardBundle)
-        ..get('/files/<attachmentId>', _handleGetFile);
+        ..get('/files/<attachmentId>', _handleGetFile)
+        ..get('/chat/files/<attachmentId>', _handleGetChatFile);
 
       final wsHandler = webSocketHandler((webSocket, protocol) {
         _webSocketClients.add(webSocket);
@@ -1983,7 +2557,9 @@ class _MyHomePageState extends State<MyHomePage>
       if (mounted) {
         setState(() {
           _publicHost = ipAddress;
-          _serverAddress = 'http://$_publicHost:${_server!.port}';
+          _ipServerAddress = 'http://$_publicHost:${_server!.port}';
+          _serverAddress = 'http://Android.local:${_server!.port}';
+          _bookmarkAddress = _serverAddress;
           _isServerRunning = true;
         });
       }
@@ -2026,10 +2602,12 @@ class _MyHomePageState extends State<MyHomePage>
     if (mounted) {
       setState(() {
         _isServerRunning = false;
+        _ipServerAddress = null;
         _serverAddress = '服务器已停止';
       });
     } else {
       _isServerRunning = false;
+      _ipServerAddress = null;
     }
   }
 
@@ -2054,7 +2632,7 @@ class _MyHomePageState extends State<MyHomePage>
         }
       }
     } catch (_) {}
-    return '127.0.0.1';
+    return null;
   }
 
   Map<String, dynamic> _buildSnapshot() {
@@ -2068,6 +2646,7 @@ class _MyHomePageState extends State<MyHomePage>
       'address': _serverAddress,
       'discoveryHint': _discoveryHint,
       'bookmarkAddress': _bookmarkAddress,
+      'chatMessages': _buildChatSnapshot()['messages'],
     };
   }
 
@@ -2086,6 +2665,7 @@ class _MyHomePageState extends State<MyHomePage>
 
   void _sendSnapshotToClient(WebSocketChannel client) {
     client.sink.add(jsonEncode(_buildSnapshot()));
+    client.sink.add(jsonEncode(_buildChatSnapshot()));
   }
 
   Future<void> _handleWebSocketMessage(
@@ -2112,6 +2692,18 @@ class _MyHomePageState extends State<MyHomePage>
         _applyReorder((data['cardIds'] as List<dynamic>? ?? <dynamic>[])
             .map((value) => value as String)
             .toList());
+      } else if (type == 'createChatMessage') {
+        final attachmentsData =
+            data['attachments'] as List<dynamic>? ?? <dynamic>[];
+        await _createTempChatMessage(
+          text: data['text'] as String? ?? '',
+          sender: data['sender'] as String? ?? 'web',
+          attachments: attachmentsData
+              .map((item) => _IncomingAttachmentPayload.fromJson(
+                    item as Map<String, dynamic>,
+                  ))
+              .toList(),
+        );
       }
     } catch (_) {
       sender.sink.add(jsonEncode({
@@ -2167,6 +2759,21 @@ class _MyHomePageState extends State<MyHomePage>
     return _jsonResponse({'ok': true});
   }
 
+  Future<Response> _handleDeleteCards(Request request) async {
+    final body = await request.readAsString();
+    final payload = jsonDecode(body) as Map<String, dynamic>;
+    final ids = (payload['cardIds'] as List<dynamic>? ?? <dynamic>[])
+        .map((value) => value as String)
+        .toList();
+    for (final cardId in ids) {
+      final card = _findCard(cardId);
+      if (card != null) {
+        await _deleteCard(card.id);
+      }
+    }
+    return _jsonResponse({'ok': true, 'deleted': ids.length});
+  }
+
   Future<Response> _handleReorderCards(Request request) async {
     final body = await request.readAsString();
     final payload = jsonDecode(body) as Map<String, dynamic>;
@@ -2191,6 +2798,79 @@ class _MyHomePageState extends State<MyHomePage>
       );
     }
     return _jsonResponse({'ok': true});
+  }
+
+  Future<Response> _handleGetChat(Request request) async {
+    return _jsonResponse(_buildChatSnapshot());
+  }
+
+  Future<Response> _handleCreateChatMessage(Request request) async {
+    final body = await request.readAsString();
+    final payload = jsonDecode(body) as Map<String, dynamic>;
+    final attachmentsJson =
+        payload['attachments'] as List<dynamic>? ?? <dynamic>[];
+    final message = await _createTempChatMessage(
+      text: payload['text'] as String? ?? '',
+      sender: payload['sender'] as String? ?? 'web',
+      attachments: attachmentsJson
+          .map((item) => _IncomingAttachmentPayload.fromJson(
+                item as Map<String, dynamic>,
+              ))
+          .toList(),
+    );
+    return _jsonResponse({'ok': true, 'messageId': message.id});
+  }
+
+  Future<Response> _handleDeleteChatMessage(
+    Request request,
+    String messageId,
+  ) async {
+    await _deleteTempChatMessage(messageId);
+    return _jsonResponse({'ok': true});
+  }
+
+  Future<Response> _handleSaveChatMessageAsCard(
+    Request request,
+    String messageId,
+  ) async {
+    final card = await _saveTempChatMessageAsCard(messageId);
+    if (card == null) {
+      return Response.notFound('Message not found');
+    }
+    return _jsonResponse({'ok': true, 'cardId': card.id});
+  }
+
+  Future<Response> _handleClearChat(Request request) async {
+    await _clearTempChat();
+    return _jsonResponse({'ok': true});
+  }
+
+  Future<Response> _handleGetChatFile(
+    Request request,
+    String attachmentId,
+  ) async {
+    final attachment = _chatAttachments[attachmentId];
+    if (attachment == null) {
+      return Response.notFound('Attachment not found');
+    }
+    final file = File(attachment.localPath);
+    if (!await file.exists()) {
+      return Response.notFound('File missing');
+    }
+    final isPreview = request.url.queryParameters['view'] == '1';
+    final length = await file.length();
+    return Response.ok(
+      file.openRead(),
+      headers: {
+        'content-type': attachment.mimeType,
+        'content-length': length.toString(),
+        'cache-control': 'no-cache',
+        'content-disposition': _buildContentDisposition(
+          attachment.name,
+          inline: isPreview,
+        ),
+      },
+    );
   }
 
   Future<Response> _handleGetFile(Request request, String attachmentId) async {
@@ -2662,6 +3342,9 @@ button { cursor: pointer; }
 .search-row input { flex: 1 1 280px; border: 1px solid var(--outline); background:white; border-radius: 18px; padding: 14px 16px; }
 .cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
 .card { padding: 18px; }
+.card.collapsed .card-body { display:none; }
+.card-select { width:18px; height:18px; accent-color: var(--primary); }
+.batch-toolbar { margin: 12px 0 14px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
 .card-top { display:flex; justify-content:space-between; gap:12px; color: var(--muted); font-size: 12px; }
 .card-text { margin-top: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 15px; }
 .card-text a { color: var(--primary-dark); text-decoration: underline; text-decoration-thickness: 1.5px; text-underline-offset: 2px; }
@@ -2723,6 +3406,20 @@ button { cursor: pointer; }
   background: rgba(255,255,255,.12); color: white;
   font-size: 12px; font-weight: 700;
 }
+.chat-panel { margin-top: 22px; padding: 16px; }
+.chat-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+.chat-title { font-family: Manrope, sans-serif; font-size: 22px; font-weight: 800; color: var(--primary-dark); }
+.chat-hint { margin-top: 4px; color: var(--muted); font-size: 13px; line-height:1.5; }
+.chat-window { margin-top: 14px; min-height: 260px; max-height: 460px; overflow:auto; padding: 14px; border-radius: 22px; background: #eef3fb; display:flex; flex-direction:column; gap:10px; }
+.chat-bubble { max-width: min(78%, 680px); padding: 10px 12px; border-radius: 18px; background: white; box-shadow: 0 8px 22px rgba(19,83,216,.07); }
+.chat-bubble.me { align-self:flex-end; background:#d8f8c6; }
+.chat-meta { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--muted); font-size:11px; margin-bottom:6px; }
+.chat-text { white-space:pre-wrap; word-break:break-word; line-height:1.55; }
+.chat-attachments { display:grid; gap:8px; margin-top:8px; }
+.chat-file { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 10px; border-radius:12px; background:rgba(255,255,255,.65); border:1px solid rgba(216,222,232,.8); }
+.chat-input-row { margin-top: 12px; display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; }
+.chat-input-row textarea { flex: 1 1 320px; min-height: 58px; max-height: 150px; border:1px solid var(--outline); border-radius:18px; padding:12px 14px; resize:vertical; outline:none; }
+.chat-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
 .card-actions { display:flex; align-items:center; gap:10px; margin-top: 14px; }
 .card-actions .btn { flex: 1 1 0; min-width: 0; }
 .empty { padding: 32px; text-align:center; color: var(--muted); border: 1px dashed var(--outline); border-radius: 28px; background: rgba(255,255,255,.72); }
@@ -2753,14 +3450,14 @@ button { cursor: pointer; }
   </section>
 
   <section class="panel address-panel" id="copyAddressBtn" role="button" tabindex="0">
-    <div class="address-label">访问地址</div>
+    <div class="address-label">推荐收藏地址</div>
     <code class="address-code" id="addressText"></code>
     <code class="address-code" id="bookmarkAddressText" style="display:none;margin-top:8px;font-size:14px;"></code>
     <div class="address-hint" id="discoveryHintRow" style="display:none;">
       <span id="discoveryHintText"></span>
     </div>
     <div class="address-hint">
-      <span>点击复制当前真实访问地址，端口模式由设置页控制。</span>
+      <span>建议把这个 .local 地址加入浏览器收藏夹，手机 IP 变化后也不用重新输入。</span>
       <span style="display:flex;align-items:center;gap:6px;color:rgba(19,83,216,.65);"><span class="material-symbols-outlined" style="font-size:18px;">content_copy</span>点击可复制</span>
     </div>
   </section>
@@ -2795,6 +3492,24 @@ button { cursor: pointer; }
     </div>
   </section>
 
+  <section class="panel chat-panel">
+    <div class="chat-head">
+      <div>
+        <div class="chat-title">临时对话</div>
+        <div class="chat-hint">像微信聊天一样临时互传文字/文件；最近会话会临时保留，但不会自动生成卡片。需要留存时点气泡里的“存为卡片”。</div>
+      </div>
+      <button id="clearChatBtn" class="btn btn-danger">清空临时对话</button>
+    </div>
+    <div id="chatWindow" class="chat-window"></div>
+    <div id="chatPickedFiles" class="chips"></div>
+    <div class="chat-input-row">
+      <textarea id="chatInput" placeholder="输入临时消息；调试命令、日志、链接、备注都可以放这里"></textarea>
+      <button id="chatPickFilesBtn" class="btn btn-soft">选择文件</button>
+      <button id="chatSendBtn" class="btn btn-primary">发送</button>
+      <input id="chatFileInput" type="file" multiple hidden>
+    </div>
+  </section>
+
   <section class="section-head">
     <div>
       <div class="section-title">卡片列表</div>
@@ -2806,6 +3521,14 @@ button { cursor: pointer; }
     </div>
   </section>
 
+  <section class="batch-toolbar">
+    <button id="selectAllBtn" class="btn btn-soft">全选当前列表</button>
+    <button id="clearSelectionBtn" class="btn btn-ghost">取消选择</button>
+    <button id="deleteSelectedBtn" class="btn btn-danger">删除选中</button>
+    <button id="collapseAllBtn" class="btn btn-ghost">全部折叠</button>
+    <button id="expandAllBtn" class="btn btn-ghost">全部展开</button>
+    <span id="selectedCountText" class="chip">已选 0 张</span>
+  </section>
   <section id="cardsRoot" class="cards"></section>
 </main>
 <div id="toast" class="toast"></div>
@@ -2838,6 +3561,10 @@ const searchInput = document.getElementById('searchInput');
 const composerInput = document.getElementById('composerInput');
 const fileInput = document.getElementById('fileInput');
 const pickedFiles = document.getElementById('pickedFiles');
+const chatWindow = document.getElementById('chatWindow');
+const chatInput = document.getElementById('chatInput');
+const chatFileInput = document.getElementById('chatFileInput');
+const chatPickedFiles = document.getElementById('chatPickedFiles');
 const countText = document.getElementById('countText');
 const statusText = document.getElementById('statusText');
 const statusDot = document.getElementById('statusDot');
@@ -2856,10 +3583,16 @@ const imageViewerName = document.getElementById('imageViewerName');
 const imageViewerHint = document.getElementById('imageViewerHint');
 let cards = [];
 let pendingFiles = [];
+let chatMessages = [];
+let chatPendingFiles = [];
+const clientId = 'web-' + Math.random().toString(36).slice(2, 8);
 let socket;
 let viewerImages = [];
 let viewerIndex = 0;
 let viewerTouchStartX = null;
+let selectedCardIds = new Set();
+let collapsedCardIds = new Set();
+let currentFilteredIds = [];
 addressText.textContent = initialAddress;
 renderBookmarkAddress(initialBookmarkAddress);
 renderDiscoveryHint(initialDiscoveryHint);
@@ -2940,6 +3673,82 @@ function renderPickedFiles() {
   pickedFiles.innerHTML = pendingFiles.map(file => '<span class="chip">' + escapeHtml(file.name) + '</span>').join('');
 }
 
+function renderChatPickedFiles() {
+  if (!chatPendingFiles.length) {
+    chatPickedFiles.innerHTML = '';
+    return;
+  }
+  chatPickedFiles.innerHTML = chatPendingFiles.map(file => '<span class="chip">' + escapeHtml(file.name) + '</span>').join('');
+}
+
+function renderChat() {
+  if (!chatMessages.length) {
+    chatWindow.innerHTML = '<div class="empty">暂无临时消息。这里适合临时传命令、日志、截图和调试文件。</div>';
+    return;
+  }
+  chatWindow.innerHTML = chatMessages.map(message => {
+    const mine = String(message.sender || '') === clientId;
+    const attachments = (message.attachments || []).map(file => {
+      const preview = file.previewable && file.kind === 'image'
+        ? '<img class="preview" src="' + file.previewUrl + '" alt="' + escapeHtml(file.name) + '">'
+        : '';
+      return '<div class="chat-file"><span>' + escapeHtml(file.name) + ' · ' + formatBytes(file.size || 0) + '</span><a class="action-link" href="' + file.downloadUrl + '" download>下载</a></div>' + preview;
+    }).join('');
+    return '<div class="chat-bubble ' + (mine ? 'me' : '') + '">' +
+      '<div class="chat-meta"><span>' + (mine ? '我' : escapeHtml(message.sender || '对方')) + '</span><span>' + new Date(message.createdAt).toLocaleTimeString() + '</span></div>' +
+      (message.text ? '<div class="chat-text">' + renderCardText(message.text || '') + '</div>' : '') +
+      (attachments ? '<div class="chat-attachments">' + attachments + '</div>' : '') +
+      '<div class="chat-actions">' +
+        '<button class="btn btn-soft" data-action="save-chat-card" data-message-id="' + escapeHtml(message.id) + '">存为卡片</button>' +
+        '<button class="btn btn-ghost" data-action="copy-chat" data-message-id="' + escapeHtml(message.id) + '">复制</button>' +
+        '<button class="btn btn-danger" data-action="delete-chat" data-message-id="' + escapeHtml(message.id) + '">删除</button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+  chatWindow.scrollTop = chatWindow.scrollHeight;
+}
+
+async function refreshChat() {
+  const response = await fetch('/api/chat');
+  const payload = await response.json();
+  chatMessages = payload.messages || [];
+  renderChat();
+}
+
+async function sendChatMessage() {
+  const text = chatInput.value.trim();
+  if (!text && chatPendingFiles.length === 0) return;
+  const attachments = await filesToPayload(chatPendingFiles);
+  await fetch('/api/chat/messages', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text, sender: clientId, attachments}),
+  });
+  chatInput.value = '';
+  chatPendingFiles = [];
+  chatFileInput.value = '';
+  renderChatPickedFiles();
+  await refreshChat();
+}
+
+async function deleteChatMessage(messageId) {
+  await fetch('/api/chat/messages/' + encodeURIComponent(messageId) + '/delete', {method: 'POST'});
+  await refreshChat();
+}
+
+async function saveChatMessageAsCard(messageId) {
+  await fetch('/api/chat/messages/' + encodeURIComponent(messageId) + '/save-card', {method: 'POST'});
+  showToast('已存为卡片');
+  await refreshCards();
+}
+
+async function clearChat() {
+  if (!confirm('确认清空所有临时对话？')) return;
+  await fetch('/api/chat/clear', {method: 'POST'});
+  chatMessages = [];
+  renderChat();
+}
+
 function renderCards() {
   const query = searchInput.value.trim().toLowerCase();
   const filtered = cards.filter(card => {
@@ -2948,7 +3757,10 @@ function renderCards() {
     return (card.attachments || []).some(file => (file.name || '').toLowerCase().includes(query));
   });
 
+  currentFilteredIds = filtered.map(card => card.id);
+  selectedCardIds = new Set([...selectedCardIds].filter(id => cards.some(card => card.id === id)));
   countText.textContent = filtered.length + ' 张卡片';
+  updateSelectedCount();
   if (!filtered.length) {
     cardsRoot.innerHTML = '<div class="empty">还没有匹配卡片。你可以先写点内容，或上传一个文件后制卡。</div>';
     return;
@@ -2958,6 +3770,8 @@ function renderCards() {
     const openUrl = extractFirstUrl(card.text || '');
     const bundleUrl = card.bundleDownloadUrl || '';
     const imageFiles = (card.attachments || []).filter(file => file.kind === 'image');
+    const collapsed = collapsedCardIds.has(card.id);
+    const selected = selectedCardIds.has(card.id);
     const attachments = (card.attachments || []).map(file => {
       let preview = '';
       if (file.previewable && file.kind === 'image') {
@@ -2983,14 +3797,20 @@ function renderCards() {
       '</div>';
     }).join('');
 
-    return '<article class="panel card">' +
-      '<div class="card-top"><span>' + (card.pinned ? '置顶' : '') + '</span><span>创建 ' + new Date(card.createdAt).toLocaleString() + '</span></div>' +
-      '<div class="card-text">' + renderCardText(card.text || '') + '</div>' +
-      ((card.attachments || []).length > 1 && bundleUrl
-        ? '<div class="card-actions" style="margin-top:14px;"><a class="action-link" href="' + bundleUrl + '" download>全部下载</a></div>'
-        : '') +
-      (attachments ? '<div class="attachment-list">' + attachments + '</div>' : '') +
+    return '<article class="panel card ' + (collapsed ? 'collapsed' : '') + '">' +
+      '<div class="card-top">' +
+        '<label style="display:flex;align-items:center;gap:8px;"><input class="card-select" type="checkbox" data-action="select-card" data-card-id="' + escapeHtml(card.id) + '" ' + (selected ? 'checked' : '') + '>选择</label>' +
+        '<span>' + (card.pinned ? '置顶 · ' : '') + '创建 ' + new Date(card.createdAt).toLocaleString() + '</span>' +
+      '</div>' +
+      '<div class="card-body">' +
+        '<div class="card-text">' + renderCardText(card.text || '') + '</div>' +
+        ((card.attachments || []).length > 1 && bundleUrl
+          ? '<div class="card-actions" style="margin-top:14px;"><a class="action-link" href="' + bundleUrl + '" download>全部下载</a></div>'
+          : '') +
+        (attachments ? '<div class="attachment-list">' + attachments + '</div>' : '') +
+      '</div>' +
       '<div class="card-actions">' +
+        '<button class="btn btn-ghost" data-action="toggle-collapse" data-card-id="' + escapeHtml(card.id) + '">' + (collapsed ? '展开' : '折叠') + '</button>' +
         (openUrl ? '<button class="btn btn-soft" data-action="open-card" data-card-url="' + escapeHtml(openUrl) + '">打开</button>' : '') +
         '<button class="btn btn-ghost" data-action="copy-card" data-card-id="' + escapeHtml(card.id) + '">复制</button>' +
         '<button class="btn btn-danger" data-action="delete-card" data-card-id="' + escapeHtml(card.id) + '">删除</button>' +
@@ -2998,6 +3818,12 @@ function renderCards() {
     '</article>';
   }).join('');
 }
+
+function updateSelectedCount() {
+  const node = document.getElementById('selectedCountText');
+  if (node) node.textContent = '已选 ' + selectedCardIds.size + ' 张';
+}
+
 
 function openImageViewer(cardId, imageIndex) {
   const card = cards.find(item => item.id === cardId);
@@ -3069,6 +3895,9 @@ function connectWs() {
       renderBookmarkAddress(payload.bookmarkAddress || '');
       renderDiscoveryHint(payload.discoveryHint || '');
       renderCards();
+    } else if (payload.type === 'chatSnapshot') {
+      chatMessages = payload.messages || [];
+      renderChat();
     }
   };
 }
@@ -3113,6 +3942,20 @@ async function deleteCard(cardId) {
   await refreshCards();
 }
 
+async function deleteSelectedCards() {
+  const ids = [...selectedCardIds];
+  if (!ids.length) { showToast('请先选择卡片'); return; }
+  if (!confirm('确认删除选中的 ' + ids.length + ' 张卡片？')) return;
+  await fetch('/api/cards/delete', {
+    method: 'POST',
+    headers: {'content-type': 'application/json'},
+    body: JSON.stringify({cardIds: ids}),
+  });
+  selectedCardIds.clear();
+  await refreshCards();
+  showToast('已删除 ' + ids.length + ' 张卡片');
+}
+
 async function copyCard(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -3139,7 +3982,7 @@ cardsRoot.addEventListener('click', async event => {
     );
     return;
   }
-  const target = event.target.closest('button[data-action]');
+  const target = event.target.closest('[data-action]');
   if (!target) return;
   const action = target.dataset.action || '';
   if (action === 'open-card') {
@@ -3158,6 +4001,28 @@ cardsRoot.addEventListener('click', async event => {
     await copyCard(card.text || '');
   } else if (action === 'delete-card') {
     await deleteCard(card.id);
+  } else if (action === 'select-card') {
+    if (target.checked) selectedCardIds.add(card.id); else selectedCardIds.delete(card.id);
+    updateSelectedCount();
+  } else if (action === 'toggle-collapse') {
+    if (collapsedCardIds.has(card.id)) collapsedCardIds.delete(card.id); else collapsedCardIds.add(card.id);
+    renderCards();
+  }
+});
+
+chatWindow.addEventListener('click', async event => {
+  const target = event.target.closest('button[data-action]');
+  if (!target) return;
+  const messageId = target.dataset.messageId || '';
+  const message = chatMessages.find(item => item.id === messageId);
+  if (!message) return;
+  const action = target.dataset.action || '';
+  if (action === 'save-chat-card') {
+    await saveChatMessageAsCard(messageId);
+  } else if (action === 'copy-chat') {
+    await copyCard(message.text || '');
+  } else if (action === 'delete-chat') {
+    await deleteChatMessage(messageId);
   }
 });
 
@@ -3238,6 +4103,9 @@ function readImageFilesFromPasteEvent(event) {
 }
 
 document.getElementById('pickFilesBtn').addEventListener('click', () => fileInput.click());
+document.getElementById('chatPickFilesBtn').addEventListener('click', () => chatFileInput.click());
+document.getElementById('chatSendBtn').addEventListener('click', sendChatMessage);
+document.getElementById('clearChatBtn').addEventListener('click', clearChat);
 document.getElementById('createBtn').addEventListener('click', createCard);
 document.getElementById('refreshBtn').addEventListener('click', refreshCards);
 document.getElementById('pasteBtn').addEventListener('click', pasteIntoComposer);
@@ -3261,6 +4129,16 @@ fileInput.addEventListener('change', event => {
   pendingFiles = Array.from(event.target.files || []);
   renderPickedFiles();
 });
+chatFileInput.addEventListener('change', event => {
+  chatPendingFiles = Array.from(event.target.files || []);
+  renderChatPickedFiles();
+});
+chatInput.addEventListener('keydown', event => {
+  if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+    event.preventDefault();
+    sendChatMessage();
+  }
+});
 composerInput.addEventListener('paste', event => {
   const imageFiles = readImageFilesFromPasteEvent(event);
   if (!imageFiles.length) return;
@@ -3269,15 +4147,11 @@ composerInput.addEventListener('paste', event => {
   renderPickedFiles();
   showToast('已粘贴 ' + imageFiles.length + ' 张图片');
 });
-document.addEventListener('paste', event => {
-  if (document.activeElement !== composerInput) return;
-  const imageFiles = readImageFilesFromPasteEvent(event);
-  if (!imageFiles.length) return;
-  event.preventDefault();
-  pendingFiles = pendingFiles.concat(imageFiles);
-  renderPickedFiles();
-  showToast('已粘贴 ' + imageFiles.length + ' 张图片');
-});
+document.getElementById('selectAllBtn').addEventListener('click', () => { currentFilteredIds.forEach(id => selectedCardIds.add(id)); renderCards(); });
+document.getElementById('clearSelectionBtn').addEventListener('click', () => { selectedCardIds.clear(); renderCards(); });
+document.getElementById('deleteSelectedBtn').addEventListener('click', deleteSelectedCards);
+document.getElementById('collapseAllBtn').addEventListener('click', () => { currentFilteredIds.forEach(id => collapsedCardIds.add(id)); renderCards(); });
+document.getElementById('expandAllBtn').addEventListener('click', () => { currentFilteredIds.forEach(id => collapsedCardIds.delete(id)); renderCards(); });
 imageViewerClose.addEventListener('click', closeImageViewer);
 imageViewerPrev.addEventListener('click', () => stepImageViewer(-1));
 imageViewerNext.addEventListener('click', () => stepImageViewer(1));
@@ -3308,7 +4182,10 @@ document.addEventListener('keydown', event => {
   }
 });
 renderPickedFiles();
+renderChatPickedFiles();
+renderChat();
 refreshCards();
+refreshChat();
 connectWs();
 </script>
 </body>
@@ -3504,7 +4381,6 @@ connectWs();
   Widget _buildAddressPanel() {
     final statusColor =
         _isServerRunning ? const Color(0xFF1E9B52) : const Color(0xFFC53B3B);
-    const maxDragOffset = 88.0;
     return AnimatedBuilder(
       animation: _addressGlowController,
       builder: (context, child) {
@@ -3543,168 +4419,90 @@ connectWs();
           ),
           child: Padding(
             padding: const EdgeInsets.all(1.5),
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  child: Container(
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(22),
-                      gradient: LinearGradient(
-                        begin: Alignment.centerLeft,
-                        end: Alignment.centerRight,
-                        colors: _isServerRunning
-                            ? [
-                                const Color(0x10C53B3B),
-                                const Color(0x28C53B3B),
-                              ]
-                            : [
-                                const Color(0x101E9B52),
-                                const Color(0x281E9B52),
-                              ],
-                      ),
-                    ),
-                    padding: const EdgeInsets.symmetric(horizontal: 18),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Opacity(
-                            opacity: _isServerRunning
-                                ? (_addressCardDragOffset < 0
-                                    ? (_addressCardDragOffset.abs() /
-                                            maxDragOffset)
-                                        .clamp(0.0, 1.0)
-                                    : 0)
-                                : 0,
-                            child: const Align(
-                              alignment: Alignment.centerLeft,
-                              child: Text(
-                                '停止',
-                                style: TextStyle(
-                                  color: Color(0xFFB42318),
-                                  fontWeight: FontWeight.w900,
-                                  fontSize: 15,
-                                ),
-                              ),
-                            ),
+            child: Container(
+              decoration: _panelDecoration(
+                radius: 22,
+                shadowOpacity: 0.035,
+                borderColor: Colors.transparent,
+                glowColor: statusColor,
+              ),
+              padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          '推荐收藏地址',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 2.8,
+                            color: Color(0x7A1353D8),
                           ),
                         ),
-                        Expanded(
-                          child: Opacity(
-                            opacity: !_isServerRunning
-                                ? (_addressCardDragOffset > 0
-                                    ? (_addressCardDragOffset.abs() /
-                                            maxDragOffset)
-                                        .clamp(0.0, 1.0)
-                                    : 0)
-                                : 0,
-                            child: const Align(
-                              alignment: Alignment.centerRight,
-                              child: Text(
-                                '启动',
-                                style: TextStyle(
-                                  color: Color(0xFF157347),
-                                  fontWeight: FontWeight.w900,
-                                  fontSize: 15,
-                                ),
-                              ),
-                            ),
-                          ),
+                      ),
+                      _buildMetaPill(
+                        _isServerRunning ? '运行中' : '已停止',
+                        foregroundColor: statusColor,
+                        backgroundColor: statusColor.withValues(alpha: 0.12),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  SelectableText(
+                    _serverAddress,
+                    style: const TextStyle(
+                      fontSize: 16,
+                      height: 1.28,
+                      fontWeight: FontWeight.w800,
+                      color: Color(0xFF1143AB),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _buildCapsuleButton(
+                          label: _isServerRunning ? '停止服务' : '启动服务',
+                          icon: _isServerRunning
+                              ? Icons.stop_circle_outlined
+                              : Icons.play_circle_outline_rounded,
+                          onTap: () async {
+                            if (_isServerRunning) {
+                              await _stopServer();
+                            } else {
+                              await _startServer();
+                            }
+                          },
+                          variant: _isServerRunning
+                              ? _CapsuleButtonVariant.danger
+                              : _CapsuleButtonVariant.primary,
+                          compact: true,
                         ),
-                      ],
-                    ),
-                  ),
-                ),
-                GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onHorizontalDragUpdate: (details) {
-                    setState(() {
-                      _addressCardDragOffset =
-                          (_addressCardDragOffset + details.delta.dx)
-                              .clamp(-maxDragOffset, maxDragOffset);
-                    });
-                  },
-                  onHorizontalDragEnd: (details) async {
-                    final velocity = details.primaryVelocity?.abs() ?? 0;
-                    final shouldToggle =
-                        _addressCardDragOffset.abs() > 12 || velocity > 80;
-                    setState(() {
-                      _addressCardDragOffset = 0;
-                    });
-                    if (!shouldToggle) {
-                      return;
-                    }
-                    if (_isServerRunning) {
-                      await _stopServer();
-                    } else {
-                      await _startServer();
-                    }
-                  },
-                  onHorizontalDragCancel: () {
-                    if (_addressCardDragOffset == 0) {
-                      return;
-                    }
-                    setState(() {
-                      _addressCardDragOffset = 0;
-                    });
-                  },
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 140),
-                    curve: Curves.easeOutCubic,
-                    transform: Matrix4.translationValues(
-                      _addressCardDragOffset,
-                      0,
-                      0,
-                    ),
-                    child: Container(
-                      decoration: _panelDecoration(
-                        radius: 22,
-                        shadowOpacity: 0.035,
-                        borderColor: Colors.transparent,
-                        glowColor: statusColor,
                       ),
-                      padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              const Expanded(
-                                child: Text(
-                                  '访问地址',
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w800,
-                                    letterSpacing: 2.8,
-                                    color: Color(0x7A1353D8),
-                                  ),
-                                ),
-                              ),
-                              _buildMetaPill(
-                                _isServerRunning ? '运行中' : '已停止',
-                                foregroundColor: statusColor,
-                                backgroundColor: statusColor.withValues(
-                                  alpha: 0.12,
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 10),
-                          Text(
-                            _serverAddress,
-                            style: const TextStyle(
-                              fontSize: 16,
-                              height: 1.28,
-                              fontWeight: FontWeight.w800,
-                              color: Color(0xFF1143AB),
-                            ),
-                          ),
-                          const SizedBox(height: 6),
-                        ],
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _buildCapsuleButton(
+                          label: '复制地址',
+                          icon: Icons.copy_rounded,
+                          onTap: _isServerRunning
+                              ? () async {
+                                  await Clipboard.setData(
+                                    ClipboardData(text: _serverAddress),
+                                  );
+                                  _showToast('已复制推荐收藏地址');
+                                }
+                              : null,
+                          variant: _CapsuleButtonVariant.soft,
+                          compact: true,
+                        ),
                       ),
-                    ),
+                    ],
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         );
@@ -3867,6 +4665,46 @@ connectWs();
             ),
           ],
         ),
+        if (cards.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _buildCapsuleButton(
+                label: _selectedCardIds.isEmpty ? '进入多选' : '取消多选',
+                icon: _selectedCardIds.isEmpty
+                    ? Icons.checklist_rounded
+                    : Icons.close_rounded,
+                onTap: () {
+                  setState(() {
+                    if (_selectedCardIds.isEmpty) {
+                      _selectedCardIds.add(cards.first.id);
+                    } else {
+                      _selectedCardIds.clear();
+                    }
+                  });
+                },
+                variant: _CapsuleButtonVariant.soft,
+                compact: true,
+              ),
+              _buildCapsuleButton(
+                label: '全选',
+                icon: Icons.select_all_rounded,
+                onTap: () => _selectAllVisibleCards(cards),
+                variant: _CapsuleButtonVariant.ghost,
+                compact: true,
+              ),
+              _buildCapsuleButton(
+                label: '删除 ${_selectedCardIds.length}',
+                icon: Icons.delete_outline,
+                onTap: _selectedCardIds.isEmpty ? null : _deleteSelectedCards,
+                variant: _CapsuleButtonVariant.danger,
+                compact: true,
+              ),
+            ],
+          ),
+        ],
         const SizedBox(height: 16),
         if (cards.isEmpty)
           Container(
@@ -3936,7 +4774,16 @@ connectWs();
         color: Colors.transparent,
         child: InkWell(
           borderRadius: BorderRadius.circular(24),
-          onLongPress: () => _copyCardText(card.text),
+          onTap: _selectedCardIds.isNotEmpty
+              ? () => _toggleCardSelection(card)
+              : null,
+          onLongPress: _selectedCardIds.isNotEmpty
+              ? () => _toggleCardSelection(card)
+              : () {
+                  setState(() {
+                    _selectedCardIds.add(card.id);
+                  });
+                },
           child: Ink(
             decoration: _panelDecoration(radius: 24, shadowOpacity: 0.045),
             padding: const EdgeInsets.all(12),
@@ -3946,6 +4793,14 @@ connectWs();
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
+                    if (_selectedCardIds.isNotEmpty) ...[
+                      Checkbox(
+                        value: _selectedCardIds.contains(card.id),
+                        onChanged: (_) => _toggleCardSelection(card),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                      const SizedBox(width: 4),
+                    ],
                     AnimatedOpacity(
                       opacity: card.isPinned ? 1 : 0,
                       duration: const Duration(milliseconds: 160),
@@ -4104,6 +4959,17 @@ connectWs();
                       ),
                       const SizedBox(width: 8),
                     ],
+                    Expanded(
+                      child: _buildCapsuleButton(
+                        label: '复制',
+                        icon: Icons.copy_rounded,
+                        onTap: () => _copyCardText(card.text),
+                        variant: _CapsuleButtonVariant.soft,
+                        compact: true,
+                        stacked: true,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
                     Expanded(
                       child: _buildCapsuleButton(
                         label: '分享',
@@ -4282,6 +5148,7 @@ class LocalShareSettingsPage extends StatefulWidget {
     required this.initialConfirmDelete,
     required this.onImportTap,
     required this.onExportTap,
+    required this.onManageCardsTap,
   });
 
   final int initialPort;
@@ -4289,6 +5156,7 @@ class LocalShareSettingsPage extends StatefulWidget {
   final bool initialConfirmDelete;
   final Future<void> Function() onImportTap;
   final Future<void> Function() onExportTap;
+  final Future<void> Function(BuildContext context) onManageCardsTap;
 
   @override
   State<LocalShareSettingsPage> createState() => _LocalShareSettingsPageState();
@@ -4410,6 +5278,21 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
                 ),
                 const SizedBox(height: 14),
                 OutlinedButton.icon(
+                  onPressed: () => widget.onManageCardsTap(context),
+                  icon: const Icon(Icons.rule_folder_outlined),
+                  label: const Text(
+                    '卡片管理',
+                    style: TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size.fromHeight(48),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                OutlinedButton.icon(
                   onPressed: () async {
                     Navigator.of(context).pop();
                     await widget.onExportTap();
@@ -4480,6 +5363,297 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class LocalShareCardManagePage extends StatefulWidget {
+  const LocalShareCardManagePage({
+    super.key,
+    required this.cards,
+    required this.attachmentMap,
+    required this.onDeleteCards,
+  });
+
+  final List<CardItem> cards;
+  final Map<String, CardAttachment> attachmentMap;
+  final Future<int> Function(List<String> cardIds) onDeleteCards;
+
+  @override
+  State<LocalShareCardManagePage> createState() =>
+      _LocalShareCardManagePageState();
+}
+
+class _LocalShareCardManagePageState extends State<LocalShareCardManagePage> {
+  final TextEditingController _searchController = TextEditingController();
+  final Set<String> _selectedIds = <String>{};
+  String _filter = 'all';
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  List<CardItem> get _filteredCards {
+    final query = _searchController.text.trim().toLowerCase();
+    final now = DateTime.now();
+    return widget.cards.where((card) {
+      final attachments = _attachmentsOf(card);
+      final textMatched = query.isEmpty ||
+          card.text.toLowerCase().contains(query) ||
+          attachments.any(
+            (attachment) => attachment.name.toLowerCase().contains(query),
+          );
+      if (!textMatched) {
+        return false;
+      }
+      switch (_filter) {
+        case 'today':
+          return _isSameDate(card.createdAt, now);
+        case '7days':
+          return card.createdAt.isAfter(now.subtract(const Duration(days: 7)));
+        case '30days':
+          return card.createdAt.isAfter(now.subtract(const Duration(days: 30)));
+        case 'pinned':
+          return card.isPinned;
+        case 'withAttachments':
+          return attachments.isNotEmpty;
+        case 'images':
+          return attachments.any(
+            (attachment) => attachment.kind == AttachmentKind.image,
+          );
+        case 'textOnly':
+          return attachments.isEmpty;
+        default:
+          return true;
+      }
+    }).toList();
+  }
+
+  List<CardAttachment> _attachmentsOf(CardItem card) {
+    return card.attachmentIds
+        .map((id) => widget.attachmentMap[id])
+        .whereType<CardAttachment>()
+        .toList();
+  }
+
+  bool _isSameDate(DateTime a, DateTime b) {
+    final left = a.toLocal();
+    final right = b.toLocal();
+    return left.year == right.year &&
+        left.month == right.month &&
+        left.day == right.day;
+  }
+
+  String _formatDate(DateTime value) {
+    final local = value.toLocal();
+    return '${local.year}-${local.month.toString().padLeft(2, '0')}-${local.day.toString().padLeft(2, '0')}';
+  }
+
+  void _selectFilteredCards() {
+    setState(() {
+      _selectedIds.addAll(_filteredCards.map((card) => card.id));
+    });
+  }
+
+  void _clearSelection() {
+    setState(_selectedIds.clear);
+  }
+
+  Future<void> _deleteSelected() async {
+    final ids = _selectedIds.toList();
+    if (ids.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先选择要删除的卡片')),
+      );
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('批量删除卡片'),
+        content: Text('将删除选中的 ${ids.length} 张卡片及其附件，确认继续吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFBA1A1A),
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) {
+      return;
+    }
+    final deleted = await widget.onDeleteCards(ids);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _selectedIds.clear();
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已删除 $deleted 张卡片')),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final filteredCards = _filteredCards;
+    final selectedInFilter =
+        filteredCards.where((card) => _selectedIds.contains(card.id)).length;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('卡片管理'),
+        actions: [
+          TextButton(
+            onPressed: _selectedIds.isEmpty ? null : _deleteSelected,
+            child: Text('删除 ${_selectedIds.length}'),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+            child: Column(
+              children: [
+                TextField(
+                  controller: _searchController,
+                  decoration: const InputDecoration(
+                    prefixIcon: Icon(Icons.search_rounded),
+                    labelText: '搜索正文或附件名',
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+                const SizedBox(height: 10),
+                DropdownButtonFormField<String>(
+                  initialValue: _filter,
+                  decoration: const InputDecoration(
+                    labelText: '筛选条件',
+                    prefixIcon: Icon(Icons.filter_alt_outlined),
+                  ),
+                  items: const [
+                    DropdownMenuItem(value: 'all', child: Text('全部卡片')),
+                    DropdownMenuItem(value: 'today', child: Text('今天创建')),
+                    DropdownMenuItem(value: '7days', child: Text('最近 7 天')),
+                    DropdownMenuItem(value: '30days', child: Text('最近 30 天')),
+                    DropdownMenuItem(value: 'pinned', child: Text('已置顶')),
+                    DropdownMenuItem(
+                      value: 'withAttachments',
+                      child: Text('包含附件'),
+                    ),
+                    DropdownMenuItem(value: 'images', child: Text('包含图片')),
+                    DropdownMenuItem(value: 'textOnly', child: Text('仅文本')),
+                  ],
+                  onChanged: (value) {
+                    setState(() {
+                      _filter = value ?? 'all';
+                    });
+                  },
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed:
+                            filteredCards.isEmpty ? null : _selectFilteredCards,
+                        icon: const Icon(Icons.select_all_rounded),
+                        label: const Text('全选筛选结果'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed:
+                            _selectedIds.isEmpty ? null : _clearSelection,
+                        icon: const Icon(Icons.close_rounded),
+                        label: const Text('清空选择'),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    '筛出 ${filteredCards.length} 张，当前筛选内已选 $selectedInFilter 张，总已选 ${_selectedIds.length} 张',
+                    style: const TextStyle(
+                      color: Color(0xFF6E7788),
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: filteredCards.isEmpty
+                ? const Center(child: Text('没有匹配的卡片'))
+                : ListView.separated(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 18),
+                    itemCount: filteredCards.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 8),
+                    itemBuilder: (context, index) {
+                      final card = filteredCards[index];
+                      final attachments = _attachmentsOf(card);
+                      final selected = _selectedIds.contains(card.id);
+                      return Card(
+                        child: CheckboxListTile(
+                          value: selected,
+                          onChanged: (_) {
+                            setState(() {
+                              if (selected) {
+                                _selectedIds.remove(card.id);
+                              } else {
+                                _selectedIds.add(card.id);
+                              }
+                            });
+                          },
+                          title: Text(
+                            card.text.trim().isEmpty ? '无文本内容' : card.text,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontWeight: FontWeight.w800),
+                          ),
+                          subtitle: Padding(
+                            padding: const EdgeInsets.only(top: 6),
+                            child: Text(
+                              '${_formatDate(card.createdAt)} · ${attachments.length} 个附件${card.isPinned ? ' · 置顶' : ''}',
+                            ),
+                          ),
+                          controlAffinity: ListTileControlAffinity.leading,
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+          child: FilledButton.icon(
+            onPressed: _selectedIds.isEmpty ? null : _deleteSelected,
+            icon: const Icon(Icons.delete_outline),
+            label: Text('删除选中的 ${_selectedIds.length} 张卡片'),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFBA1A1A),
+              foregroundColor: Colors.white,
+              minimumSize: const Size.fromHeight(48),
+            ),
+          ),
+        ),
       ),
     );
   }
