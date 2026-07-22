@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'package:flutter/gestures.dart';
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter_background/flutter_background.dart';
@@ -248,6 +249,7 @@ class CardItem {
     required this.createdAt,
     required this.updatedAt,
     this.pinnedAt,
+    this.source = 'local',
     List<String>? attachmentIds,
   }) : attachmentIds = attachmentIds ?? <String>[];
 
@@ -256,6 +258,7 @@ class CardItem {
   final DateTime createdAt;
   DateTime updatedAt;
   DateTime? pinnedAt;
+  String source;
   final List<String> attachmentIds;
 
   bool get isPinned => pinnedAt != null;
@@ -267,6 +270,7 @@ class CardItem {
       'createdAt': createdAt.toIso8601String(),
       'updatedAt': updatedAt.toIso8601String(),
       'pinnedAt': pinnedAt?.toIso8601String(),
+      'source': source,
       'attachmentIds': attachmentIds,
     };
   }
@@ -283,6 +287,7 @@ class CardItem {
       'createdAt': createdAt.toIso8601String(),
       'updatedAt': updatedAt.toIso8601String(),
       'pinnedAt': pinnedAt?.toIso8601String(),
+      'source': source,
       'pinned': isPinned,
       'attachments': attachments,
       'bundleDownloadUrl': attachments.isEmpty ? null : '/cards/$id/bundle',
@@ -298,6 +303,7 @@ class CardItem {
       updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ??
           DateTime.now(),
       pinnedAt: DateTime.tryParse(json['pinnedAt'] as String? ?? ''),
+      source: json['source'] as String? ?? 'local',
       attachmentIds: (json['attachmentIds'] as List<dynamic>? ?? <dynamic>[])
           .map((value) => value as String)
           .toList(),
@@ -1107,13 +1113,16 @@ class _MyHomePageState extends State<MyHomePage>
     }
     _publicHost = ipAddress;
     _ipServerAddress = 'http://$_publicHost:${_server?.port ?? _preferredPort}';
-    _hasObservedWebAddress = false;
     if (mounted) {
       setState(() {
-        _serverAddress = _ipServerAddress!;
+        if (!_hasObservedWebAddress) {
+          _serverAddress = _ipServerAddress!;
+        }
       });
     } else {
-      _serverAddress = _ipServerAddress!;
+      if (!_hasObservedWebAddress) {
+        _serverAddress = _ipServerAddress!;
+      }
     }
     await _syncForegroundService();
     await _syncDiscoveryService();
@@ -1213,14 +1222,11 @@ class _MyHomePageState extends State<MyHomePage>
 
     final textContent =
         textParts.where((value) => value.isNotEmpty).join('\n\n');
-    final fallbackText = filePayloads.length == 1
-        ? '收到文件：${filePayloads.first.name}'
-        : '收到 ${filePayloads.length} 个文件';
-
     try {
       await _createCard(
-        text: textContent.isNotEmpty ? textContent : fallbackText,
+        text: textContent,
         attachments: filePayloads,
+        source: 'shared',
       );
       _showToast('已保存到本地分享');
       if (autoClose && Platform.isAndroid) {
@@ -1250,6 +1256,7 @@ class _MyHomePageState extends State<MyHomePage>
   Future<CardItem> _createCard({
     required String text,
     List<_IncomingAttachmentPayload>? attachments,
+    String source = 'local',
     bool notify = true,
   }) async {
     final now = DateTime.now();
@@ -1258,6 +1265,7 @@ class _MyHomePageState extends State<MyHomePage>
       text: text.trim(),
       createdAt: now,
       updatedAt: now,
+      source: source,
     );
     _cards.add(card);
 
@@ -1748,48 +1756,41 @@ class _MyHomePageState extends State<MyHomePage>
     );
   }
 
-  Uri? _extractFirstUrl(String text) {
-    final match = RegExp(r'https?://[^\s<>()]+').firstMatch(text);
-    if (match == null) {
-      return null;
-    }
-    final candidate = (match.group(0) ?? '').replaceFirst(
-      RegExp(r'[\]\)\}\.,;:!?]+$'),
-      '',
-    );
-    if (candidate.isEmpty) {
-      return null;
-    }
-    final uri = Uri.tryParse(candidate);
-    if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
-      return null;
-    }
-    if (uri.scheme != 'http' && uri.scheme != 'https') {
-      return null;
-    }
-    return uri;
-  }
-
-  Future<void> _openCardUrl(CardItem card) async {
-    final uri = _extractFirstUrl(card.text);
-    if (uri == null) {
-      _showToast('这张卡片不是可直接打开的链接');
-      return;
-    }
+  Future<void> _openUri(Uri uri) async {
     final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
     if (!launched) {
       _showToast('无法打开该链接');
     }
   }
 
+  Future<void> _copyUrl(String url) async {
+    await Clipboard.setData(ClipboardData(text: url));
+    _showToast('链接已复制');
+  }
+
   Future<void> _shareCard(CardItem card) async {
     final text = card.text.trim();
-    if (text.isEmpty) {
+    final cardAttachments = card.attachmentIds
+        .map((id) => _attachments[id])
+        .whereType<CardAttachment>()
+        .where((attachment) => File(attachment.localPath).existsSync())
+        .toList();
+    if (text.isEmpty && cardAttachments.isEmpty) {
       _showToast('空卡片暂不支持分享');
       return;
     }
     try {
-      await Share.share(text, subject: '本地分享');
+      if (cardAttachments.isNotEmpty) {
+        await Share.shareXFiles(
+          cardAttachments
+              .map((attachment) => XFile(attachment.localPath))
+              .toList(),
+          text: text.isEmpty ? null : text,
+          subject: '本地分享',
+        );
+      } else {
+        await Share.share(text, subject: '本地分享');
+      }
     } catch (error) {
       _showToast('分享失败');
       debugPrint('shareCard failed: $error');
@@ -3911,7 +3912,6 @@ function renderCards() {
   }
 
   cardsRoot.innerHTML = filtered.map(card => {
-    const openUrl = extractFirstUrl(card.text || '');
     const bundleUrl = card.bundleDownloadUrl || '';
     const imageFiles = (card.attachments || []).filter(file => file.kind === 'image');
     const collapsed = !expandedCardIds.has(card.id);
@@ -3955,7 +3955,6 @@ function renderCards() {
       '</div>' +
       '<div class="card-actions">' +
         '<button class="btn btn-ghost" data-action="toggle-collapse" data-card-id="' + escapeHtml(card.id) + '">' + (collapsed ? '展开' : '折叠') + '</button>' +
-        (openUrl ? '<button class="btn btn-soft" data-action="open-card" data-card-url="' + escapeHtml(openUrl) + '">打开</button>' : '') +
       '</div>' +
     '</article>';
   }).join('');
@@ -4129,15 +4128,6 @@ cardsRoot.addEventListener('click', async event => {
   const target = event.target.closest('[data-action]');
   if (!target) return;
   const action = target.dataset.action || '';
-  if (action === 'open-card') {
-    const url = target.dataset.cardUrl || '';
-    if (!url) return;
-    const opened = window.open(url, '_blank', 'noopener');
-    if (!opened) {
-      window.location.href = url;
-    }
-    return;
-  }
   const cardId = target.dataset.cardId || '';
   const card = cards.find(item => item.id === cardId);
   if (!card) return;
@@ -4861,7 +4851,11 @@ connectWs();
     final imageAttachments = cardAttachments
         .where((attachment) => attachment.kind == AttachmentKind.image)
         .toList();
-    final openUrl = _extractFirstUrl(card.text);
+    final hasText = card.text.trim().isNotEmpty;
+    final metaLabels = <String>[
+      if (card.source == 'shared') '分享导入',
+      if (_cardTypeLabel(cardAttachments) case final typeLabel?) typeLabel,
+    ];
 
     return _SwipeRevealCard(
       leftActions: [
@@ -4901,33 +4895,52 @@ connectWs();
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    AnimatedOpacity(
-                      opacity: card.isPinned ? 1 : 0,
-                      duration: const Duration(milliseconds: 160),
-                      child: IgnorePointer(
-                        ignoring: !card.isPinned,
-                        child: _buildMetaPill(
-                          '置顶',
-                          foregroundColor: const Color(0xFF0D44B3),
-                          backgroundColor: const Color(0xFFEAF1FF),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _buildSmallIconButton(
+                          icon: Icons.ios_share_rounded,
+                          tooltip: '分享',
+                          onTap: () => _shareCard(card),
                         ),
+                        const SizedBox(width: 8),
+                        ...metaLabels.expand(
+                          (label) => [
+                            _buildMetaPill(label),
+                            const SizedBox(width: 8),
+                          ],
+                        ),
+                        AnimatedOpacity(
+                          opacity: card.isPinned ? 1 : 0,
+                          duration: const Duration(milliseconds: 160),
+                          child: IgnorePointer(
+                            ignoring: !card.isPinned,
+                            child: _buildMetaPill(
+                              '置顶',
+                              foregroundColor: const Color(0xFF0D44B3),
+                              backgroundColor: const Color(0xFFEAF1FF),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    Flexible(
+                      child: Align(
+                        alignment: Alignment.centerRight,
+                        child: _buildMetaPill(
+                            '创建 ${_formatDateTime(card.createdAt)}'),
                       ),
                     ),
-                    _buildMetaPill('创建 ${_formatDateTime(card.createdAt)}'),
                   ],
                 ),
-                const SizedBox(height: 10),
-                Text(
-                  card.text.isEmpty ? '无文本内容' : card.text,
-                  maxLines: 5,
-                  overflow: TextOverflow.fade,
-                  style: const TextStyle(
-                    color: Color(0xFF1F2430),
-                    fontSize: 14.5,
-                    height: 1.6,
-                    fontWeight: FontWeight.w500,
+                if (hasText) ...[
+                  const SizedBox(height: 10),
+                  _CardTextPreview(
+                    text: card.text,
+                    onOpenUri: _openUri,
+                    onCopyUrl: _copyUrl,
                   ),
-                ),
+                ],
                 if (cardAttachments.isNotEmpty) ...[
                   const SizedBox(height: 14),
                   if (cardAttachments.length > 1) ...[
@@ -5043,36 +5056,62 @@ connectWs();
                     ),
                   ),
                 ],
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    if (openUrl != null) ...[
-                      Expanded(
-                        child: _buildCapsuleButton(
-                          label: '打开',
-                          icon: Icons.open_in_new_rounded,
-                          onTap: () => _openCardUrl(card),
-                          variant: _CapsuleButtonVariant.soft,
-                          compact: true,
-                          stacked: true,
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                    ],
-                    Expanded(
-                      child: _buildCapsuleButton(
-                        label: '分享',
-                        icon: Icons.ios_share_rounded,
-                        onTap: () => _shareCard(card),
-                        variant: _CapsuleButtonVariant.soft,
-                        compact: true,
-                        stacked: true,
-                      ),
-                    ),
-                  ],
-                ),
               ],
             ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  String? _cardTypeLabel(List<CardAttachment> attachments) {
+    if (attachments.isEmpty) {
+      return null;
+    }
+    if (attachments
+        .every((attachment) => attachment.kind == AttachmentKind.image)) {
+      return attachments.length == 1 ? '图片' : '${attachments.length} 张图片';
+    }
+    if (attachments.length == 1) {
+      switch (attachments.first.kind) {
+        case AttachmentKind.audio:
+          return '音频';
+        case AttachmentKind.video:
+          return '视频';
+        case AttachmentKind.document:
+          return '文档';
+        case AttachmentKind.archive:
+          return '压缩包';
+        case AttachmentKind.image:
+          return '图片';
+        case AttachmentKind.other:
+          return '附件';
+      }
+    }
+    return '${attachments.length} 个附件';
+  }
+
+  Widget _buildSmallIconButton({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onTap,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(999),
+        child: Ink(
+          width: 30,
+          height: 30,
+          decoration: BoxDecoration(
+            color: const Color(0xFFEAF1FF),
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Icon(
+            icon,
+            size: 16,
+            color: const Color(0xFF0D44B3),
           ),
         ),
       ),
@@ -6033,6 +6072,7 @@ class _CardEditorPage extends StatefulWidget {
 class _CardEditorPageState extends State<_CardEditorPage> {
   late final TextEditingController _controller =
       TextEditingController(text: widget.initialText);
+  late String _lastText = widget.initialText;
 
   @override
   void dispose() {
@@ -6040,46 +6080,170 @@ class _CardEditorPageState extends State<_CardEditorPage> {
     super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('编辑卡片'),
-        leading: IconButton(
-          onPressed: () => Navigator.of(context).pop(),
-          icon: const Icon(Icons.close_rounded),
-          tooltip: '取消',
-        ),
+  bool get _hasChanges => _controller.text != widget.initialText;
+
+  Future<bool> _confirmDiscard() async {
+    if (!_hasChanges) {
+      return true;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('放弃修改？'),
+        content: const Text('当前卡片内容还没有保存。'),
         actions: [
           TextButton(
-            onPressed: () => Navigator.of(context).pop(_controller.text.trim()),
-            child: const Text(
-              '保存',
-              style: TextStyle(fontWeight: FontWeight.w900),
-            ),
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('继续编辑'),
           ),
-          const SizedBox(width: 6),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('放弃'),
+          ),
         ],
       ),
-      body: SafeArea(
-        child: Padding(
-          padding: EdgeInsets.fromLTRB(
-            16,
-            10,
-            16,
-            16 + MediaQuery.of(context).viewInsets.bottom,
+    );
+    return confirmed == true;
+  }
+
+  Future<void> _close() async {
+    if (await _confirmDiscard() && mounted) {
+      Navigator.of(context).pop();
+    }
+  }
+
+  void _save() {
+    Navigator.of(context).pop(_controller.text);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final mediaQuery = MediaQuery.of(context);
+    return PopScope(
+      canPop: !_hasChanges,
+      onPopInvokedWithResult: (didPop, result) async {
+        if (didPop) {
+          return;
+        }
+        await _close();
+      },
+      child: Scaffold(
+        resizeToAvoidBottomInset: true,
+        appBar: AppBar(
+          title: const Text('编辑卡片'),
+          leading: IconButton(
+            onPressed: _close,
+            icon: const Icon(Icons.close_rounded),
+            tooltip: '取消',
           ),
-          child: TextField(
-            controller: _controller,
-            expands: true,
-            maxLines: null,
-            minLines: null,
-            autofocus: true,
-            textAlignVertical: TextAlignVertical.top,
-            decoration: const InputDecoration(
-              hintText: '修改卡片内容',
-              alignLabelWithHint: true,
+          actions: [
+            TextButton(
+              onPressed: _save,
+              child: const Text(
+                '保存',
+                style: TextStyle(fontWeight: FontWeight.w900),
+              ),
             ),
+            const SizedBox(width: 6),
+          ],
+        ),
+        body: SafeArea(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final editorHeight = constraints.maxHeight -
+                  26 -
+                  mediaQuery.viewInsets.bottom.clamp(0, 96);
+              return Padding(
+                padding: EdgeInsets.fromLTRB(
+                  14,
+                  10,
+                  14,
+                  16 + mediaQuery.viewInsets.bottom,
+                ),
+                child: Column(
+                  children: [
+                    Expanded(
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(22),
+                          border: Border.all(
+                            color: const Color(0xFFDDE5F2),
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: const Color(0xFF1353D8)
+                                  .withValues(alpha: 0.06),
+                              blurRadius: 28,
+                              offset: const Offset(0, 14),
+                            ),
+                          ],
+                        ),
+                        child: ConstrainedBox(
+                          constraints: BoxConstraints(
+                            minHeight: editorHeight.clamp(360, 1200),
+                          ),
+                          child: Padding(
+                            padding: const EdgeInsets.all(14),
+                            child: TextField(
+                              controller: _controller,
+                              expands: true,
+                              maxLines: null,
+                              minLines: null,
+                              autofocus: true,
+                              keyboardType: TextInputType.multiline,
+                              textInputAction: TextInputAction.newline,
+                              textAlignVertical: TextAlignVertical.top,
+                              onChanged: (value) {
+                                if ((value == widget.initialText) !=
+                                    (_lastText == widget.initialText)) {
+                                  setState(() {});
+                                }
+                                _lastText = value;
+                              },
+                              decoration: const InputDecoration(
+                                hintText: '修改卡片内容',
+                                border: InputBorder.none,
+                                enabledBorder: InputBorder.none,
+                                focusedBorder: InputBorder.none,
+                                contentPadding: EdgeInsets.zero,
+                              ),
+                              style: const TextStyle(
+                                fontSize: 16,
+                                height: 1.55,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            _hasChanges ? '有未保存修改' : '内容未修改',
+                            style: const TextStyle(
+                              color: Color(0xFF7A8497),
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        Text(
+                          '${_controller.text.characters.length} 字',
+                          style: const TextStyle(
+                            color: Color(0xFF7A8497),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              );
+            },
           ),
         ),
       ),
@@ -6251,6 +6415,147 @@ class _SwipeRevealCardState extends State<_SwipeRevealCard> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _CardTextPreview extends StatefulWidget {
+  const _CardTextPreview({
+    required this.text,
+    required this.onOpenUri,
+    required this.onCopyUrl,
+  });
+
+  final String text;
+  final Future<void> Function(Uri uri) onOpenUri;
+  final Future<void> Function(String url) onCopyUrl;
+
+  @override
+  State<_CardTextPreview> createState() => _CardTextPreviewState();
+}
+
+class _CardTextPreviewState extends State<_CardTextPreview> {
+  final List<TapGestureRecognizer> _recognizers = <TapGestureRecognizer>[];
+  late List<InlineSpan> _spans;
+
+  static final RegExp _urlPattern = RegExp(r'https?://[^\s<>()]+');
+  static final RegExp _trailingPunctuation = RegExp(r'[\]\)\}\.,;:!?]+$');
+  static const TextStyle _baseStyle = TextStyle(
+    color: Color(0xFF1F2430),
+    fontSize: 14.5,
+    height: 1.6,
+    fontWeight: FontWeight.w500,
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    _spans = _createSpans();
+  }
+
+  @override
+  void didUpdateWidget(covariant _CardTextPreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.text != widget.text ||
+        oldWidget.onOpenUri != widget.onOpenUri ||
+        oldWidget.onCopyUrl != widget.onCopyUrl) {
+      _disposeRecognizers();
+      _spans = _createSpans();
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposeRecognizers();
+    super.dispose();
+  }
+
+  void _disposeRecognizers() {
+    for (final recognizer in _recognizers) {
+      recognizer.dispose();
+    }
+    _recognizers.clear();
+  }
+
+  List<InlineSpan> _createSpans() {
+    final spans = <InlineSpan>[];
+    var cursor = 0;
+    for (final match in _urlPattern.allMatches(widget.text)) {
+      final raw = match.group(0) ?? '';
+      final trimmed = raw.replaceFirst(_trailingPunctuation, '');
+      if (trimmed.isEmpty) {
+        continue;
+      }
+      final uri = Uri.tryParse(trimmed);
+      if (uri == null ||
+          uri.host.isEmpty ||
+          (uri.scheme != 'http' && uri.scheme != 'https')) {
+        continue;
+      }
+      if (match.start > cursor) {
+        spans.add(TextSpan(text: widget.text.substring(cursor, match.start)));
+      }
+      final recognizer = TapGestureRecognizer()
+        ..onTap = () => widget.onOpenUri(uri);
+      _recognizers.add(recognizer);
+      spans.add(
+        TextSpan(
+          text: trimmed,
+          style: _baseStyle.copyWith(
+            color: const Color(0xFF385171),
+            decoration: TextDecoration.underline,
+            decorationColor: const Color(0x66385171),
+            fontWeight: FontWeight.w800,
+          ),
+          recognizer: recognizer,
+        ),
+      );
+      spans.add(
+        WidgetSpan(
+          alignment: PlaceholderAlignment.middle,
+          child: Padding(
+            padding: const EdgeInsets.only(left: 3, right: 2),
+            child: Tooltip(
+              message: '复制链接',
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => widget.onCopyUrl(trimmed),
+                child: const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: Icon(
+                    Icons.content_copy_rounded,
+                    size: 13,
+                    color: Color(0xFF6A7890),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      cursor = match.start + trimmed.length;
+      if (raw.length > trimmed.length) {
+        final trailing = raw.substring(trimmed.length);
+        spans.add(TextSpan(text: trailing));
+        cursor = match.end;
+      }
+    }
+    if (cursor < widget.text.length) {
+      spans.add(TextSpan(text: widget.text.substring(cursor)));
+    }
+    return spans.isEmpty ? <InlineSpan>[TextSpan(text: widget.text)] : spans;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return RichText(
+      maxLines: 5,
+      overflow: TextOverflow.fade,
+      text: TextSpan(
+        style: _baseStyle,
+        children: _spans,
       ),
     );
   }
