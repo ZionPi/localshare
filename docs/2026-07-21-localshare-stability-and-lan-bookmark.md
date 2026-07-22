@@ -1,8 +1,8 @@
-# 2026-07-21 LocalShare 稳定性与局域网收藏地址改造记录
+# 2026-07-21 LocalShare 稳定性与当前访问地址改造记录
 
 ## 背景
 
-本轮集中处理 LocalShare 使用中的严重问题，重点是：手机作为局域网 Web 服务器时，电脑端希望像收藏普通网页一样收藏一个稳定地址，而不是每次输入变化的手机 IP。
+本轮集中处理 LocalShare 使用中的严重问题，重点是：手机作为局域网 Web 服务器时，电脑端需要看到“当前应该访问哪个网址”。理想情况下，这个地址应优先使用相对稳定的 mDNS/Bonjour 主机名，例如 `android_pddwcd2v.local`，从而避免手机 IP 在家庭、公司等不同 Wi-Fi 环境中变化后需要重新输入；如果当前网络或系统无法确认 `.local` 主机名，则 IP 地址只能作为当前可访问的 fallback。
 
 ## 已完成的代码改动
 
@@ -36,20 +36,22 @@
   - 复制地址。
 - 无局域网地址时不再显示 `127.0.0.1` 作为可访问地址，而是显示不可用状态。
 
-### 4. 局域网收藏地址
+### 4. 当前访问地址与 mDNS 主机名
 
 - Android 端继续使用 NSD/mDNS 注册 `_http._tcp.local` 服务。
 - 服务实例名固定为 `localshare`，便于在 Windows/macOS 上通过 Bonjour/mDNS 工具发现。
-- 手机端顶部地址改为“推荐收藏地址”。
-- 当前实际策略：
-  - 优先使用 Android NSD 返回的 `bookmarkUrl`；
-  - 如果 Android 回调拿不到 hostname，则 fallback 到本轮在 HONOR Pad 7 上实测可用的 `Android.local`，例如：
+- 手机端顶部应显示“当前访问地址”，不是“推荐收藏地址”或“局域网收藏地址”。
+- 当前访问地址的优先级应是：
+  1. 已确认可用的 `.local` 主机名地址，例如电脑通过 DNS-SD 解析到的 `android_pddwcd2v.local`；
+  2. Android NSD 返回的 `bookmarkUrl`，前提是该 hostname 在当前电脑端确实可解析；
+  3. 当前 Wi-Fi 下的 IP 地址，例如 `http://192.168.31.142:35773`，仅作为 fallback。
+- 如果 Android 回调拿不到 hostname，不能把某一次实测的 `Android.local` 当成通用地址。不同设备、厂商系统、网络环境下，实际主机名可能不同，例如：
 
 ```text
-http://Android.local:35773
+http://android_pddwcd2v.local:35773
 ```
 
-> 注意：这个 fallback 是当前阶段为解决 HONOR Pad 7 上 Android NSD 回调拿不到 hostname 而采用的实用方案，不是最终通用方案。后续可改成设置页手动配置“收藏主机名”。
+> 注意：`.local` 主机名是“相对稳定的当前访问地址”，不是永久不变的承诺。后续应支持在设置页手动配置当前环境中确认可用的主机名；没有可用 `.local` 时，手机端必须仍能显示当前 IP 地址作为 fallback。
 
 ### 5. 手机端下载网页上传文件
 
@@ -136,12 +138,15 @@ http://android.local:35773/
 ### 结论
 
 - `localshare` 是 mDNS 服务实例名，不等于浏览器可直接访问的 hostname。
-- `Android.local` 才是当前设备实际可解析的局域网主机名。
-- 浏览器收藏应收藏实际主机名地址，例如：
+- `Android.local` 只是当时 Windows 环境解析到的主机名，不是通用值。
+- macOS 上同一台手机可能解析为 `Android_PDDWCD2V.local`，浏览器实际可访问地址应以 DNS-SD 查询结果或真实请求 Host 为准。
+- 当前访问地址应优先显示实际 `.local` 主机名地址，例如：
 
 ```text
-http://Android.local:35773
+http://android_pddwcd2v.local:35773
 ```
+
+- 如果 `.local` 当前不可解析，则退回显示当前 Wi-Fi IP 地址，保证用户仍然知道手机服务器怎么访问。
 
 ## 关于不同机器无法覆盖安装 APK 的原因
 
@@ -207,7 +212,7 @@ AE5HNU1604404926  AGM3_AL09HN
 
 ## 仍需后续验证或优化
 
-1. `Android.local` 作为 fallback 不是通用最终方案，建议后续在设置页增加“收藏主机名”手动配置。
+1. `Android.local` 不是通用 fallback。建议后续在设置页增加“当前主机名 / .local 地址”手动配置，并允许从电脑端真实访问 Host 自动学习。
 2. 后台保活仍需长时间真机验证，尤其是锁屏、省电策略、退后台后的 WebSocket 连接状态。
 3. 手机端下载网页上传文件已改为本地复制优先，但仍需多类型文件实测。
 4. 临时对话模式已完成主体功能，但还需浏览器/手机双端连续互传压力测试。

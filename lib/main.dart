@@ -709,6 +709,7 @@ class _MyHomePageState extends State<MyHomePage>
   bool _isLoading = true;
   DateTime? _lastStateSyncAt;
   bool _backgroundExecutionReady = false;
+  bool _isTempChatMode = false;
 
   @override
   void initState() {
@@ -934,6 +935,7 @@ class _MyHomePageState extends State<MyHomePage>
   Map<String, dynamic> _buildChatSnapshot() {
     return {
       'type': 'chatSnapshot',
+      'tempChatMode': _isTempChatMode,
       'messages': _chatMessages
           .map((message) => message.toPublicJson(_chatAttachments))
           .toList(),
@@ -945,6 +947,18 @@ class _MyHomePageState extends State<MyHomePage>
     final message = jsonEncode(_buildChatSnapshot());
     for (final client in _webSocketClients) {
       client.sink.add(message);
+    }
+  }
+
+  void _setTempChatMode(bool enabled) {
+    if (_isTempChatMode == enabled) {
+      return;
+    }
+    _isTempChatMode = enabled;
+    _broadcastSnapshot();
+    _broadcastChatSnapshot();
+    if (mounted) {
+      setState(() {});
     }
   }
 
@@ -1076,8 +1090,33 @@ class _MyHomePageState extends State<MyHomePage>
     _stateRefreshTimer?.cancel();
     _stateRefreshTimer = Timer.periodic(
       const Duration(seconds: 2),
-      (_) => unawaited(_refreshStateFromStorageIfChanged()),
+      (_) {
+        unawaited(_refreshStateFromStorageIfChanged());
+        unawaited(_refreshLocalNetworkAddress());
+      },
     );
+  }
+
+  Future<void> _refreshLocalNetworkAddress() async {
+    if (!_isServerRunning) {
+      return;
+    }
+    final ipAddress = await _getLocalIpAddress();
+    if (ipAddress == null || ipAddress == _publicHost) {
+      return;
+    }
+    _publicHost = ipAddress;
+    _ipServerAddress = 'http://$_publicHost:${_server?.port ?? _preferredPort}';
+    _hasObservedWebAddress = false;
+    if (mounted) {
+      setState(() {
+        _serverAddress = _ipServerAddress!;
+      });
+    } else {
+      _serverAddress = _ipServerAddress!;
+    }
+    await _syncForegroundService();
+    await _syncDiscoveryService();
   }
 
   Future<void> _refreshStateFromStorageIfChanged({bool force = false}) async {
@@ -1379,45 +1418,6 @@ class _MyHomePageState extends State<MyHomePage>
       setState(() {});
     }
     return deleted;
-  }
-
-  Future<void> _deleteSelectedCards() async {
-    final selectedIds = _selectedCardIds.toList();
-    if (selectedIds.isEmpty) {
-      _showToast('请先选择要删除的卡片');
-      return;
-    }
-    if (_confirmDelete) {
-      final confirmed = await _showDeleteConfirmDialog(
-        title: '批量删除',
-        message: '将删除选中的 ${selectedIds.length} 张卡片及其附件，确认继续吗？',
-        confirmLabel: '批量删除',
-      );
-      if (!confirmed) {
-        return;
-      }
-    }
-    final deleted = await _deleteCardsByIds(selectedIds);
-    _selectedCardIds.clear();
-    _showToast('已删除 $deleted 张卡片');
-  }
-
-  void _toggleCardSelection(CardItem card) {
-    setState(() {
-      if (_selectedCardIds.contains(card.id)) {
-        _selectedCardIds.remove(card.id);
-      } else {
-        _selectedCardIds.add(card.id);
-      }
-    });
-  }
-
-  void _selectAllVisibleCards(List<CardItem> cards) {
-    setState(() {
-      _selectedCardIds
-        ..clear()
-        ..addAll(cards.map((card) => card.id));
-    });
   }
 
   Future<void> _clearAllCards() async {
@@ -1892,13 +1892,12 @@ class _MyHomePageState extends State<MyHomePage>
             .invokeMapMethod<String, dynamic>('getRegisteredHttpService');
       }
       final hint = (payload?['hint'] as String?)?.trim();
-      final displayAddress = _ipServerAddress ??
-          'http://$_publicHost:${_server?.port ?? _preferredPort}';
       if (!mounted) {
         _discoveryHint = hint?.isEmpty == true ? null : hint;
         _bookmarkAddress = null;
         if (!_hasObservedWebAddress) {
-          _serverAddress = displayAddress;
+          _serverAddress = _ipServerAddress ??
+              'http://$_publicHost:${_server?.port ?? _preferredPort}';
         }
         return;
       }
@@ -1906,7 +1905,8 @@ class _MyHomePageState extends State<MyHomePage>
         _discoveryHint = hint?.isEmpty == true ? null : hint;
         _bookmarkAddress = null;
         if (!_hasObservedWebAddress) {
-          _serverAddress = displayAddress;
+          _serverAddress = _ipServerAddress ??
+              'http://$_publicHost:${_server?.port ?? _preferredPort}';
         }
       });
     } catch (error) {
@@ -1970,6 +1970,22 @@ class _MyHomePageState extends State<MyHomePage>
           initialConfirmDelete: _confirmDelete,
           onImportTap: _importAllCards,
           onExportTap: _exportAllCards,
+          onTempChatTap: (settingsContext) async {
+            _setTempChatMode(true);
+            await Navigator.of(settingsContext).push<void>(
+              MaterialPageRoute<void>(
+                builder: (_) => _LocalShareTempChatPage(
+                  messages: _chatMessages,
+                  attachmentMap: _chatAttachments,
+                  onSendMessage: _createTempChatMessage,
+                  onClearChat: _clearTempChat,
+                  onSaveMessageAsCard: _saveTempChatMessageAsCard,
+                  onDeleteMessage: _deleteTempChatMessage,
+                ),
+              ),
+            );
+            _setTempChatMode(false);
+          },
           onManageCardsTap: (settingsContext) async {
             await Navigator.of(settingsContext).push<void>(
               MaterialPageRoute<void>(
@@ -2708,6 +2724,7 @@ class _MyHomePageState extends State<MyHomePage>
       'address': _serverAddress,
       'discoveryHint': _discoveryHint,
       'bookmarkAddress': _bookmarkAddress,
+      'tempChatMode': _isTempChatMode,
       'chatMessages': _buildChatSnapshot()['messages'],
     };
   }
@@ -2728,7 +2745,8 @@ class _MyHomePageState extends State<MyHomePage>
     if (normalizedHost == 'localhost' ||
         normalizedHost == '0.0.0.0' ||
         normalizedHost == '::1' ||
-        normalizedHost.startsWith('127.')) {
+        normalizedHost.startsWith('127.') ||
+        !normalizedHost.endsWith('.local')) {
       return;
     }
 
@@ -3451,8 +3469,8 @@ button { cursor: pointer; }
   max-height: calc(1.7em * 5);
   overflow:hidden;
 }
-.card-select { width:18px; height:18px; accent-color: var(--primary); }
-.batch-toolbar { margin: 12px 0 14px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+.card-select, .card-select-label { display:none; }
+.batch-toolbar { display:none; }
 .card-top { display:flex; justify-content:space-between; gap:12px; color: var(--muted); font-size: 12px; }
 .card-text { margin-top: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 15px; max-height: 260px; overflow:auto; }
 .card-text a { color: var(--primary-dark); text-decoration: underline; text-decoration-thickness: 1.5px; text-underline-offset: 2px; }
@@ -3514,7 +3532,15 @@ button { cursor: pointer; }
   background: rgba(255,255,255,.12); color: white;
   font-size: 12px; font-weight: 700;
 }
-.chat-panel { margin-top: 22px; padding: 16px; }
+.chat-panel { display:none; }
+body.temp-chat-mode .hero,
+body.temp-chat-mode .address-panel,
+body.temp-chat-mode .composer,
+body.temp-chat-mode .grid,
+body.temp-chat-mode .section-head,
+body.temp-chat-mode .batch-toolbar,
+body.temp-chat-mode .cards { display:none; }
+body.temp-chat-mode .chat-panel { display:block; }
 .chat-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
 .chat-title { font-family: Manrope, sans-serif; font-size: 22px; font-weight: 800; color: var(--primary-dark); }
 .chat-hint { margin-top: 4px; color: var(--muted); font-size: 13px; line-height:1.5; }
@@ -3565,7 +3591,7 @@ button { cursor: pointer; }
       <span id="discoveryHintText"></span>
     </div>
     <div class="address-hint">
-      <span>如果显示 .local 地址，可以收藏；如果显示 IP 地址，请以手机当前显示为准。</span>
+      <span>优先显示 .local 地址；未发现时使用当前 IP 访问。</span>
       <span style="display:flex;align-items:center;gap:6px;color:rgba(19,83,216,.65);"><span class="material-symbols-outlined" style="font-size:18px;">content_copy</span>点击可复制</span>
     </div>
   </section>
@@ -3664,6 +3690,7 @@ const wsUrl = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + win
 const initialAddress = ${jsonEncode(_serverAddress)};
 const initialDiscoveryHint = ${jsonEncode(_discoveryHint)};
 const initialBookmarkAddress = ${jsonEncode(_bookmarkAddress)};
+const initialTempChatMode = ${jsonEncode(_isTempChatMode)};
 const cardsRoot = document.getElementById('cardsRoot');
 const searchInput = document.getElementById('searchInput');
 const composerInput = document.getElementById('composerInput');
@@ -3704,6 +3731,7 @@ let currentFilteredIds = [];
 addressText.textContent = initialAddress;
 renderBookmarkAddress(initialBookmarkAddress);
 renderDiscoveryHint(initialDiscoveryHint);
+applyTempChatMode(initialTempChatMode);
 
 function showToast(message) {
   toast.textContent = message;
@@ -3720,6 +3748,14 @@ function renderDiscoveryHint(value) {
 function renderBookmarkAddress(value) {
   bookmarkAddressText.style.display = 'none';
   bookmarkAddressText.textContent = '';
+}
+
+function applyTempChatMode(enabled) {
+  document.body.classList.toggle('temp-chat-mode', Boolean(enabled));
+  if (enabled) {
+    renderChat();
+    refreshChat();
+  }
 }
 
 function escapeHtml(value) {
@@ -3907,7 +3943,7 @@ function renderCards() {
 
     return '<article class="panel card ' + (collapsed ? 'collapsed' : '') + '">' +
       '<div class="card-top">' +
-        '<label style="display:flex;align-items:center;gap:8px;"><input class="card-select" type="checkbox" data-action="select-card" data-card-id="' + escapeHtml(card.id) + '" ' + (selected ? 'checked' : '') + '>选择</label>' +
+        '<label class="card-select-label" style="display:flex;align-items:center;gap:8px;"><input class="card-select" type="checkbox" data-action="select-card" data-card-id="' + escapeHtml(card.id) + '" ' + (selected ? 'checked' : '') + '>选择</label>' +
         '<span>' + (card.pinned ? '置顶 · ' : '') + '创建 ' + new Date(card.createdAt).toLocaleString() + '</span>' +
       '</div>' +
       '<div class="card-body">' +
@@ -3920,8 +3956,6 @@ function renderCards() {
       '<div class="card-actions">' +
         '<button class="btn btn-ghost" data-action="toggle-collapse" data-card-id="' + escapeHtml(card.id) + '">' + (collapsed ? '展开' : '折叠') + '</button>' +
         (openUrl ? '<button class="btn btn-soft" data-action="open-card" data-card-url="' + escapeHtml(openUrl) + '">打开</button>' : '') +
-        '<button class="btn btn-ghost" data-action="copy-card" data-card-id="' + escapeHtml(card.id) + '">复制</button>' +
-        '<button class="btn btn-danger" data-action="delete-card" data-card-id="' + escapeHtml(card.id) + '">删除</button>' +
       '</div>' +
     '</article>';
   }).join('');
@@ -4002,9 +4036,11 @@ function connectWs() {
       if (payload.address) addressText.textContent = payload.address;
       renderBookmarkAddress(payload.bookmarkAddress || '');
       renderDiscoveryHint(payload.discoveryHint || '');
+      applyTempChatMode(payload.tempChatMode);
       renderCards();
     } else if (payload.type === 'chatSnapshot') {
       chatMessages = payload.messages || [];
+      applyTempChatMode(payload.tempChatMode);
       renderChat();
     }
   };
@@ -4568,6 +4604,19 @@ connectWs();
                       color: Color(0xFF1143AB),
                     ),
                   ),
+                  if (_ipServerAddress != null &&
+                      _serverAddress != _ipServerAddress) ...[
+                    const SizedBox(height: 6),
+                    SelectableText(
+                      _ipServerAddress!,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        height: 1.25,
+                        fontWeight: FontWeight.w600,
+                        color: Color(0xFF8A93A5),
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 12),
                   Row(
                     children: [
@@ -4773,46 +4822,6 @@ connectWs();
             ),
           ],
         ),
-        if (cards.isNotEmpty) ...[
-          const SizedBox(height: 12),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              _buildCapsuleButton(
-                label: _selectedCardIds.isEmpty ? '进入多选' : '取消多选',
-                icon: _selectedCardIds.isEmpty
-                    ? Icons.checklist_rounded
-                    : Icons.close_rounded,
-                onTap: () {
-                  setState(() {
-                    if (_selectedCardIds.isEmpty) {
-                      _selectedCardIds.add(cards.first.id);
-                    } else {
-                      _selectedCardIds.clear();
-                    }
-                  });
-                },
-                variant: _CapsuleButtonVariant.soft,
-                compact: true,
-              ),
-              _buildCapsuleButton(
-                label: '全选',
-                icon: Icons.select_all_rounded,
-                onTap: () => _selectAllVisibleCards(cards),
-                variant: _CapsuleButtonVariant.ghost,
-                compact: true,
-              ),
-              _buildCapsuleButton(
-                label: '删除 ${_selectedCardIds.length}',
-                icon: Icons.delete_outline,
-                onTap: _selectedCardIds.isEmpty ? null : _deleteSelectedCards,
-                variant: _CapsuleButtonVariant.danger,
-                compact: true,
-              ),
-            ],
-          ),
-        ],
         const SizedBox(height: 16),
         if (cards.isEmpty)
           Container(
@@ -4882,16 +4891,7 @@ connectWs();
         color: Colors.transparent,
         child: InkWell(
           borderRadius: BorderRadius.circular(24),
-          onTap: _selectedCardIds.isNotEmpty
-              ? () => _toggleCardSelection(card)
-              : null,
-          onLongPress: _selectedCardIds.isNotEmpty
-              ? () => _toggleCardSelection(card)
-              : () {
-                  setState(() {
-                    _selectedCardIds.add(card.id);
-                  });
-                },
+          onLongPress: () => _copyCardText(card.text),
           child: Ink(
             decoration: _panelDecoration(radius: 24, shadowOpacity: 0.045),
             padding: const EdgeInsets.all(12),
@@ -4901,14 +4901,6 @@ connectWs();
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    if (_selectedCardIds.isNotEmpty) ...[
-                      Checkbox(
-                        value: _selectedCardIds.contains(card.id),
-                        onChanged: (_) => _toggleCardSelection(card),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                      const SizedBox(width: 4),
-                    ],
                     AnimatedOpacity(
                       opacity: card.isPinned ? 1 : 0,
                       duration: const Duration(milliseconds: 160),
@@ -5067,17 +5059,6 @@ connectWs();
                       ),
                       const SizedBox(width: 8),
                     ],
-                    Expanded(
-                      child: _buildCapsuleButton(
-                        label: '复制',
-                        icon: Icons.copy_rounded,
-                        onTap: () => _copyCardText(card.text),
-                        variant: _CapsuleButtonVariant.soft,
-                        compact: true,
-                        stacked: true,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
                     Expanded(
                       child: _buildCapsuleButton(
                         label: '分享',
@@ -5248,6 +5229,262 @@ connectWs();
   }
 }
 
+class _LocalShareTempChatPage extends StatefulWidget {
+  const _LocalShareTempChatPage({
+    required this.messages,
+    required this.attachmentMap,
+    required this.onSendMessage,
+    required this.onClearChat,
+    required this.onSaveMessageAsCard,
+    required this.onDeleteMessage,
+  });
+
+  final List<TempChatMessage> messages;
+  final Map<String, TempChatAttachment> attachmentMap;
+  final Future<TempChatMessage> Function({
+    required String text,
+    required String sender,
+    List<_IncomingAttachmentPayload>? attachments,
+  }) onSendMessage;
+  final Future<void> Function() onClearChat;
+  final Future<CardItem?> Function(String messageId) onSaveMessageAsCard;
+  final Future<void> Function(String messageId) onDeleteMessage;
+
+  @override
+  State<_LocalShareTempChatPage> createState() =>
+      _LocalShareTempChatPageState();
+}
+
+class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
+  final TextEditingController _controller = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+  Timer? _refreshTimer;
+  bool _sending = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) {
+        setState(() {});
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    _controller.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  List<TempChatAttachment> _attachmentsOf(TempChatMessage message) {
+    return message.attachmentIds
+        .map((id) => widget.attachmentMap[id])
+        .whereType<TempChatAttachment>()
+        .toList();
+  }
+
+  Future<void> _send() async {
+    final text = _controller.text.trim();
+    if (text.isEmpty || _sending) {
+      return;
+    }
+    setState(() {
+      _sending = true;
+    });
+    try {
+      await widget.onSendMessage(text: text, sender: 'phone');
+      _controller.clear();
+      if (mounted) {
+        setState(() {});
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_scrollController.hasClients) {
+          _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+        }
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _sending = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _clearChat() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('清空临时对话'),
+        content: const Text('这会清空所有临时消息和临时附件，确认继续吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFBA1A1A),
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) {
+      return;
+    }
+    await widget.onClearChat();
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final messages = widget.messages;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('临时聊天模式'),
+        actions: [
+          TextButton(
+            onPressed: messages.isEmpty ? null : _clearChat,
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: messages.isEmpty
+                ? const Center(child: Text('暂无临时消息'))
+                : ListView.separated(
+                    controller: _scrollController,
+                    padding: const EdgeInsets.all(16),
+                    itemCount: messages.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 10),
+                    itemBuilder: (context, index) {
+                      final message = messages[index];
+                      final attachments = _attachmentsOf(message);
+                      final isPhone = message.sender == 'phone';
+                      return Align(
+                        alignment: isPhone
+                            ? Alignment.centerRight
+                            : Alignment.centerLeft,
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 320),
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: isPhone
+                                  ? const Color(0xFFDDF6D1)
+                                  : Colors.white,
+                              borderRadius: BorderRadius.circular(18),
+                              border: Border.all(
+                                color: const Color(0xFFE2E7F1),
+                              ),
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.all(12),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    message.text.isEmpty
+                                        ? '附件消息'
+                                        : message.text,
+                                    style: const TextStyle(height: 1.45),
+                                  ),
+                                  if (attachments.isNotEmpty) ...[
+                                    const SizedBox(height: 8),
+                                    Text(
+                                      '${attachments.length} 个附件',
+                                      style: const TextStyle(
+                                        color: Color(0xFF6E7788),
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  ],
+                                  const SizedBox(height: 8),
+                                  Wrap(
+                                    spacing: 8,
+                                    runSpacing: 4,
+                                    children: [
+                                      TextButton(
+                                        onPressed: () async {
+                                          final messenger =
+                                              ScaffoldMessenger.of(context);
+                                          await widget.onSaveMessageAsCard(
+                                            message.id,
+                                          );
+                                          if (mounted) {
+                                            messenger.showSnackBar(
+                                              const SnackBar(
+                                                content: Text('已存为卡片'),
+                                              ),
+                                            );
+                                          }
+                                        },
+                                        child: const Text('存为卡片'),
+                                      ),
+                                      TextButton(
+                                        onPressed: () async {
+                                          await widget.onDeleteMessage(
+                                            message.id,
+                                          );
+                                          if (mounted) {
+                                            setState(() {});
+                                          }
+                                        },
+                                        child: const Text('删除'),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _controller,
+                      minLines: 1,
+                      maxLines: 4,
+                      decoration: const InputDecoration(
+                        hintText: '输入临时消息',
+                      ),
+                      onSubmitted: (_) => _send(),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton(
+                    onPressed: _sending ? null : _send,
+                    child: const Text('发送'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class LocalShareSettingsPage extends StatefulWidget {
   const LocalShareSettingsPage({
     super.key,
@@ -5256,6 +5493,7 @@ class LocalShareSettingsPage extends StatefulWidget {
     required this.initialConfirmDelete,
     required this.onImportTap,
     required this.onExportTap,
+    required this.onTempChatTap,
     required this.onManageCardsTap,
   });
 
@@ -5264,6 +5502,7 @@ class LocalShareSettingsPage extends StatefulWidget {
   final bool initialConfirmDelete;
   final Future<void> Function() onImportTap;
   final Future<void> Function() onExportTap;
+  final Future<void> Function(BuildContext context) onTempChatTap;
   final Future<void> Function(BuildContext context) onManageCardsTap;
 
   @override
@@ -5385,6 +5624,21 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
                   ),
                 ),
                 const SizedBox(height: 14),
+                OutlinedButton.icon(
+                  onPressed: () => widget.onTempChatTap(context),
+                  icon: const Icon(Icons.chat_bubble_outline_rounded),
+                  label: const Text(
+                    '临时聊天模式',
+                    style: TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size.fromHeight(48),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
                 OutlinedButton.icon(
                   onPressed: () => widget.onManageCardsTap(context),
                   icon: const Icon(Icons.rule_folder_outlined),
