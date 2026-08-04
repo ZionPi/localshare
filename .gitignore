@@ -65,3 +65,6 @@ ios/Flutter/flutter_export_environment.sh
 
 # Local screenshots
 /flutter_*.png
+# Private local build config
+localshare.local.mk
+*.local.mk

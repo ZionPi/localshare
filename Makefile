@@ -13,6 +13,8 @@ RESOLVED_DEVICE := $(if $(DEVICE),$(DEVICE),$(SELECTED_DEVICE))
 ADB_TARGET := $(if $(RESOLVED_DEVICE),-s $(RESOLVED_DEVICE),)
 DEBUG_APK := build/app/outputs/flutter-apk/app-debug.apk
 RELEASE_APK := build/app/outputs/flutter-apk/app-release.apk
+FLUTTER_BUILD_ARGS ?=
+-include localshare.local.mk
 
 .PHONY: help deps devices doctor apk release-apk install install-release install-apk install-release-apk run restart logs uninstall clean
 
@@ -51,10 +53,10 @@ doctor:
 	$(FLUTTER) doctor -v
 
 apk:
-	$(FLUTTER) build apk --debug
+	@$(FLUTTER) build apk --debug $(FLUTTER_BUILD_ARGS)
 
 release-apk:
-	$(FLUTTER) build apk --release
+	@$(FLUTTER) build apk --release $(FLUTTER_BUILD_ARGS)
 
 install: apk
 	@test -n "$(RESOLVED_DEVICE)" || (echo "未找到可安装的 Android 设备" && exit 1)

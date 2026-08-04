@@ -249,6 +249,7 @@ class CardItem {
     required this.createdAt,
     required this.updatedAt,
     this.pinnedAt,
+    this.archivedAt,
     this.source = 'local',
     List<String>? attachmentIds,
   }) : attachmentIds = attachmentIds ?? <String>[];
@@ -258,10 +259,12 @@ class CardItem {
   final DateTime createdAt;
   DateTime updatedAt;
   DateTime? pinnedAt;
+  DateTime? archivedAt;
   String source;
   final List<String> attachmentIds;
 
   bool get isPinned => pinnedAt != null;
+  bool get isArchived => archivedAt != null;
 
   Map<String, dynamic> toJson() {
     return {
@@ -270,6 +273,7 @@ class CardItem {
       'createdAt': createdAt.toIso8601String(),
       'updatedAt': updatedAt.toIso8601String(),
       'pinnedAt': pinnedAt?.toIso8601String(),
+      'archivedAt': archivedAt?.toIso8601String(),
       'source': source,
       'attachmentIds': attachmentIds,
     };
@@ -287,7 +291,9 @@ class CardItem {
       'createdAt': createdAt.toIso8601String(),
       'updatedAt': updatedAt.toIso8601String(),
       'pinnedAt': pinnedAt?.toIso8601String(),
+      'archivedAt': archivedAt?.toIso8601String(),
       'source': source,
+      'archived': isArchived,
       'pinned': isPinned,
       'attachments': attachments,
       'bundleDownloadUrl': attachments.isEmpty ? null : '/cards/$id/bundle',
@@ -303,6 +309,7 @@ class CardItem {
       updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ??
           DateTime.now(),
       pinnedAt: DateTime.tryParse(json['pinnedAt'] as String? ?? ''),
+      archivedAt: DateTime.tryParse(json['archivedAt'] as String? ?? ''),
       source: json['source'] as String? ?? 'local',
       attachmentIds: (json['attachmentIds'] as List<dynamic>? ?? <dynamic>[])
           .map((value) => value as String)
@@ -672,6 +679,13 @@ class _MyHomePageState extends State<MyHomePage>
   static const String _preferredPortKey = 'preferred_server_port';
   static const String _useFixedPortKey = 'use_fixed_server_port';
   static const String _confirmDeleteKey = 'confirm_delete_before_remove';
+  static const String _clipboardToTempChatKey = 'clipboard_to_temp_chat';
+  static const String _clipboardToTempChatAutoEnabledKey =
+      'clipboard_to_temp_chat_auto_enabled_v1';
+  static const String _wechatArticleApiBaseUrl = String.fromEnvironment(
+    'WECHAT_ARTICLE_API_BASE_URL',
+    defaultValue: '',
+  );
   static const int _defaultServerPort = 35773;
   static const int _maxPinnedCards = 5;
 
@@ -697,6 +711,7 @@ class _MyHomePageState extends State<MyHomePage>
   Timer? _saveDebounceTimer;
   Timer? _broadcastDebounceTimer;
   Timer? _stateRefreshTimer;
+  Timer? _clipboardMonitorTimer;
   late final AnimationController _addressGlowController;
 
   String _serverAddress = '服务启动中';
@@ -715,7 +730,14 @@ class _MyHomePageState extends State<MyHomePage>
   bool _isLoading = true;
   DateTime? _lastStateSyncAt;
   bool _backgroundExecutionReady = false;
+  bool _autoStartWhenWifiAvailable = true;
+  bool _isAutoStartingServer = false;
+  bool _clipboardToTempChatEnabled = false;
   bool _isTempChatMode = false;
+  bool _hasUnreadTempChat = false;
+  String? _lastCapturedClipboardFingerprint;
+  String? _lastLocalShareCopiedText;
+  final Set<String> _pendingWeChatFetchUrls = <String>{};
 
   @override
   void initState() {
@@ -753,6 +775,7 @@ class _MyHomePageState extends State<MyHomePage>
       await _initializeBackgroundExecution();
       await _startServer();
       _startStateRefreshLoop();
+      _syncClipboardMonitor();
     } catch (error) {
       _showToast('初始化失败: $error');
     } finally {
@@ -768,6 +791,12 @@ class _MyHomePageState extends State<MyHomePage>
     final prefs = await SharedPreferences.getInstance();
     _useFixedPort = prefs.getBool(_useFixedPortKey) ?? true;
     _confirmDelete = prefs.getBool(_confirmDeleteKey) ?? true;
+    if (prefs.getBool(_clipboardToTempChatAutoEnabledKey) != true) {
+      await prefs.setBool(_clipboardToTempChatKey, true);
+      await prefs.setBool(_clipboardToTempChatAutoEnabledKey, true);
+    }
+    _clipboardToTempChatEnabled =
+        prefs.getBool(_clipboardToTempChatKey) ?? true;
     final savedPort = prefs.getInt(_preferredPortKey);
     if (savedPort != null && savedPort >= 1 && savedPort <= 65535) {
       _preferredPort = savedPort;
@@ -778,14 +807,18 @@ class _MyHomePageState extends State<MyHomePage>
     required bool useFixedPort,
     required int port,
     required bool confirmDelete,
+    required bool clipboardToTempChat,
   }) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_useFixedPortKey, useFixedPort);
     await prefs.setInt(_preferredPortKey, port);
     await prefs.setBool(_confirmDeleteKey, confirmDelete);
+    await prefs.setBool(_clipboardToTempChatKey, clipboardToTempChat);
     _useFixedPort = useFixedPort;
     _preferredPort = port;
     _confirmDelete = confirmDelete;
+    _clipboardToTempChatEnabled = clipboardToTempChat;
+    _syncClipboardMonitor();
   }
 
   @override
@@ -799,6 +832,7 @@ class _MyHomePageState extends State<MyHomePage>
     _saveDebounceTimer?.cancel();
     _broadcastDebounceTimer?.cancel();
     _stateRefreshTimer?.cancel();
+    _clipboardMonitorTimer?.cancel();
     _intentDataStreamSubscription?.cancel();
     super.dispose();
   }
@@ -819,6 +853,9 @@ class _MyHomePageState extends State<MyHomePage>
   List<CardItem> get _sortedCards {
     final query = _searchController.text.trim().toLowerCase();
     final items = _cards.where((card) {
+      if (card.isArchived) {
+        return false;
+      }
       if (query.isEmpty) {
         return true;
       }
@@ -945,6 +982,7 @@ class _MyHomePageState extends State<MyHomePage>
       'messages': _chatMessages
           .map((message) => message.toPublicJson(_chatAttachments))
           .toList(),
+      'wechatFetchingCount': _pendingWeChatFetchUrls.length,
       'serverTime': DateTime.now().toIso8601String(),
     };
   }
@@ -1010,6 +1048,12 @@ class _MyHomePageState extends State<MyHomePage>
       await _deleteTempChatMessage(_chatMessages.first.id, persist: false);
     }
     await _persistTempChatState();
+    if (!_isTempChatMode) {
+      _hasUnreadTempChat = true;
+      if (mounted) {
+        setState(() {});
+      }
+    }
     _broadcastChatSnapshot();
     return message;
   }
@@ -1098,9 +1142,205 @@ class _MyHomePageState extends State<MyHomePage>
       const Duration(seconds: 2),
       (_) {
         unawaited(_refreshStateFromStorageIfChanged());
-        unawaited(_refreshLocalNetworkAddress());
+        unawaited(_refreshNetworkServerState());
       },
     );
+  }
+
+  void _syncClipboardMonitor() {
+    _clipboardMonitorTimer?.cancel();
+    _clipboardMonitorTimer = null;
+    if (!Platform.isAndroid ||
+        !_clipboardToTempChatEnabled ||
+        !_isServerRunning) {
+      return;
+    }
+    _clipboardMonitorTimer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => unawaited(_pollClipboardToTempChat()),
+    );
+    unawaited(_pollClipboardToTempChat());
+  }
+
+  Future<void> _pollClipboardToTempChat() async {
+    if (!Platform.isAndroid ||
+        !_clipboardToTempChatEnabled ||
+        !_isServerRunning ||
+        _storage == null) {
+      return;
+    }
+    try {
+      final payload = await _clipboardChannel
+          .invokeMapMethod<String, dynamic>('readClipboardPayload');
+      if (payload == null || payload['type'] != 'text') {
+        return;
+      }
+      final text = (payload['text'] as String? ?? '').trim();
+      final timestamp = payload['timestamp']?.toString() ?? '';
+      final hasNativeTimestamp = timestamp.isNotEmpty && timestamp != '0';
+      final fingerprint =
+          hasNativeTimestamp ? 'text:$timestamp:$text' : 'text:$text';
+      if (!_shouldCaptureClipboardText(text, fingerprint, hasNativeTimestamp)) {
+        return;
+      }
+      _lastCapturedClipboardFingerprint = fingerprint;
+      await _createTempChatMessage(text: text, sender: '手机剪贴板');
+
+      final wechatUrl = _extractWeChatArticleUrl(text);
+      if (wechatUrl != null) {
+        unawaited(_fetchWeChatArticleToTempChat(wechatUrl));
+      }
+    } catch (error) {
+      debugPrint('clipboard monitor failed: $error');
+    }
+  }
+
+  bool _shouldCaptureClipboardText(
+    String text,
+    String fingerprint,
+    bool hasNativeTimestamp,
+  ) {
+    final value = text.trim();
+    if (value.length < 3) {
+      return false;
+    }
+    if (fingerprint == _lastCapturedClipboardFingerprint ||
+        value == _lastLocalShareCopiedText) {
+      return false;
+    }
+    if (!hasNativeTimestamp &&
+        _chatMessages.isNotEmpty &&
+        _chatMessages.last.text.trim() == value) {
+      return false;
+    }
+    if (_extractWeChatArticleUrl(value) != null) {
+      return true;
+    }
+    if (_looksLikeSensitiveClipboard(value)) {
+      return false;
+    }
+    return true;
+  }
+
+  bool _looksLikeSensitiveClipboard(String text) {
+    final value = text.trim();
+    if (RegExp(r'^\d{4,8}$').hasMatch(value)) {
+      return true;
+    }
+    if (value.length <= 64 &&
+        RegExp(r'^[A-Za-z0-9_\-!@#$%^&*+=.]{8,}$').hasMatch(value) &&
+        !value.contains(' ')) {
+      return true;
+    }
+    return false;
+  }
+
+  String? _extractWeChatArticleUrl(String text) {
+    final matches = RegExp(r'https?://[^\s<>()]+').allMatches(text);
+    for (final match in matches) {
+      final candidate = (match.group(0) ?? '').replaceFirst(
+        RegExp(r'[\]\)\}\.,;:!?]+$'),
+        '',
+      );
+      final uri = Uri.tryParse(candidate);
+      if (uri == null) {
+        continue;
+      }
+      if (uri.scheme != 'http' && uri.scheme != 'https') {
+        continue;
+      }
+      if (uri.host.toLowerCase() != 'mp.weixin.qq.com') {
+        continue;
+      }
+      if (uri.path == '/s' || uri.path.startsWith('/s/')) {
+        return uri.toString();
+      }
+    }
+    return null;
+  }
+
+  Future<void> _fetchWeChatArticleToTempChat(String url) async {
+    if (_wechatArticleApiBaseUrl.trim().isEmpty) {
+      return;
+    }
+    if (!_pendingWeChatFetchUrls.add(url)) {
+      return;
+    }
+    _broadcastChatSnapshot();
+    if (mounted) {
+      setState(() {});
+    }
+    try {
+      final article = await _fetchWeChatArticle(url);
+      final title = article.title.trim();
+      final content = article.content.trim();
+      final text = title.isEmpty ? content : '$title\n\n$content';
+      if (text.trim().isEmpty) {
+        return;
+      }
+      if (_chatMessages.any((message) => message.text.trim() == text.trim())) {
+        return;
+      }
+      await _createTempChatMessage(text: text, sender: '微信公众号');
+    } catch (error) {
+      debugPrint('wechat article fetch failed: $error');
+      await _createTempChatMessage(
+        text: '微信公众号文章抓取失败：$url\n$error',
+        sender: '微信公众号',
+      );
+    } finally {
+      _pendingWeChatFetchUrls.remove(url);
+      _broadcastChatSnapshot();
+      if (mounted) {
+        setState(() {});
+      }
+    }
+  }
+
+  Future<_WeChatArticleResult> _fetchWeChatArticle(String url) async {
+    final client = HttpClient();
+    try {
+      client.connectionTimeout = const Duration(seconds: 10);
+      final request = await client.postUrl(
+        Uri.parse('$_wechatArticleApiBaseUrl/api/wechat/article'),
+      );
+      request.headers.contentType = ContentType.json;
+      request.write(jsonEncode({'url': url}));
+      final response = await request.close().timeout(
+            const Duration(seconds: 25),
+          );
+      final body = await utf8.decoder.bind(response).join();
+      final decoded = jsonDecode(body) as Map<String, dynamic>;
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        final message = decoded['error']?.toString() ?? '抓取失败';
+        throw StateError(message);
+      }
+      return _WeChatArticleResult.fromJson(decoded);
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _refreshNetworkServerState() async {
+    if (!_isServerRunning) {
+      if (_autoStartWhenWifiAvailable && !_isAutoStartingServer) {
+        final ipAddress = await _getLocalIpAddress();
+        if (ipAddress != null) {
+          _isAutoStartingServer = true;
+          try {
+            await _startServer(showWifiWarning: false);
+            if (_isServerRunning) {
+              _showToast('已连接 Wi‑Fi，服务已启动：$_serverAddress');
+            }
+          } finally {
+            _isAutoStartingServer = false;
+          }
+        }
+      }
+      return;
+    }
+
+    await _refreshLocalNetworkAddress();
   }
 
   Future<void> _refreshLocalNetworkAddress() async {
@@ -1108,7 +1348,22 @@ class _MyHomePageState extends State<MyHomePage>
       return;
     }
     final ipAddress = await _getLocalIpAddress();
-    if (ipAddress == null || ipAddress == _publicHost) {
+    if (ipAddress == null) {
+      await _stopServer();
+      _autoStartWhenWifiAvailable = true;
+      if (mounted) {
+        setState(() {
+          _serverAddress = '未连接 Wi‑Fi，服务已暂停';
+          _ipServerAddress = null;
+        });
+      } else {
+        _serverAddress = '未连接 Wi‑Fi，服务已暂停';
+        _ipServerAddress = null;
+      }
+      _showToast('当前不是 Wi‑Fi 网络，服务已暂停；连接 Wi‑Fi 后会自动启动');
+      return;
+    }
+    if (ipAddress == _publicHost) {
       return;
     }
     _publicHost = ipAddress;
@@ -1411,6 +1666,43 @@ class _MyHomePageState extends State<MyHomePage>
     await _deleteCard(card.id);
   }
 
+  Future<void> _archiveCard(CardItem card) async {
+    if (card.isArchived) {
+      return;
+    }
+    card.archivedAt = DateTime.now();
+    card.pinnedAt = null;
+    card.updatedAt = DateTime.now();
+    _selectedCardIds.remove(card.id);
+    await _persistStateNow();
+    _broadcastSnapshot();
+    if (mounted) {
+      setState(() {});
+    }
+    _showToast('卡片已归档');
+  }
+
+  Future<int> _restoreCardsByIds(Iterable<String> cardIds) async {
+    final ids = cardIds.toSet();
+    var restored = 0;
+    for (final card in _cards) {
+      if (!ids.contains(card.id) || !card.isArchived) {
+        continue;
+      }
+      card.archivedAt = null;
+      card.updatedAt = DateTime.now();
+      restored += 1;
+    }
+    if (restored > 0) {
+      await _persistStateNow();
+      _broadcastSnapshot();
+      if (mounted) {
+        setState(() {});
+      }
+    }
+    return restored;
+  }
+
   Future<int> _deleteCardsByIds(Iterable<String> cardIds) async {
     final ids = cardIds.toSet().toList();
     var deleted = 0;
@@ -1659,6 +1951,8 @@ class _MyHomePageState extends State<MyHomePage>
             createdAt: card.createdAt,
             updatedAt: card.updatedAt,
             pinnedAt: card.pinnedAt,
+            archivedAt: card.archivedAt,
+            source: card.source,
             attachmentIds: List<String>.from(card.attachmentIds),
           ),
         )
@@ -1719,7 +2013,14 @@ class _MyHomePageState extends State<MyHomePage>
 
   Future<void> _copyCardText(String text) async {
     await Clipboard.setData(ClipboardData(text: text));
+    _lastLocalShareCopiedText = text.trim();
     _showToast(text.trim().isEmpty ? '空卡片已复制' : '卡片内容已复制');
+  }
+
+  Future<void> _copyTempChatText(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    _lastLocalShareCopiedText = text.trim();
+    _showToast(text.trim().isEmpty ? '空消息已复制' : '临时消息已复制');
   }
 
   Future<void> _openCardEditor(CardItem card) async {
@@ -1761,11 +2062,6 @@ class _MyHomePageState extends State<MyHomePage>
     if (!launched) {
       _showToast('无法打开该链接');
     }
-  }
-
-  Future<void> _copyUrl(String url) async {
-    await Clipboard.setData(ClipboardData(text: url));
-    _showToast('链接已复制');
   }
 
   Future<void> _shareCard(CardItem card) async {
@@ -1962,6 +2258,30 @@ class _MyHomePageState extends State<MyHomePage>
     }
   }
 
+  Future<void> _openTempChatPage(BuildContext context) async {
+    _setTempChatMode(true);
+    if (mounted) {
+      setState(() {
+        _hasUnreadTempChat = false;
+      });
+    }
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => _LocalShareTempChatPage(
+          messages: _chatMessages,
+          attachmentMap: _chatAttachments,
+          onSendMessage: _createTempChatMessage,
+          onClearChat: _clearTempChat,
+          onSaveMessageAsCard: _saveTempChatMessageAsCard,
+          onDeleteMessage: _deleteTempChatMessage,
+          onCopyMessageText: _copyTempChatText,
+          isFetchingWeChatArticle: () => _pendingWeChatFetchUrls.isNotEmpty,
+        ),
+      ),
+    );
+    _setTempChatMode(false);
+  }
+
   Future<void> _openSettings() async {
     final nextSettings = await Navigator.of(context).push<_PortSettingsResult>(
       MaterialPageRoute<_PortSettingsResult>(
@@ -1969,31 +2289,33 @@ class _MyHomePageState extends State<MyHomePage>
           initialUseFixedPort: _useFixedPort,
           initialPort: _preferredPort,
           initialConfirmDelete: _confirmDelete,
+          initialClipboardToTempChat: _clipboardToTempChatEnabled,
           onImportTap: _importAllCards,
           onExportTap: _exportAllCards,
-          onTempChatTap: (settingsContext) async {
-            _setTempChatMode(true);
-            await Navigator.of(settingsContext).push<void>(
-              MaterialPageRoute<void>(
-                builder: (_) => _LocalShareTempChatPage(
-                  messages: _chatMessages,
-                  attachmentMap: _chatAttachments,
-                  onSendMessage: _createTempChatMessage,
-                  onClearChat: _clearTempChat,
-                  onSaveMessageAsCard: _saveTempChatMessageAsCard,
-                  onDeleteMessage: _deleteTempChatMessage,
-                ),
-              ),
-            );
-            _setTempChatMode(false);
-          },
+          onTempChatTap: _openTempChatPage,
           onManageCardsTap: (settingsContext) async {
             await Navigator.of(settingsContext).push<void>(
               MaterialPageRoute<void>(
                 builder: (_) => LocalShareCardManagePage(
-                  cards: _sortCards(_cards),
+                  title: '卡片管理',
+                  emptyText: '没有匹配的卡片',
+                  cards: _sortCards(_cards.where((card) => !card.isArchived)),
                   attachmentMap: _attachments,
                   onDeleteCards: _deleteCardsByIds,
+                ),
+              ),
+            );
+          },
+          onArchivedCardsTap: (settingsContext) async {
+            await Navigator.of(settingsContext).push<void>(
+              MaterialPageRoute<void>(
+                builder: (_) => LocalShareCardManagePage(
+                  title: '归档卡片',
+                  emptyText: '没有归档卡片',
+                  cards: _sortCards(_cards.where((card) => card.isArchived)),
+                  attachmentMap: _attachments,
+                  onDeleteCards: _deleteCardsByIds,
+                  onRestoreCards: _restoreCardsByIds,
                 ),
               ),
             );
@@ -2005,6 +2327,7 @@ class _MyHomePageState extends State<MyHomePage>
         (nextSettings.port == _preferredPort &&
             nextSettings.useFixedPort == _useFixedPort &&
             nextSettings.confirmDelete == _confirmDelete &&
+            nextSettings.clipboardToTempChat == _clipboardToTempChatEnabled &&
             !nextSettings.clearAllCards)) {
       return;
     }
@@ -2012,6 +2335,7 @@ class _MyHomePageState extends State<MyHomePage>
       useFixedPort: nextSettings.useFixedPort,
       port: nextSettings.port,
       confirmDelete: nextSettings.confirmDelete,
+      clipboardToTempChat: nextSettings.clipboardToTempChat,
     );
     if (nextSettings.clearAllCards) {
       await _clearAllCards();
@@ -2563,7 +2887,7 @@ class _MyHomePageState extends State<MyHomePage>
     );
   }
 
-  Future<void> _startServer() async {
+  Future<void> _startServer({bool showWifiWarning = true}) async {
     if (_isServerRunning) {
       return;
     }
@@ -2572,10 +2896,15 @@ class _MyHomePageState extends State<MyHomePage>
       await _requestNotificationPermission();
       final ipAddress = await _getLocalIpAddress();
       if (ipAddress == null) {
+        _autoStartWhenWifiAvailable = true;
         setState(() {
-          _serverAddress = '未连接局域网，服务不可用';
+          _serverAddress = '未连接 Wi‑Fi，服务未启动';
+          _ipServerAddress = null;
           _isServerRunning = false;
         });
+        if (showWifiWarning) {
+          _showToast('当前不是 Wi‑Fi 网络，服务未启动；连接 Wi‑Fi 后会自动启动');
+        }
         return;
       }
 
@@ -2638,11 +2967,13 @@ class _MyHomePageState extends State<MyHomePage>
           _bookmarkAddress = null;
           _hasObservedWebAddress = false;
           _isServerRunning = true;
+          _autoStartWhenWifiAvailable = true;
         });
       }
       await _syncForegroundService();
       await _enableBackgroundExecution();
       await _syncDiscoveryService();
+      _syncClipboardMonitor();
     } on SocketException catch (error) {
       final addressInUse = error.osError?.errorCode == 48 ||
           error.osError?.errorCode == 98 ||
@@ -2669,6 +3000,8 @@ class _MyHomePageState extends State<MyHomePage>
     if (!_isServerRunning) {
       return;
     }
+    _clipboardMonitorTimer?.cancel();
+    _clipboardMonitorTimer = null;
     for (final client in _webSocketClients) {
       client.sink.close();
     }
@@ -2698,6 +3031,9 @@ class _MyHomePageState extends State<MyHomePage>
         return ip;
       }
     } catch (_) {}
+    if (Platform.isAndroid) {
+      return null;
+    }
     try {
       final interfaces = await NetworkInterface.list(
         includeLoopback: false,
@@ -2715,7 +3051,7 @@ class _MyHomePageState extends State<MyHomePage>
   }
 
   Map<String, dynamic> _buildSnapshot() {
-    final cards = _sortCards(_cards)
+    final cards = _sortCards(_cards.where((card) => !card.isArchived))
         .map((card) => card.toPublicJson(_attachments))
         .toList();
     return {
@@ -3470,9 +3806,14 @@ button { cursor: pointer; }
   max-height: calc(1.7em * 5);
   overflow:hidden;
 }
-.card-select, .card-select-label { display:none; }
 .batch-toolbar { display:none; }
-.card-top { display:flex; justify-content:space-between; gap:12px; color: var(--muted); font-size: 12px; }
+.card-top { display:flex; align-items:center; justify-content:space-between; gap:12px; color: var(--muted); font-size: 12px; }
+.card-copy-button {
+  width: 30px; height: 30px; border:0; border-radius:999px;
+  display:grid; place-items:center; color:#5f6f89;
+  background: rgba(19,83,216,.07);
+}
+.card-copy-button .material-symbols-outlined { font-size: 17px; }
 .card-text { margin-top: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 15px; max-height: 260px; overflow:auto; }
 .card-text a { color: var(--primary-dark); text-decoration: underline; text-decoration-thickness: 1.5px; text-underline-offset: 2px; }
 .attachment-list { display:grid; gap: 10px; margin-top: 14px; }
@@ -3546,10 +3887,20 @@ body.temp-chat-mode .chat-panel { display:block; }
 .chat-title { font-family: Manrope, sans-serif; font-size: 22px; font-weight: 800; color: var(--primary-dark); }
 .chat-hint { margin-top: 4px; color: var(--muted); font-size: 13px; line-height:1.5; }
 .chat-window { margin-top: 14px; min-height: 260px; max-height: 460px; overflow:auto; padding: 14px; border-radius: 22px; background: #eef3fb; display:flex; flex-direction:column; gap:10px; }
-.chat-bubble { max-width: min(78%, 680px); padding: 10px 12px; border-radius: 18px; background: white; box-shadow: 0 8px 22px rgba(19,83,216,.07); }
+.chat-bubble { position:relative; max-width: min(78%, 680px); padding: 12px 42px 12px 12px; border-radius: 20px; background: white; box-shadow: 0 10px 26px rgba(19,83,216,.08); animation: bubbleIn .18s ease-out; }
 .chat-bubble.me { align-self:flex-end; background:#d8f8c6; }
-.chat-meta { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--muted); font-size:11px; margin-bottom:6px; }
-.chat-text { white-space:pre-wrap; word-break:break-word; line-height:1.55; }
+.chat-copy-button { position:absolute; top:9px; right:9px; width:26px; height:26px; border:0; border-radius:999px; background:rgba(19,83,216,.09); color:var(--primary); display:flex; align-items:center; justify-content:center; cursor:pointer; }
+.chat-copy-button .material-symbols-outlined { font-size:16px; }
+.chat-meta { display:flex; align-items:center; gap:6px; color:var(--muted); font-size:11px; margin-bottom:8px; flex-wrap:wrap; }
+.chat-chip { display:inline-flex; align-items:center; gap:4px; padding:4px 8px; border-radius:999px; background:#f3f6fb; color:#6e7788; font-size:11px; font-weight:800; border:0; cursor:default; }
+.chat-chip.primary { background:#eaf1ff; color:var(--primary); }
+.chat-actions .chat-chip { cursor:pointer; }
+.chat-fetching { align-self:flex-start; display:flex; align-items:center; gap:10px; padding:12px 14px; border-radius:18px; background:white; color:var(--primary); font-weight:800; box-shadow:0 10px 26px rgba(19,83,216,.08); animation:pulseFetch 1s ease-in-out infinite alternate; }
+.chat-spinner { width:16px; height:16px; border-radius:999px; border:2px solid rgba(19,83,216,.18); border-top-color:var(--primary); animation:spin .8s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+@keyframes pulseFetch { from { opacity:.62; transform:translateY(1px); } to { opacity:1; transform:translateY(0); } }
+@keyframes bubbleIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+.chat-text { white-space:pre-wrap; word-break:break-word; line-height:1.6; }
 .chat-attachments { display:grid; gap:8px; margin-top:8px; }
 .chat-file { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 10px; border-radius:12px; background:rgba(255,255,255,.65); border:1px solid rgba(216,222,232,.8); }
 .chat-input-row { margin-top: 12px; display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; }
@@ -3720,6 +4071,7 @@ const imageViewerHint = document.getElementById('imageViewerHint');
 let cards = [];
 let pendingFiles = [];
 let chatMessages = [];
+let chatFetchingCount = 0;
 let chatPendingFiles = [];
 const clientId = 'web-' + Math.random().toString(36).slice(2, 8);
 let socket;
@@ -3827,11 +4179,15 @@ function renderChatPickedFiles() {
 }
 
 function renderChat() {
-  if (!chatMessages.length) {
+  if (!chatMessages.length && !chatFetchingCount) {
     chatWindow.innerHTML = '<div class="empty">暂无临时消息。这里适合临时传命令、日志、截图和调试文件。</div>';
     return;
   }
-  chatWindow.innerHTML = chatMessages.map(message => {
+  const fetchingHtml = chatFetchingCount
+    ? '<div class="chat-fetching"><span class="chat-spinner"></span><span>正在抓取公众号文章…</span></div>'
+    : '';
+  const orderedMessages = [...chatMessages].reverse();
+  chatWindow.innerHTML = fetchingHtml + orderedMessages.map(message => {
     const mine = String(message.sender || '') === clientId;
     const attachments = (message.attachments || []).map(file => {
       const preview = file.previewable && file.kind === 'image'
@@ -3840,23 +4196,24 @@ function renderChat() {
       return '<div class="chat-file"><span>' + escapeHtml(file.name) + ' · ' + formatBytes(file.size || 0) + '</span><a class="action-link" href="' + file.downloadUrl + '" download>下载</a></div>' + preview;
     }).join('');
     return '<div class="chat-bubble ' + (mine ? 'me' : '') + '">' +
-      '<div class="chat-meta"><span>' + (mine ? '我' : escapeHtml(message.sender || '对方')) + '</span><span>' + new Date(message.createdAt).toLocaleTimeString() + '</span></div>' +
+      '<button class="chat-copy-button" data-action="copy-chat" data-message-id="' + escapeHtml(message.id) + '" title="复制"><span class="material-symbols-outlined">content_copy</span></button>' +
+      '<div class="chat-meta"><span class="chat-chip primary">' + (mine ? '我' : escapeHtml(message.sender || '对方')) + '</span><span class="chat-chip">' + new Date(message.createdAt).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) + '</span></div>' +
       (message.text ? '<div class="chat-text">' + renderCardText(message.text || '') + '</div>' : '') +
       (attachments ? '<div class="chat-attachments">' + attachments + '</div>' : '') +
       '<div class="chat-actions">' +
-        '<button class="btn btn-soft" data-action="save-chat-card" data-message-id="' + escapeHtml(message.id) + '">存为卡片</button>' +
-        '<button class="btn btn-ghost" data-action="copy-chat" data-message-id="' + escapeHtml(message.id) + '">复制</button>' +
-        '<button class="btn btn-danger" data-action="delete-chat" data-message-id="' + escapeHtml(message.id) + '">删除</button>' +
+        '<button class="chat-chip primary" data-action="save-chat-card" data-message-id="' + escapeHtml(message.id) + '">存为卡片</button>' +
+        '<button class="chat-chip" data-action="delete-chat" data-message-id="' + escapeHtml(message.id) + '">删除</button>' +
       '</div>' +
     '</div>';
   }).join('');
-  chatWindow.scrollTop = chatWindow.scrollHeight;
+  chatWindow.scrollTop = 0;
 }
 
 async function refreshChat() {
   const response = await fetch('/api/chat');
   const payload = await response.json();
   chatMessages = payload.messages || [];
+  chatFetchingCount = payload.wechatFetchingCount || 0;
   renderChat();
 }
 
@@ -3915,7 +4272,6 @@ function renderCards() {
     const bundleUrl = card.bundleDownloadUrl || '';
     const imageFiles = (card.attachments || []).filter(file => file.kind === 'image');
     const collapsed = !expandedCardIds.has(card.id);
-    const selected = selectedCardIds.has(card.id);
     const attachments = (card.attachments || []).map(file => {
       let preview = '';
       if (file.previewable && file.kind === 'image') {
@@ -3943,7 +4299,7 @@ function renderCards() {
 
     return '<article class="panel card ' + (collapsed ? 'collapsed' : '') + '">' +
       '<div class="card-top">' +
-        '<label class="card-select-label" style="display:flex;align-items:center;gap:8px;"><input class="card-select" type="checkbox" data-action="select-card" data-card-id="' + escapeHtml(card.id) + '" ' + (selected ? 'checked' : '') + '>选择</label>' +
+        '<button class="card-copy-button" data-action="copy-card" data-card-id="' + escapeHtml(card.id) + '" title="复制"><span class="material-symbols-outlined">content_copy</span></button>' +
         '<span>' + (card.pinned ? '置顶 · ' : '') + '创建 ' + new Date(card.createdAt).toLocaleString() + '</span>' +
       '</div>' +
       '<div class="card-body">' +
@@ -4039,6 +4395,7 @@ function connectWs() {
       renderCards();
     } else if (payload.type === 'chatSnapshot') {
       chatMessages = payload.messages || [];
+      chatFetchingCount = payload.wechatFetchingCount || 0;
       applyTempChatMode(payload.tempChatMode);
       renderChat();
     }
@@ -4135,9 +4492,6 @@ cardsRoot.addEventListener('click', async event => {
     await copyCard(card.text || '');
   } else if (action === 'delete-card') {
     await deleteCard(card.id);
-  } else if (action === 'select-card') {
-    if (target.checked) selectedCardIds.add(card.id); else selectedCardIds.delete(card.id);
-    updateSelectedCount();
   } else if (action === 'toggle-collapse') {
     if (expandedCardIds.has(card.id)) expandedCardIds.delete(card.id); else expandedCardIds.add(card.id);
     renderCards();
@@ -4415,15 +4769,37 @@ connectWs();
                 Center(
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 720),
-                    child: ListView(
+                    child: CustomScrollView(
                       controller: _scrollController,
-                      padding: const EdgeInsets.fromLTRB(12, 6, 12, 28),
-                      children: [
-                        _buildAddressPanel(),
-                        const SizedBox(height: 14),
-                        _buildComposerCard(),
-                        const SizedBox(height: 20),
-                        _buildCardsSection(cards),
+                      slivers: [
+                        SliverPadding(
+                          padding: const EdgeInsets.fromLTRB(12, 6, 12, 28),
+                          sliver: SliverList(
+                            delegate: SliverChildListDelegate(
+                              [
+                                _buildAddressPanel(),
+                                const SizedBox(height: 14),
+                                _buildComposerCard(),
+                                const SizedBox(height: 20),
+                                _buildCardsSectionHeader(cards),
+                              ],
+                            ),
+                          ),
+                        ),
+                        SliverPadding(
+                          padding: const EdgeInsets.fromLTRB(12, 0, 12, 28),
+                          sliver: cards.isEmpty
+                              ? SliverToBoxAdapter(
+                                  child: _buildEmptyCardsPanel(),
+                                )
+                              : SliverList.separated(
+                                  itemCount: cards.length,
+                                  itemBuilder: (context, index) =>
+                                      _buildCardTile(cards[index], index + 1),
+                                  separatorBuilder: (context, index) =>
+                                      const SizedBox(height: 14),
+                                ),
+                        ),
                       ],
                     ),
                   ),
@@ -4612,14 +4988,16 @@ connectWs();
                     children: [
                       Expanded(
                         child: _buildCapsuleButton(
-                          label: _isServerRunning ? '停止服务' : '启动服务',
+                          label: _isServerRunning ? '停止' : '启动',
                           icon: _isServerRunning
                               ? Icons.stop_circle_outlined
                               : Icons.play_circle_outline_rounded,
                           onTap: () async {
                             if (_isServerRunning) {
+                              _autoStartWhenWifiAvailable = false;
                               await _stopServer();
                             } else {
+                              _autoStartWhenWifiAvailable = true;
                               await _startServer();
                             }
                           },
@@ -4632,18 +5010,55 @@ connectWs();
                       const SizedBox(width: 10),
                       Expanded(
                         child: _buildCapsuleButton(
-                          label: '复制地址',
+                          label: '复制',
                           icon: Icons.copy_rounded,
                           onTap: _isServerRunning
                               ? () async {
                                   await Clipboard.setData(
                                     ClipboardData(text: _serverAddress),
                                   );
+                                  _lastLocalShareCopiedText =
+                                      _serverAddress.trim();
                                   _showToast('已复制当前访问地址');
                                 }
                               : null,
                           variant: _CapsuleButtonVariant.soft,
                           compact: true,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Stack(
+                          clipBehavior: Clip.none,
+                          children: [
+                            SizedBox(
+                              width: double.infinity,
+                              child: _buildCapsuleButton(
+                                label: '聊天',
+                                icon: Icons.chat_bubble_outline_rounded,
+                                onTap: () => _openTempChatPage(context),
+                                variant: _CapsuleButtonVariant.soft,
+                                compact: true,
+                              ),
+                            ),
+                            if (_hasUnreadTempChat)
+                              Positioned(
+                                top: -1,
+                                right: 8,
+                                child: Container(
+                                  width: 9,
+                                  height: 9,
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFFFF5A5F),
+                                    borderRadius: BorderRadius.circular(99),
+                                    border: Border.all(
+                                      color: Colors.white,
+                                      width: 1.5,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                          ],
                         ),
                       ),
                     ],
@@ -4783,7 +5198,7 @@ connectWs();
     );
   }
 
-  Widget _buildCardsSection(List<CardItem> cards) {
+  Widget _buildCardsSectionHeader(List<CardItem> cards) {
     return Column(
       key: _cardsSectionKey,
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -4813,37 +5228,30 @@ connectWs();
           ],
         ),
         const SizedBox(height: 16),
-        if (cards.isEmpty)
-          Container(
-            decoration: _panelDecoration(radius: 24, shadowOpacity: 0.04),
-            width: double.infinity,
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              children: const [
-                Icon(Icons.blur_on, size: 48, color: Color(0x551353D8)),
-                SizedBox(height: 14),
-                Text(
-                  '还没有卡片。你可以直接输入文本点击“制卡”，或者先选择文件后一起保存。',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: Color(0xFF6B7381), height: 1.6),
-                ),
-              ],
-            ),
-          )
-        else
-          Column(
-            children: [
-              for (var i = 0; i < cards.length; i++) ...[
-                _buildCardTile(cards[i]),
-                if (i != cards.length - 1) const SizedBox(height: 14),
-              ],
-            ],
-          ),
       ],
     );
   }
 
-  Widget _buildCardTile(CardItem card) {
+  Widget _buildEmptyCardsPanel() {
+    return Container(
+      decoration: _panelDecoration(radius: 24, shadowOpacity: 0.04),
+      width: double.infinity,
+      padding: const EdgeInsets.all(24),
+      child: const Column(
+        children: [
+          Icon(Icons.blur_on, size: 48, color: Color(0x551353D8)),
+          SizedBox(height: 14),
+          Text(
+            '还没有卡片。你可以直接输入文本点击“制卡”，或者先选择文件后一起保存。',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Color(0xFF6B7381), height: 1.6),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCardTile(CardItem card, int displayIndex) {
     final cardAttachments = card.attachmentIds
         .map((id) => _attachments[id])
         .whereType<CardAttachment>()
@@ -4860,10 +5268,16 @@ connectWs();
     return _SwipeRevealCard(
       leftActions: [
         _SwipeActionSpec(
-          label: '查看编辑',
+          label: '编辑',
           icon: Icons.edit_note_rounded,
           color: const Color(0xFF0D44B3),
           onTap: () => _openCardEditor(card),
+        ),
+        _SwipeActionSpec(
+          label: '归档',
+          icon: Icons.archive_outlined,
+          color: const Color(0xFF5F6F89),
+          onTap: () => _archiveCard(card),
         ),
       ],
       rightActions: [
@@ -4888,175 +5302,191 @@ connectWs();
           onLongPress: () => _copyCardText(card.text),
           child: Ink(
             decoration: _panelDecoration(radius: 24, shadowOpacity: 0.045),
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        _buildSmallIconButton(
-                          icon: Icons.ios_share_rounded,
-                          tooltip: '分享',
-                          onTap: () => _shareCard(card),
-                        ),
-                        const SizedBox(width: 8),
-                        ...metaLabels.expand(
-                          (label) => [
-                            _buildMetaPill(label),
-                            const SizedBox(width: 8),
-                          ],
-                        ),
-                        AnimatedOpacity(
-                          opacity: card.isPinned ? 1 : 0,
-                          duration: const Duration(milliseconds: 160),
-                          child: IgnorePointer(
-                            ignoring: !card.isPinned,
-                            child: _buildMetaPill(
-                              '置顶',
-                              foregroundColor: const Color(0xFF0D44B3),
-                              backgroundColor: const Color(0xFFEAF1FF),
-                            ),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 18),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(minHeight: 168),
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: Center(
+                        child: Text(
+                          displayIndex.toString().padLeft(2, '0'),
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Color(0x141353D8),
+                            fontSize: 118,
+                            height: 1,
+                            fontWeight: FontWeight.w900,
                           ),
                         ),
-                      ],
-                    ),
-                    Flexible(
-                      child: Align(
-                        alignment: Alignment.centerRight,
-                        child: _buildMetaPill(
-                            '创建 ${_formatDateTime(card.createdAt)}'),
                       ),
                     ),
-                  ],
-                ),
-                if (hasText) ...[
-                  const SizedBox(height: 10),
-                  _CardTextPreview(
-                    text: card.text,
-                    onOpenUri: _openUri,
-                    onCopyUrl: _copyUrl,
                   ),
-                ],
-                if (cardAttachments.isNotEmpty) ...[
-                  const SizedBox(height: 14),
-                  if (cardAttachments.length > 1) ...[
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: _buildCapsuleButton(
-                        label: '全部下载',
-                        icon: Icons.folder_zip_rounded,
-                        onTap: () => _downloadCardBundle(card),
-                        variant: _CapsuleButtonVariant.primary,
-                        compact: true,
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                  ],
-                  ...cardAttachments.map(
-                    (attachment) => Container(
-                      margin: const EdgeInsets.only(bottom: 10),
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFF7F9FD),
-                        borderRadius: BorderRadius.circular(16),
-                        border: Border.all(color: const Color(0xFFE2E7F1)),
-                      ),
-                      child: Column(
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          if (attachment.kind == AttachmentKind.image) ...[
-                            _buildImageAttachmentPreview(
-                              attachment,
-                              imageAttachments: imageAttachments,
-                              initialIndex: imageAttachments.indexWhere(
-                                (item) => item.id == attachment.id,
-                              ),
+                          Expanded(
+                            child: Wrap(
+                              spacing: 8,
+                              runSpacing: 6,
+                              children: [
+                                _buildMetaPill(
+                                  '创建 ${_formatDateTime(card.createdAt)}',
+                                ),
+                                ...metaLabels.map(_buildMetaPill),
+                                if (card.isPinned)
+                                  _buildMetaPill(
+                                    '置顶',
+                                    foregroundColor: const Color(0xFF0D44B3),
+                                    backgroundColor: const Color(0xFFEAF1FF),
+                                  ),
+                              ],
                             ),
-                            const SizedBox(height: 12),
-                          ],
-                          Row(
-                            children: [
-                              Container(
-                                width: 38,
-                                height: 38,
-                                decoration: BoxDecoration(
-                                  color: const Color(0x141353D8),
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                                child: Icon(
-                                  _iconForAttachment(attachment),
-                                  color: const Color(0xFF1353D8),
-                                ),
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
+                          ),
+                          const SizedBox(width: 8),
+                          _buildSmallIconButton(
+                            icon: Icons.share_rounded,
+                            tooltip: '分享',
+                            onTap: () => _shareCard(card),
+                          ),
+                        ],
+                      ),
+                      if (hasText) ...[
+                        const SizedBox(height: 10),
+                        _CardTextPreview(
+                          text: card.text,
+                          onOpenUri: _openUri,
+                        ),
+                      ],
+                      if (cardAttachments.isNotEmpty) ...[
+                        const SizedBox(height: 14),
+                        if (cardAttachments.length > 1) ...[
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: _buildCapsuleButton(
+                              label: '全部下载',
+                              icon: Icons.folder_zip_rounded,
+                              onTap: () => _downloadCardBundle(card),
+                              variant: _CapsuleButtonVariant.primary,
+                              compact: true,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                        ],
+                        ...cardAttachments.map(
+                          (attachment) => Container(
+                            margin: const EdgeInsets.only(bottom: 10),
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFF7F9FD),
+                              borderRadius: BorderRadius.circular(16),
+                              border:
+                                  Border.all(color: const Color(0xFFE2E7F1)),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                if (attachment.kind ==
+                                    AttachmentKind.image) ...[
+                                  _buildImageAttachmentPreview(
+                                    attachment,
+                                    imageAttachments: imageAttachments,
+                                    initialIndex: imageAttachments.indexWhere(
+                                      (item) => item.id == attachment.id,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 12),
+                                ],
+                                Row(
                                   children: [
-                                    Text(
-                                      attachment.name,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        fontWeight: FontWeight.w800,
-                                        fontSize: 14,
+                                    Container(
+                                      width: 38,
+                                      height: 38,
+                                      decoration: BoxDecoration(
+                                        color: const Color(0x141353D8),
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
+                                      child: Icon(
+                                        _iconForAttachment(attachment),
+                                        color: const Color(0xFF1353D8),
                                       ),
                                     ),
-                                    const SizedBox(height: 3),
-                                    Text(
-                                      _attachmentLabel(attachment),
-                                      style: const TextStyle(
-                                        color: Color(0xFF7A8497),
-                                        fontSize: 12,
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            attachment.name,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(
+                                              fontWeight: FontWeight.w800,
+                                              fontSize: 14,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 3),
+                                          Text(
+                                            _attachmentLabel(attachment),
+                                            style: const TextStyle(
+                                              color: Color(0xFF7A8497),
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ],
                                       ),
                                     ),
                                   ],
                                 ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
-                          Row(
-                            children: [
-                              if (attachment.isPreviewable &&
-                                  attachment.kind != AttachmentKind.image) ...[
-                                Expanded(
-                                  child: _buildCapsuleButton(
-                                    label: '预览',
-                                    icon: Icons.visibility_outlined,
-                                    onTap: () => _openAttachment(
-                                      attachment,
-                                      preview: true,
+                                const SizedBox(height: 12),
+                                Row(
+                                  children: [
+                                    if (attachment.isPreviewable &&
+                                        attachment.kind !=
+                                            AttachmentKind.image) ...[
+                                      Expanded(
+                                        child: _buildCapsuleButton(
+                                          label: '预览',
+                                          icon: Icons.visibility_outlined,
+                                          onTap: () => _openAttachment(
+                                            attachment,
+                                            preview: true,
+                                          ),
+                                          variant: _CapsuleButtonVariant.soft,
+                                          compact: true,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                    ],
+                                    Expanded(
+                                      child: _buildCapsuleButton(
+                                        label: attachment.kind ==
+                                                AttachmentKind.image
+                                            ? '原图'
+                                            : '下载',
+                                        icon: Icons.download_rounded,
+                                        onTap: () =>
+                                            _openAttachment(attachment),
+                                        variant: _CapsuleButtonVariant.primary,
+                                        compact: true,
+                                      ),
                                     ),
-                                    variant: _CapsuleButtonVariant.soft,
-                                    compact: true,
-                                  ),
+                                  ],
                                 ),
-                                const SizedBox(width: 8),
                               ],
-                              Expanded(
-                                child: _buildCapsuleButton(
-                                  label: attachment.kind == AttachmentKind.image
-                                      ? '原图'
-                                      : '下载',
-                                  icon: Icons.download_rounded,
-                                  onTap: () => _openAttachment(attachment),
-                                  variant: _CapsuleButtonVariant.primary,
-                                  compact: true,
-                                ),
-                              ),
-                            ],
+                            ),
                           ),
-                        ],
-                      ),
-                    ),
+                        ),
+                      ],
+                    ],
                   ),
                 ],
-              ],
+              ),
             ),
           ),
         ),
@@ -5102,16 +5532,16 @@ connectWs();
         onTap: onTap,
         borderRadius: BorderRadius.circular(999),
         child: Ink(
-          width: 30,
-          height: 30,
+          width: 28,
+          height: 28,
           decoration: BoxDecoration(
-            color: const Color(0xFFEAF1FF),
+            color: const Color(0xFFF3F6FB),
             borderRadius: BorderRadius.circular(999),
           ),
           child: Icon(
             icon,
-            size: 16,
-            color: const Color(0xFF0D44B3),
+            size: 18,
+            color: const Color(0xFF5F6F89),
           ),
         ),
       ),
@@ -5276,6 +5706,8 @@ class _LocalShareTempChatPage extends StatefulWidget {
     required this.onClearChat,
     required this.onSaveMessageAsCard,
     required this.onDeleteMessage,
+    required this.onCopyMessageText,
+    required this.isFetchingWeChatArticle,
   });
 
   final List<TempChatMessage> messages;
@@ -5288,6 +5720,8 @@ class _LocalShareTempChatPage extends StatefulWidget {
   final Future<void> Function() onClearChat;
   final Future<CardItem?> Function(String messageId) onSaveMessageAsCard;
   final Future<void> Function(String messageId) onDeleteMessage;
+  final Future<void> Function(String text) onCopyMessageText;
+  final bool Function() isFetchingWeChatArticle;
 
   @override
   State<_LocalShareTempChatPage> createState() =>
@@ -5325,6 +5759,13 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
         .toList();
   }
 
+  String _formatTimeChip(DateTime time) {
+    final local = time.toLocal();
+    final hour = local.hour.toString().padLeft(2, '0');
+    final minute = local.minute.toString().padLeft(2, '0');
+    return '$hour:$minute';
+  }
+
   Future<void> _send() async {
     final text = _controller.text.trim();
     if (text.isEmpty || _sending) {
@@ -5341,7 +5782,7 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
       }
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (_scrollController.hasClients) {
-          _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+          _scrollController.jumpTo(_scrollController.position.minScrollExtent);
         }
       });
     } finally {
@@ -5386,7 +5827,8 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
 
   @override
   Widget build(BuildContext context) {
-    final messages = widget.messages;
+    final messages = widget.messages.reversed.toList();
+    final isFetchingArticle = widget.isFetchingWeChatArticle();
     return Scaffold(
       appBar: AppBar(
         title: const Text('临时聊天模式'),
@@ -5400,15 +5842,22 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
       body: Column(
         children: [
           Expanded(
-            child: messages.isEmpty
+            child: messages.isEmpty && !isFetchingArticle
                 ? const Center(child: Text('暂无临时消息'))
                 : ListView.separated(
                     controller: _scrollController,
                     padding: const EdgeInsets.all(16),
-                    itemCount: messages.length,
+                    itemCount: messages.length + (isFetchingArticle ? 1 : 0),
                     separatorBuilder: (_, __) => const SizedBox(height: 10),
                     itemBuilder: (context, index) {
-                      final message = messages[index];
+                      if (isFetchingArticle && index == 0) {
+                        return const Align(
+                          alignment: Alignment.centerLeft,
+                          child: _WeChatFetchingBubble(),
+                        );
+                      }
+                      final messageIndex = index - (isFetchingArticle ? 1 : 0);
+                      final message = messages[messageIndex];
                       final attachments = _attachmentsOf(message);
                       final isPhone = message.sender == 'phone';
                       return Align(
@@ -5427,64 +5876,152 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
                                 color: const Color(0xFFE2E7F1),
                               ),
                             ),
-                            child: Padding(
-                              padding: const EdgeInsets.all(12),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    message.text.isEmpty
-                                        ? '附件消息'
-                                        : message.text,
-                                    style: const TextStyle(height: 1.45),
-                                  ),
-                                  if (attachments.isNotEmpty) ...[
-                                    const SizedBox(height: 8),
-                                    Text(
-                                      '${attachments.length} 个附件',
-                                      style: const TextStyle(
-                                        color: Color(0xFF6E7788),
-                                        fontSize: 12,
-                                      ),
-                                    ),
-                                  ],
-                                  const SizedBox(height: 8),
-                                  Wrap(
-                                    spacing: 8,
-                                    runSpacing: 4,
+                            child: Stack(
+                              children: [
+                                Padding(
+                                  padding:
+                                      const EdgeInsets.fromLTRB(12, 12, 12, 12),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
                                     children: [
-                                      TextButton(
-                                        onPressed: () async {
-                                          final messenger =
-                                              ScaffoldMessenger.of(context);
-                                          await widget.onSaveMessageAsCard(
-                                            message.id,
-                                          );
-                                          if (mounted) {
-                                            messenger.showSnackBar(
-                                              const SnackBar(
-                                                content: Text('已存为卡片'),
+                                      Wrap(
+                                        spacing: 6,
+                                        runSpacing: 6,
+                                        children: [
+                                          Chip(
+                                            materialTapTargetSize:
+                                                MaterialTapTargetSize
+                                                    .shrinkWrap,
+                                            visualDensity:
+                                                VisualDensity.compact,
+                                            label: Text(
+                                              isPhone
+                                                  ? '我'
+                                                  : message.sender.isEmpty
+                                                      ? '对方'
+                                                      : message.sender,
+                                            ),
+                                            labelStyle: const TextStyle(
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w800,
+                                              color: Color(0xFF1353D8),
+                                            ),
+                                            backgroundColor:
+                                                const Color(0xFFEAF1FF),
+                                            side: BorderSide.none,
+                                          ),
+                                          Chip(
+                                            materialTapTargetSize:
+                                                MaterialTapTargetSize
+                                                    .shrinkWrap,
+                                            visualDensity:
+                                                VisualDensity.compact,
+                                            label: Text(
+                                              _formatTimeChip(
+                                                message.createdAt,
                                               ),
-                                            );
-                                          }
-                                        },
-                                        child: const Text('存为卡片'),
+                                            ),
+                                            labelStyle: const TextStyle(
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w700,
+                                              color: Color(0xFF6E7788),
+                                            ),
+                                            backgroundColor:
+                                                const Color(0xFFF3F6FB),
+                                            side: BorderSide.none,
+                                          ),
+                                        ],
                                       ),
-                                      TextButton(
-                                        onPressed: () async {
-                                          await widget.onDeleteMessage(
-                                            message.id,
-                                          );
-                                          if (mounted) {
-                                            setState(() {});
-                                          }
-                                        },
-                                        child: const Text('删除'),
+                                      const SizedBox(height: 8),
+                                      Padding(
+                                        padding:
+                                            const EdgeInsets.only(right: 36),
+                                        child: Text(
+                                          message.text.isEmpty
+                                              ? '附件消息'
+                                              : message.text,
+                                          style: const TextStyle(height: 1.45),
+                                        ),
+                                      ),
+                                      if (attachments.isNotEmpty) ...[
+                                        const SizedBox(height: 8),
+                                        Text(
+                                          '${attachments.length} 个附件',
+                                          style: const TextStyle(
+                                            color: Color(0xFF6E7788),
+                                            fontSize: 12,
+                                          ),
+                                        ),
+                                      ],
+                                      const SizedBox(height: 8),
+                                      Wrap(
+                                        spacing: 8,
+                                        runSpacing: 4,
+                                        children: [
+                                          ActionChip(
+                                            visualDensity:
+                                                VisualDensity.compact,
+                                            avatar: const Icon(
+                                              Icons.add_card_outlined,
+                                              size: 16,
+                                            ),
+                                            label: const Text('存为卡片'),
+                                            onPressed: () async {
+                                              final messenger =
+                                                  ScaffoldMessenger.of(
+                                                context,
+                                              );
+                                              await widget.onSaveMessageAsCard(
+                                                message.id,
+                                              );
+                                              if (mounted) {
+                                                messenger.showSnackBar(
+                                                  const SnackBar(
+                                                    content: Text('已存为卡片'),
+                                                  ),
+                                                );
+                                              }
+                                            },
+                                          ),
+                                          ActionChip(
+                                            visualDensity:
+                                                VisualDensity.compact,
+                                            avatar: const Icon(
+                                              Icons.delete_outline_rounded,
+                                              size: 16,
+                                            ),
+                                            label: const Text('删除'),
+                                            onPressed: () async {
+                                              await widget.onDeleteMessage(
+                                                message.id,
+                                              );
+                                              if (mounted) {
+                                                setState(() {});
+                                              }
+                                            },
+                                          ),
+                                        ],
                                       ),
                                     ],
                                   ),
-                                ],
-                              ),
+                                ),
+                                Positioned(
+                                  top: 2,
+                                  right: 2,
+                                  child: IconButton(
+                                    visualDensity: VisualDensity.compact,
+                                    tooltip: '复制',
+                                    icon: const Icon(
+                                      Icons.content_copy_rounded,
+                                      size: 18,
+                                    ),
+                                    onPressed: () => widget.onCopyMessageText(
+                                      message.text,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                         ),
@@ -5524,25 +6061,93 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
   }
 }
 
+class _WeChatFetchingBubble extends StatefulWidget {
+  const _WeChatFetchingBubble();
+
+  @override
+  State<_WeChatFetchingBubble> createState() => _WeChatFetchingBubbleState();
+}
+
+class _WeChatFetchingBubbleState extends State<_WeChatFetchingBubble>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 950),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: Tween<double>(begin: 0.62, end: 1).animate(
+        CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
+      ),
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: 320),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: const Color(0xFFE2E7F1)),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFF1353D8).withValues(alpha: 0.07),
+              blurRadius: 18,
+              offset: const Offset(0, 10),
+            ),
+          ],
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            SizedBox(width: 10),
+            Text(
+              '正在抓取公众号文章…',
+              style: TextStyle(
+                fontWeight: FontWeight.w800,
+                color: Color(0xFF1353D8),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class LocalShareSettingsPage extends StatefulWidget {
   const LocalShareSettingsPage({
     super.key,
     required this.initialPort,
     required this.initialUseFixedPort,
     required this.initialConfirmDelete,
+    required this.initialClipboardToTempChat,
     required this.onImportTap,
     required this.onExportTap,
     required this.onTempChatTap,
     required this.onManageCardsTap,
+    required this.onArchivedCardsTap,
   });
 
   final int initialPort;
   final bool initialUseFixedPort;
   final bool initialConfirmDelete;
+  final bool initialClipboardToTempChat;
   final Future<void> Function() onImportTap;
   final Future<void> Function() onExportTap;
   final Future<void> Function(BuildContext context) onTempChatTap;
   final Future<void> Function(BuildContext context) onManageCardsTap;
+  final Future<void> Function(BuildContext context) onArchivedCardsTap;
 
   @override
   State<LocalShareSettingsPage> createState() => _LocalShareSettingsPageState();
@@ -5553,6 +6158,7 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
       TextEditingController(text: widget.initialPort.toString());
   late bool _useFixedPort = widget.initialUseFixedPort;
   late bool _confirmDelete = widget.initialConfirmDelete;
+  late bool _clipboardToTempChat = widget.initialClipboardToTempChat;
 
   @override
   void dispose() {
@@ -5567,6 +6173,7 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
           useFixedPort: false,
           port: widget.initialPort,
           confirmDelete: _confirmDelete,
+          clipboardToTempChat: _clipboardToTempChat,
           clearAllCards: clearAllCards,
         ),
       );
@@ -5584,6 +6191,7 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
         useFixedPort: true,
         port: value,
         confirmDelete: _confirmDelete,
+        clipboardToTempChat: _clipboardToTempChat,
         clearAllCards: clearAllCards,
       ),
     );
@@ -5592,7 +6200,18 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('设置')),
+      appBar: AppBar(
+        title: const Text('设置'),
+        actions: [
+          TextButton(
+            onPressed: () => _save(),
+            child: const Text(
+              '保存',
+              style: TextStyle(fontWeight: FontWeight.w900),
+            ),
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
@@ -5652,6 +6271,23 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
                     });
                   },
                 ),
+                const SizedBox(height: 4),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: _clipboardToTempChat,
+                  title: const Text(
+                    '监听手机剪贴板',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  subtitle: const Text(
+                    '服务运行时捕获手机复制的文本进入临时聊天；已配置私有接口时会自动抓取公众号正文',
+                  ),
+                  onChanged: (value) {
+                    setState(() {
+                      _clipboardToTempChat = value;
+                    });
+                  },
+                ),
                 const SizedBox(height: 8),
                 TextField(
                   controller: _portController,
@@ -5683,6 +6319,21 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
                   icon: const Icon(Icons.rule_folder_outlined),
                   label: const Text(
                     '卡片管理',
+                    style: TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size.fromHeight(48),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                OutlinedButton.icon(
+                  onPressed: () => widget.onArchivedCardsTap(context),
+                  icon: const Icon(Icons.archive_outlined),
+                  label: const Text(
+                    '归档卡片',
                     style: TextStyle(fontWeight: FontWeight.w900),
                   ),
                   style: OutlinedButton.styleFrom(
@@ -5744,22 +6395,6 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
                     style: TextStyle(fontWeight: FontWeight.w900),
                   ),
                 ),
-                const SizedBox(height: 10),
-                FilledButton(
-                  onPressed: () => _save(),
-                  style: FilledButton.styleFrom(
-                    backgroundColor: const Color(0xFF1550D7),
-                    foregroundColor: Colors.white,
-                    minimumSize: const Size.fromHeight(48),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(18),
-                    ),
-                  ),
-                  child: const Text(
-                    '保存',
-                    style: TextStyle(fontWeight: FontWeight.w900),
-                  ),
-                ),
               ],
             ),
           ),
@@ -5772,14 +6407,20 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
 class LocalShareCardManagePage extends StatefulWidget {
   const LocalShareCardManagePage({
     super.key,
+    required this.title,
+    required this.emptyText,
     required this.cards,
     required this.attachmentMap,
     required this.onDeleteCards,
+    this.onRestoreCards,
   });
 
+  final String title;
+  final String emptyText;
   final List<CardItem> cards;
   final Map<String, CardAttachment> attachmentMap;
   final Future<int> Function(List<String> cardIds) onDeleteCards;
+  final Future<int> Function(List<String> cardIds)? onRestoreCards;
 
   @override
   State<LocalShareCardManagePage> createState() =>
@@ -5789,6 +6430,7 @@ class LocalShareCardManagePage extends StatefulWidget {
 class _LocalShareCardManagePageState extends State<LocalShareCardManagePage> {
   final TextEditingController _searchController = TextEditingController();
   final Set<String> _selectedIds = <String>{};
+  late final List<CardItem> _cards = List<CardItem>.from(widget.cards);
   String _filter = 'all';
 
   @override
@@ -5800,7 +6442,7 @@ class _LocalShareCardManagePageState extends State<LocalShareCardManagePage> {
   List<CardItem> get _filteredCards {
     final query = _searchController.text.trim().toLowerCase();
     final now = DateTime.now();
-    return widget.cards.where((card) {
+    return _cards.where((card) {
       final attachments = _attachmentsOf(card);
       final textMatched = query.isEmpty ||
           card.text.toLowerCase().contains(query) ||
@@ -5900,10 +6542,71 @@ class _LocalShareCardManagePageState extends State<LocalShareCardManagePage> {
       return;
     }
     setState(() {
+      _cards.removeWhere((card) => ids.contains(card.id));
       _selectedIds.clear();
     });
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('已删除 $deleted 张卡片')),
+    );
+  }
+
+  Future<void> _restoreSelected() async {
+    final ids = _selectedIds.toList();
+    if (ids.isEmpty || widget.onRestoreCards == null) {
+      return;
+    }
+    final restored = await widget.onRestoreCards!(ids);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _cards.removeWhere((card) => ids.contains(card.id));
+      _selectedIds.clear();
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已恢复 $restored 张卡片')),
+    );
+  }
+
+  Widget _buildBottomActionBar() {
+    if (widget.onRestoreCards == null) {
+      return FilledButton.icon(
+        onPressed: _selectedIds.isEmpty ? null : _deleteSelected,
+        icon: const Icon(Icons.delete_outline),
+        label: Text('删除选中的 ${_selectedIds.length} 张卡片'),
+        style: FilledButton.styleFrom(
+          backgroundColor: const Color(0xFFBA1A1A),
+          foregroundColor: Colors.white,
+          minimumSize: const Size.fromHeight(48),
+        ),
+      );
+    }
+    return Row(
+      children: [
+        Expanded(
+          child: FilledButton.icon(
+            onPressed: _selectedIds.isEmpty ? null : _restoreSelected,
+            icon: const Icon(Icons.unarchive_outlined),
+            label: Text('恢复 ${_selectedIds.length}'),
+            style: FilledButton.styleFrom(
+              minimumSize: const Size.fromHeight(48),
+            ),
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: FilledButton.icon(
+            onPressed: _selectedIds.isEmpty ? null : _deleteSelected,
+            icon: const Icon(Icons.delete_outline),
+            label: const Text('永久删除'),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFBA1A1A),
+              foregroundColor: Colors.white,
+              minimumSize: const Size.fromHeight(48),
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -5914,8 +6617,13 @@ class _LocalShareCardManagePageState extends State<LocalShareCardManagePage> {
         filteredCards.where((card) => _selectedIds.contains(card.id)).length;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('卡片管理'),
+        title: Text(widget.title),
         actions: [
+          if (widget.onRestoreCards != null)
+            TextButton(
+              onPressed: _selectedIds.isEmpty ? null : _restoreSelected,
+              child: Text('恢复 ${_selectedIds.length}'),
+            ),
           TextButton(
             onPressed: _selectedIds.isEmpty ? null : _deleteSelected,
             child: Text('删除 ${_selectedIds.length}'),
@@ -5938,7 +6646,7 @@ class _LocalShareCardManagePageState extends State<LocalShareCardManagePage> {
                 ),
                 const SizedBox(height: 10),
                 DropdownButtonFormField<String>(
-                  value: _filter,
+                  initialValue: _filter,
                   decoration: const InputDecoration(
                     labelText: '筛选条件',
                     prefixIcon: Icon(Icons.filter_alt_outlined),
@@ -6000,7 +6708,7 @@ class _LocalShareCardManagePageState extends State<LocalShareCardManagePage> {
           ),
           Expanded(
             child: filteredCards.isEmpty
-                ? const Center(child: Text('没有匹配的卡片'))
+                ? Center(child: Text(widget.emptyText))
                 : ListView.separated(
                     padding: const EdgeInsets.fromLTRB(12, 0, 12, 18),
                     itemCount: filteredCards.length,
@@ -6044,16 +6752,7 @@ class _LocalShareCardManagePageState extends State<LocalShareCardManagePage> {
       bottomNavigationBar: SafeArea(
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-          child: FilledButton.icon(
-            onPressed: _selectedIds.isEmpty ? null : _deleteSelected,
-            icon: const Icon(Icons.delete_outline),
-            label: Text('删除选中的 ${_selectedIds.length} 张卡片'),
-            style: FilledButton.styleFrom(
-              backgroundColor: const Color(0xFFBA1A1A),
-              foregroundColor: Colors.white,
-              minimumSize: const Size.fromHeight(48),
-            ),
-          ),
+          child: _buildBottomActionBar(),
         ),
       ),
     );
@@ -6116,9 +6815,17 @@ class _CardEditorPageState extends State<_CardEditorPage> {
     Navigator.of(context).pop(_controller.text);
   }
 
+  void _handleTextChanged(String value) {
+    if ((value == widget.initialText) != (_lastText == widget.initialText)) {
+      setState(() {});
+    } else {
+      setState(() {});
+    }
+    _lastText = value;
+  }
+
   @override
   Widget build(BuildContext context) {
-    final mediaQuery = MediaQuery.of(context);
     return PopScope(
       canPop: !_hasChanges,
       onPopInvokedWithResult: (didPop, result) async {
@@ -6128,7 +6835,7 @@ class _CardEditorPageState extends State<_CardEditorPage> {
         await _close();
       },
       child: Scaffold(
-        resizeToAvoidBottomInset: true,
+        resizeToAvoidBottomInset: false,
         appBar: AppBar(
           title: const Text('编辑卡片'),
           leading: IconButton(
@@ -6150,19 +6857,19 @@ class _CardEditorPageState extends State<_CardEditorPage> {
         body: SafeArea(
           child: LayoutBuilder(
             builder: (context, constraints) {
-              final editorHeight = constraints.maxHeight -
-                  26 -
-                  mediaQuery.viewInsets.bottom.clamp(0, 96);
-              return Padding(
-                padding: EdgeInsets.fromLTRB(
-                  14,
-                  10,
-                  14,
-                  16 + mediaQuery.viewInsets.bottom,
-                ),
+              final screenHeight = MediaQuery.sizeOf(context).height;
+              final editorHeight = max(
+                screenHeight,
+                constraints.maxHeight - 26,
+              ).toDouble();
+              return SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(14, 10, 14, 16),
+                keyboardDismissBehavior:
+                    ScrollViewKeyboardDismissBehavior.onDrag,
                 child: Column(
                   children: [
-                    Expanded(
+                    SizedBox(
+                      height: editorHeight,
                       child: DecoratedBox(
                         decoration: BoxDecoration(
                           color: Colors.white,
@@ -6179,39 +6886,28 @@ class _CardEditorPageState extends State<_CardEditorPage> {
                             ),
                           ],
                         ),
-                        child: ConstrainedBox(
-                          constraints: BoxConstraints(
-                            minHeight: editorHeight.clamp(360, 1200),
-                          ),
-                          child: Padding(
-                            padding: const EdgeInsets.all(14),
-                            child: TextField(
-                              controller: _controller,
-                              expands: true,
-                              maxLines: null,
-                              minLines: null,
-                              autofocus: true,
-                              keyboardType: TextInputType.multiline,
-                              textInputAction: TextInputAction.newline,
-                              textAlignVertical: TextAlignVertical.top,
-                              onChanged: (value) {
-                                if ((value == widget.initialText) !=
-                                    (_lastText == widget.initialText)) {
-                                  setState(() {});
-                                }
-                                _lastText = value;
-                              },
-                              decoration: const InputDecoration(
-                                hintText: '修改卡片内容',
-                                border: InputBorder.none,
-                                enabledBorder: InputBorder.none,
-                                focusedBorder: InputBorder.none,
-                                contentPadding: EdgeInsets.zero,
-                              ),
-                              style: const TextStyle(
-                                fontSize: 16,
-                                height: 1.55,
-                              ),
+                        child: Padding(
+                          padding: const EdgeInsets.all(14),
+                          child: TextField(
+                            controller: _controller,
+                            expands: true,
+                            maxLines: null,
+                            minLines: null,
+                            autofocus: true,
+                            keyboardType: TextInputType.multiline,
+                            textInputAction: TextInputAction.newline,
+                            textAlignVertical: TextAlignVertical.top,
+                            onChanged: _handleTextChanged,
+                            decoration: const InputDecoration(
+                              hintText: '修改卡片内容',
+                              border: InputBorder.none,
+                              enabledBorder: InputBorder.none,
+                              focusedBorder: InputBorder.none,
+                              contentPadding: EdgeInsets.zero,
+                            ),
+                            style: const TextStyle(
+                              fontSize: 16,
+                              height: 1.55,
                             ),
                           ),
                         ),
@@ -6424,12 +7120,10 @@ class _CardTextPreview extends StatefulWidget {
   const _CardTextPreview({
     required this.text,
     required this.onOpenUri,
-    required this.onCopyUrl,
   });
 
   final String text;
   final Future<void> Function(Uri uri) onOpenUri;
-  final Future<void> Function(String url) onCopyUrl;
 
   @override
   State<_CardTextPreview> createState() => _CardTextPreviewState();
@@ -6458,8 +7152,7 @@ class _CardTextPreviewState extends State<_CardTextPreview> {
   void didUpdateWidget(covariant _CardTextPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.text != widget.text ||
-        oldWidget.onOpenUri != widget.onOpenUri ||
-        oldWidget.onCopyUrl != widget.onCopyUrl) {
+        oldWidget.onOpenUri != widget.onOpenUri) {
       _disposeRecognizers();
       _spans = _createSpans();
     }
@@ -6511,30 +7204,6 @@ class _CardTextPreviewState extends State<_CardTextPreview> {
           recognizer: recognizer,
         ),
       );
-      spans.add(
-        WidgetSpan(
-          alignment: PlaceholderAlignment.middle,
-          child: Padding(
-            padding: const EdgeInsets.only(left: 3, right: 2),
-            child: Tooltip(
-              message: '复制链接',
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () => widget.onCopyUrl(trimmed),
-                child: const SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: Icon(
-                    Icons.content_copy_rounded,
-                    size: 13,
-                    color: Color(0xFF6A7890),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-      );
       cursor = match.start + trimmed.length;
       if (raw.length > trimmed.length) {
         final trailing = raw.substring(trimmed.length);
@@ -6566,12 +7235,14 @@ class _PortSettingsResult {
     required this.useFixedPort,
     required this.port,
     required this.confirmDelete,
+    required this.clipboardToTempChat,
     this.clearAllCards = false,
   });
 
   final bool useFixedPort;
   final int port;
   final bool confirmDelete;
+  final bool clipboardToTempChat;
   final bool clearAllCards;
 }
 
@@ -6594,6 +7265,26 @@ class _IncomingAttachmentPayload {
       name: json['name'] as String? ?? 'attachment',
       mimeType: json['mimeType'] as String? ?? 'application/octet-stream',
       bytes: base64.isEmpty ? <int>[] : base64Decode(base64),
+    );
+  }
+}
+
+class _WeChatArticleResult {
+  const _WeChatArticleResult({
+    required this.url,
+    required this.title,
+    required this.content,
+  });
+
+  final String url;
+  final String title;
+  final String content;
+
+  factory _WeChatArticleResult.fromJson(Map<String, dynamic> json) {
+    return _WeChatArticleResult(
+      url: json['url'] as String? ?? '',
+      title: json['title'] as String? ?? '',
+      content: json['content'] as String? ?? '',
     );
   }
 }

@@ -289,6 +289,11 @@ class MainActivity: FlutterActivity() {
                 return mapOf(
                     "type" to "text",
                     "text" to text,
+                    "timestamp" to if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        clip.description.timestamp
+                    } else {
+                        0L
+                    },
                 )
             }
         }
