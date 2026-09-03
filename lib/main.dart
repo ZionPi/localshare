@@ -3788,11 +3788,16 @@ button { cursor: pointer; }
 .control { padding: 20px; display:flex; flex-direction:column; gap:12px; }
 .control .icon { width: 48px; height: 48px; border-radius: 999px; display:grid; place-items:center; background: rgba(19,83,216,.08); color: var(--primary); }
 .control.danger .icon { background: rgba(186,26,26,.08); color: var(--error); }
-.section-head { margin: 24px 0 12px; display:flex; align-items:flex-end; justify-content:space-between; gap:12px; }
+.section-head { margin: 24px 0 12px; display:flex; flex-direction:column; align-items:stretch; gap:12px; }
+.section-head-title { display:flex; align-items:flex-end; justify-content:space-between; gap:12px; }
 .section-title { font-family: Manrope, sans-serif; font-size: 22px; font-weight: 800; color: var(--primary-dark); }
 .section-subtitle { color: var(--muted); font-size: 14px; }
-.search-row { display:flex; gap:12px; flex-wrap:wrap; }
-.search-row input { flex: 1 1 280px; border: 1px solid var(--outline); background:white; border-radius: 18px; padding: 14px 16px; }
+.search-row { width:100%; }
+.search-box { width:100%; display:flex; align-items:center; gap:8px; border: 1px solid var(--outline); background:white; border-radius: 18px; padding: 4px 6px 4px 14px; box-shadow:0 8px 20px rgba(19,83,216,.04); }
+.search-box .material-symbols-outlined { color:var(--muted); font-size:20px; }
+.search-box input { flex: 1 1 auto; min-width:0; border:0; outline:0; background:transparent; padding: 12px 4px; font-size:15px; }
+.search-clear { width:34px; height:34px; border:0; border-radius:999px; background:#f3f6fb; color:#6e7788; display:grid; place-items:center; cursor:pointer; }
+.search-clear:hover { background:#eaf1ff; color:var(--primary); }
 .cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
 .card { padding: 18px; min-height: 176px; max-height: 460px; display:flex; flex-direction:column; overflow:hidden; }
 .card.collapsed { height: 210px; }
@@ -3807,8 +3812,12 @@ button { cursor: pointer; }
   overflow:hidden;
 }
 .batch-toolbar { display:none; }
-.card-top { display:flex; align-items:center; justify-content:space-between; gap:12px; color: var(--muted); font-size: 12px; }
+.card-top { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; color: var(--muted); font-size: 12px; }
+.card-meta { display:flex; align-items:center; gap:8px; flex-wrap:wrap; min-width:0; }
+.card-tag { display:inline-flex; align-items:center; min-height:24px; padding:4px 10px; border-radius:999px; background:#f4f7fc; color:#718097; font-size:11px; font-weight:700; line-height:1.2; }
+.card-tag.primary { background:#eaf1ff; color:var(--primary-dark); }
 .card-copy-button {
+  flex:0 0 auto;
   width: 30px; height: 30px; border:0; border-radius:999px;
   display:grid; place-items:center; color:#5f6f89;
   background: rgba(19,83,216,.07);
@@ -3895,12 +3904,21 @@ body.temp-chat-mode .chat-panel { display:block; }
 .chat-chip { display:inline-flex; align-items:center; gap:4px; padding:4px 8px; border-radius:999px; background:#f3f6fb; color:#6e7788; font-size:11px; font-weight:800; border:0; cursor:default; }
 .chat-chip.primary { background:#eaf1ff; color:var(--primary); }
 .chat-actions .chat-chip { cursor:pointer; }
-.chat-fetching { align-self:flex-start; display:flex; align-items:center; gap:10px; padding:12px 14px; border-radius:18px; background:white; color:var(--primary); font-weight:800; box-shadow:0 10px 26px rgba(19,83,216,.08); animation:pulseFetch 1s ease-in-out infinite alternate; }
+.chat-fetching-card { align-self:flex-start; min-width:min(78%, 420px); }
+.chat-fetching-card .chat-text { color:var(--primary); font-weight:900; }
+.chat-skeleton { display:grid; gap:7px; margin-top:10px; }
+.chat-skeleton span { height:9px; border-radius:999px; background:rgba(19,83,216,.24); animation:pulseFetch 1s ease-in-out infinite alternate; }
+.chat-skeleton span:nth-child(1){ width:72%; }
+.chat-skeleton span:nth-child(2){ width:88%; animation-delay:.12s; }
+.chat-skeleton span:nth-child(3){ width:58%; animation-delay:.2s; }
 .chat-spinner { width:16px; height:16px; border-radius:999px; border:2px solid rgba(19,83,216,.18); border-top-color:var(--primary); animation:spin .8s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
-@keyframes pulseFetch { from { opacity:.62; transform:translateY(1px); } to { opacity:1; transform:translateY(0); } }
+@keyframes pulseFetch { from { opacity:.48; transform:translateY(1px); } to { opacity:1; transform:translateY(0); } }
 @keyframes bubbleIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
 .chat-text { white-space:pre-wrap; word-break:break-word; line-height:1.6; }
+.chat-text.collapsed { position:relative; max-height: 260px; overflow:hidden; }
+.chat-text.collapsed::after { content:''; position:absolute; left:0; right:0; bottom:0; height:72px; background:linear-gradient(to bottom, rgba(255,255,255,0), #fff); pointer-events:none; }
+.chat-bubble.me .chat-text.collapsed::after { background:linear-gradient(to bottom, rgba(216,248,198,0), #d8f8c6); }
 .chat-attachments { display:grid; gap:8px; margin-top:8px; }
 .chat-file { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 10px; border-radius:12px; background:rgba(255,255,255,.65); border:1px solid rgba(216,222,232,.8); }
 .chat-input-row { margin-top: 12px; display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; }
@@ -3991,19 +4009,27 @@ body.temp-chat-mode .chat-panel { display:block; }
     <div class="chat-input-row">
       <textarea id="chatInput" placeholder="输入临时消息；调试命令、日志、链接、备注都可以放这里"></textarea>
       <button id="chatPickFilesBtn" class="btn btn-soft">选择文件</button>
+      <button id="chatPasteBtn" class="btn btn-paste btn-icon"><span class="material-symbols-outlined" style="font-size:18px;">content_paste_go</span><span>粘贴</span></button>
       <button id="chatSendBtn" class="btn btn-primary">发送</button>
       <input id="chatFileInput" type="file" multiple hidden>
     </div>
   </section>
 
   <section class="section-head">
-    <div>
-      <div class="section-title">卡片列表</div>
-      <div class="section-subtitle" id="countText">0 张卡片</div>
+    <div class="section-head-title">
+      <div>
+        <div class="section-title">卡片列表</div>
+        <div class="section-subtitle" id="countText">0 张卡片</div>
+      </div>
     </div>
     <div class="search-row">
-      <input id="searchInput" placeholder="搜索卡片内容或附件文件名">
-      <button id="refreshBtn" class="btn btn-ghost">刷新</button>
+      <div class="search-box">
+        <span class="material-symbols-outlined">search</span>
+        <input id="searchInput" placeholder="搜索卡片内容或附件文件名">
+        <button id="clearSearchBtn" class="search-clear" type="button" aria-label="清除搜索">
+          <span class="material-symbols-outlined">close</span>
+        </button>
+      </div>
     </div>
   </section>
 
@@ -4072,6 +4098,7 @@ let cards = [];
 let pendingFiles = [];
 let chatMessages = [];
 let chatFetchingCount = 0;
+const chatExpandedIds = new Set();
 let chatPendingFiles = [];
 const clientId = 'web-' + Math.random().toString(36).slice(2, 8);
 let socket;
@@ -4162,6 +4189,35 @@ function renderCardText(text) {
   return result;
 }
 
+function cardTypeLabel(attachments) {
+  const files = Array.isArray(attachments) ? attachments : [];
+  if (!files.length) return null;
+  if (files.every(file => file.kind === 'image')) {
+    return files.length === 1 ? '图片' : files.length + ' 张图片';
+  }
+  if (files.length === 1) {
+    const kind = files[0].kind || 'other';
+    if (kind === 'audio') return '音频';
+    if (kind === 'video') return '视频';
+    if (kind === 'document') return '文档';
+    if (kind === 'archive') return '压缩包';
+    if (kind === 'image') return '图片';
+    return '附件';
+  }
+  return files.length + ' 个附件';
+}
+
+function renderCardTags(card) {
+  const labels = ['创建 ' + new Date(card.createdAt).toLocaleString()];
+  if (card.source === 'shared') labels.push('分享导入');
+  const typeLabel = cardTypeLabel(card.attachments || []);
+  if (typeLabel) labels.push(typeLabel);
+  if (card.pinned) labels.push('置顶');
+  return labels.map(label =>
+    '<span class="card-tag ' + (label === '置顶' ? 'primary' : '') + '">' + escapeHtml(label) + '</span>'
+  ).join('');
+}
+
 function renderPickedFiles() {
   if (!pendingFiles.length) {
     pickedFiles.innerHTML = '<span class="chip">未选择附件</span>';
@@ -4184,7 +4240,7 @@ function renderChat() {
     return;
   }
   const fetchingHtml = chatFetchingCount
-    ? '<div class="chat-fetching"><span class="chat-spinner"></span><span>正在抓取公众号文章…</span></div>'
+    ? '<div class="chat-bubble chat-fetching-card"><div class="chat-meta"><span class="chat-chip primary">微信公众号</span><span class="chat-spinner"></span></div><div class="chat-text">正在抓取公众号文章…</div><div class="chat-skeleton"><span></span><span></span><span></span></div></div>'
     : '';
   const orderedMessages = [...chatMessages].reverse();
   chatWindow.innerHTML = fetchingHtml + orderedMessages.map(message => {
@@ -4195,12 +4251,19 @@ function renderChat() {
         : '';
       return '<div class="chat-file"><span>' + escapeHtml(file.name) + ' · ' + formatBytes(file.size || 0) + '</span><a class="action-link" href="' + file.downloadUrl + '" download>下载</a></div>' + preview;
     }).join('');
+    const isLongArticle = String(message.sender || '') === '微信公众号' && String(message.text || '').length > 520;
+    const isExpanded = chatExpandedIds.has(message.id);
+    const textClass = 'chat-text' + (isLongArticle && !isExpanded ? ' collapsed' : '');
+    const expandAction = isLongArticle
+      ? '<button class="chat-chip" data-action="toggle-chat-expanded" data-message-id="' + escapeHtml(message.id) + '">' + (isExpanded ? '收起正文' : '展开全文') + '</button>'
+      : '';
     return '<div class="chat-bubble ' + (mine ? 'me' : '') + '">' +
       '<button class="chat-copy-button" data-action="copy-chat" data-message-id="' + escapeHtml(message.id) + '" title="复制"><span class="material-symbols-outlined">content_copy</span></button>' +
       '<div class="chat-meta"><span class="chat-chip primary">' + (mine ? '我' : escapeHtml(message.sender || '对方')) + '</span><span class="chat-chip">' + new Date(message.createdAt).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) + '</span></div>' +
-      (message.text ? '<div class="chat-text">' + renderCardText(message.text || '') + '</div>' : '') +
+      (message.text ? '<div class="' + textClass + '">' + renderCardText(message.text || '') + '</div>' : '') +
       (attachments ? '<div class="chat-attachments">' + attachments + '</div>' : '') +
       '<div class="chat-actions">' +
+        expandAction +
         '<button class="chat-chip primary" data-action="save-chat-card" data-message-id="' + escapeHtml(message.id) + '">存为卡片</button>' +
         '<button class="chat-chip" data-action="delete-chat" data-message-id="' + escapeHtml(message.id) + '">删除</button>' +
       '</div>' +
@@ -4271,7 +4334,8 @@ function renderCards() {
   cardsRoot.innerHTML = filtered.map(card => {
     const bundleUrl = card.bundleDownloadUrl || '';
     const imageFiles = (card.attachments || []).filter(file => file.kind === 'image');
-    const collapsed = !expandedCardIds.has(card.id);
+    const hasText = Boolean(String(card.text || '').trim());
+    const collapsed = hasText && !expandedCardIds.has(card.id);
     const attachments = (card.attachments || []).map(file => {
       let preview = '';
       if (file.previewable && file.kind === 'image') {
@@ -4299,19 +4363,19 @@ function renderCards() {
 
     return '<article class="panel card ' + (collapsed ? 'collapsed' : '') + '">' +
       '<div class="card-top">' +
+        '<div class="card-meta">' + renderCardTags(card) + '</div>' +
         '<button class="card-copy-button" data-action="copy-card" data-card-id="' + escapeHtml(card.id) + '" title="复制"><span class="material-symbols-outlined">content_copy</span></button>' +
-        '<span>' + (card.pinned ? '置顶 · ' : '') + '创建 ' + new Date(card.createdAt).toLocaleString() + '</span>' +
       '</div>' +
       '<div class="card-body">' +
-        '<div class="card-text">' + renderCardText(card.text || '') + '</div>' +
+        (hasText ? '<div class="card-text">' + renderCardText(card.text || '') + '</div>' : '') +
         ((card.attachments || []).length > 1 && bundleUrl
           ? '<div class="card-actions" style="margin-top:14px;"><a class="action-link" href="' + bundleUrl + '" download>全部下载</a></div>'
           : '') +
         (attachments ? '<div class="attachment-list">' + attachments + '</div>' : '') +
       '</div>' +
-      '<div class="card-actions">' +
+      (hasText ? '<div class="card-actions">' +
         '<button class="btn btn-ghost" data-action="toggle-collapse" data-card-id="' + escapeHtml(card.id) + '">' + (collapsed ? '展开' : '折叠') + '</button>' +
-      '</div>' +
+      '</div>' : '') +
     '</article>';
   }).join('');
 }
@@ -4507,6 +4571,9 @@ chatWindow.addEventListener('click', async event => {
   const action = target.dataset.action || '';
   if (action === 'save-chat-card') {
     await saveChatMessageAsCard(messageId);
+  } else if (action === 'toggle-chat-expanded') {
+    if (chatExpandedIds.has(messageId)) chatExpandedIds.delete(messageId); else chatExpandedIds.add(messageId);
+    renderChat();
   } else if (action === 'copy-chat') {
     await copyCard(message.text || '');
   } else if (action === 'delete-chat') {
@@ -4543,6 +4610,33 @@ async function pasteIntoComposer() {
       return;
     }
     composerInput.value = text;
+    showToast('已粘贴文字');
+  } catch (_) {
+    showToast('当前浏览器不支持直接读取剪贴板');
+  }
+}
+
+async function pasteIntoChat() {
+  if (!window.isSecureContext) {
+    chatInput.focus();
+    showToast('请直接在输入框按 Ctrl/Cmd+V 或长按粘贴，HTTP 页面不支持按钮读取剪贴板');
+    return;
+  }
+  const clipboardFiles = await readImagesFromClipboard();
+  if (clipboardFiles.length) {
+    chatPendingFiles = chatPendingFiles.concat(clipboardFiles);
+    renderChatPickedFiles();
+    showToast('已粘贴 ' + clipboardFiles.length + ' 张图片');
+    return;
+  }
+  try {
+    const text = await navigator.clipboard.readText();
+    if (!text) {
+      showToast('剪贴板里没有可粘贴的文字');
+      return;
+    }
+    chatInput.value = text;
+    chatInput.focus();
     showToast('已粘贴文字');
   } catch (_) {
     showToast('当前浏览器不支持直接读取剪贴板');
@@ -4592,10 +4686,10 @@ function readImageFilesFromPasteEvent(event) {
 
 document.getElementById('pickFilesBtn').addEventListener('click', () => fileInput.click());
 document.getElementById('chatPickFilesBtn').addEventListener('click', () => chatFileInput.click());
+document.getElementById('chatPasteBtn').addEventListener('click', pasteIntoChat);
 document.getElementById('chatSendBtn').addEventListener('click', sendChatMessage);
 document.getElementById('clearChatBtn').addEventListener('click', clearChat);
 document.getElementById('createBtn').addEventListener('click', createCard);
-document.getElementById('refreshBtn').addEventListener('click', refreshCards);
 document.getElementById('pasteBtn').addEventListener('click', pasteIntoComposer);
 document.getElementById('copyAddressBtn').addEventListener('click', copyAddress);
 document.getElementById('copyAddressBtn').addEventListener('keydown', event => {
@@ -4613,6 +4707,11 @@ document.getElementById('clearBtn').addEventListener('click', () => {
   renderPickedFiles();
 });
 searchInput.addEventListener('input', renderCards);
+document.getElementById('clearSearchBtn').addEventListener('click', () => {
+  searchInput.value = '';
+  searchInput.focus();
+  renderCards();
+});
 fileInput.addEventListener('change', event => {
   pendingFiles = Array.from(event.target.files || []);
   renderPickedFiles();
@@ -4633,6 +4732,29 @@ composerInput.addEventListener('paste', event => {
   event.preventDefault();
   pendingFiles = pendingFiles.concat(imageFiles);
   renderPickedFiles();
+  showToast('已粘贴 ' + imageFiles.length + ' 张图片');
+});
+chatInput.addEventListener('paste', event => {
+  const imageFiles = readImageFilesFromPasteEvent(event);
+  if (!imageFiles.length) return;
+  event.preventDefault();
+  chatPendingFiles = chatPendingFiles.concat(imageFiles);
+  renderChatPickedFiles();
+  showToast('已粘贴 ' + imageFiles.length + ' 张图片');
+});
+document.addEventListener('paste', event => {
+  if (!document.body.classList.contains('temp-chat-mode')) return;
+  const target = event.target;
+  if (target && (
+    target.tagName === 'TEXTAREA' ||
+    target.tagName === 'INPUT' ||
+    target.isContentEditable
+  )) return;
+  const imageFiles = readImageFilesFromPasteEvent(event);
+  if (!imageFiles.length) return;
+  event.preventDefault();
+  chatPendingFiles = chatPendingFiles.concat(imageFiles);
+  renderChatPickedFiles();
   showToast('已粘贴 ' + imageFiles.length + ' 张图片');
 });
 document.getElementById('selectAllBtn').addEventListener('click', () => { currentFilteredIds.forEach(id => selectedCardIds.add(id)); renderCards(); });
@@ -5731,6 +5853,7 @@ class _LocalShareTempChatPage extends StatefulWidget {
 class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
   final TextEditingController _controller = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  final Set<String> _expandedMessageIds = <String>{};
   Timer? _refreshTimer;
   bool _sending = false;
 
@@ -5860,6 +5983,11 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
                       final message = messages[messageIndex];
                       final attachments = _attachmentsOf(message);
                       final isPhone = message.sender == 'phone';
+                      final isWeChatArticle = message.sender == '微信公众号';
+                      final isLongArticle =
+                          isWeChatArticle && message.text.length > 520;
+                      final isExpanded =
+                          _expandedMessageIds.contains(message.id);
                       return Align(
                         alignment: isPhone
                             ? Alignment.centerRight
@@ -5941,9 +6069,41 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
                                           message.text.isEmpty
                                               ? '附件消息'
                                               : message.text,
+                                          maxLines: isLongArticle && !isExpanded
+                                              ? 10
+                                              : null,
+                                          overflow: isLongArticle && !isExpanded
+                                              ? TextOverflow.fade
+                                              : TextOverflow.visible,
                                           style: const TextStyle(height: 1.45),
                                         ),
                                       ),
+                                      if (isLongArticle) ...[
+                                        const SizedBox(height: 8),
+                                        ActionChip(
+                                          visualDensity: VisualDensity.compact,
+                                          avatar: Icon(
+                                            isExpanded
+                                                ? Icons.unfold_less_rounded
+                                                : Icons.unfold_more_rounded,
+                                            size: 16,
+                                          ),
+                                          label: Text(
+                                            isExpanded ? '收起正文' : '展开全文',
+                                          ),
+                                          onPressed: () {
+                                            setState(() {
+                                              if (isExpanded) {
+                                                _expandedMessageIds
+                                                    .remove(message.id);
+                                              } else {
+                                                _expandedMessageIds
+                                                    .add(message.id);
+                                              }
+                                            });
+                                          },
+                                        ),
+                                      ],
                                       if (attachments.isNotEmpty) ...[
                                         const SizedBox(height: 8),
                                         Text(
@@ -6083,43 +6243,88 @@ class _WeChatFetchingBubbleState extends State<_WeChatFetchingBubble>
 
   @override
   Widget build(BuildContext context) {
-    return FadeTransition(
-      opacity: Tween<double>(begin: 0.62, end: 1).animate(
-        CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
-      ),
-      child: Container(
-        constraints: const BoxConstraints(maxWidth: 320),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(color: const Color(0xFFE2E7F1)),
-          boxShadow: [
-            BoxShadow(
-              color: const Color(0xFF1353D8).withValues(alpha: 0.07),
-              blurRadius: 18,
-              offset: const Offset(0, 10),
-            ),
-          ],
-        ),
-        child: const Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            SizedBox(
-              width: 16,
-              height: 16,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-            SizedBox(width: 10),
-            Text(
-              '正在抓取公众号文章…',
-              style: TextStyle(
-                fontWeight: FontWeight.w800,
-                color: Color(0xFF1353D8),
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        final alpha = 0.34 + _controller.value * 0.22;
+        return Container(
+          constraints: const BoxConstraints(maxWidth: 320),
+          padding: const EdgeInsets.fromLTRB(12, 12, 42, 12),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: const Color(0xFFE2E7F1)),
+            boxShadow: [
+              BoxShadow(
+                color: const Color(0xFF1353D8).withValues(alpha: 0.07),
+                blurRadius: 18,
+                offset: const Offset(0, 10),
               ),
-            ),
-          ],
-        ),
+            ],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: const [
+                  Chip(
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    visualDensity: VisualDensity.compact,
+                    label: Text('微信公众号'),
+                    labelStyle: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w800,
+                      color: Color(0xFF1353D8),
+                    ),
+                    backgroundColor: Color(0xFFEAF1FF),
+                    side: BorderSide.none,
+                  ),
+                  SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              const Text(
+                '正在抓取公众号文章…',
+                style: TextStyle(
+                  fontWeight: FontWeight.w900,
+                  color: Color(0xFF1353D8),
+                ),
+              ),
+              const SizedBox(height: 10),
+              _SkeletonLine(width: 220, alpha: alpha),
+              const SizedBox(height: 7),
+              _SkeletonLine(width: 260, alpha: alpha),
+              const SizedBox(height: 7),
+              _SkeletonLine(width: 180, alpha: alpha),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _SkeletonLine extends StatelessWidget {
+  const _SkeletonLine({required this.width, required this.alpha});
+
+  final double width;
+  final double alpha;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: width,
+      height: 9,
+      decoration: BoxDecoration(
+        color: const Color(0xFF1353D8).withValues(alpha: alpha),
+        borderRadius: BorderRadius.circular(999),
       ),
     );
   }
