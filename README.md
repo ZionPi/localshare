@@ -23,11 +23,19 @@
 
 ## 构建
 
-项目提供 `Makefile`：
+项目提供 `Makefile`。构建 release 包必须走 Makefile，让它读取本机私有配置 `localshare.local.mk`：
 
 ```bash
 make release-apk
 ```
+
+不要直接运行裸命令：
+
+```bash
+flutter build apk --release
+```
+
+裸命令不会注入 `WECHAT_ARTICLE_API_BASE_URL`，手机端复制微信公众号链接后会无法自动抓文章。
 
 输出文件：
 
@@ -51,8 +59,8 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 
 其中：
 
-- `make release-apk`：只构建 release APK
-- `make install-release`：先构建，再安装 release APK
+- `make release-apk`：只构建 release APK，并检查 `WECHAT_ARTICLE_API_BASE_URL`
+- `make install-release`：先构建，再覆盖安装 release APK
 - `make install-release-apk`：直接安装本地现成的 release APK，不会重新编译
 
 ## 签名注意事项

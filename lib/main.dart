@@ -1297,6 +1297,21 @@ class _MyHomePageState extends State<MyHomePage>
     }
   }
 
+  Future<bool> _fetchWeChatArticleFromTempChatMessage(String messageId) async {
+    final message = _chatMessages
+        .cast<TempChatMessage?>()
+        .firstWhere((item) => item?.id == messageId, orElse: () => null);
+    if (message == null) {
+      return false;
+    }
+    final wechatUrl = _extractWeChatArticleUrl(message.text);
+    if (wechatUrl == null) {
+      return false;
+    }
+    unawaited(_fetchWeChatArticleToTempChat(wechatUrl));
+    return true;
+  }
+
   Future<_WeChatArticleResult> _fetchWeChatArticle(String url) async {
     final client = HttpClient();
     try {
@@ -2275,6 +2290,9 @@ class _MyHomePageState extends State<MyHomePage>
           onSaveMessageAsCard: _saveTempChatMessageAsCard,
           onDeleteMessage: _deleteTempChatMessage,
           onCopyMessageText: _copyTempChatText,
+          onFetchWeChatArticle: _fetchWeChatArticleFromTempChatMessage,
+          hasWeChatArticleLink: (text) =>
+              _extractWeChatArticleUrl(text) != null,
           isFetchingWeChatArticle: () => _pendingWeChatFetchUrls.isNotEmpty,
         ),
       ),
@@ -2922,6 +2940,8 @@ class _MyHomePageState extends State<MyHomePage>
             '/api/chat/messages/<messageId>/delete', _handleDeleteChatMessage)
         ..post('/api/chat/messages/<messageId>/save-card',
             _handleSaveChatMessageAsCard)
+        ..post('/api/chat/messages/<messageId>/fetch-wechat',
+            _handleFetchWeChatArticleFromChatMessage)
         ..post('/api/chat/clear', _handleClearChat)
         ..get('/cards/<cardId>/bundle', _handleDownloadCardBundle)
         ..get('/files/<attachmentId>', _handleGetFile)
@@ -3294,6 +3314,20 @@ class _MyHomePageState extends State<MyHomePage>
       return Response.notFound('Message not found');
     }
     return _jsonResponse({'ok': true, 'cardId': card.id});
+  }
+
+  Future<Response> _handleFetchWeChatArticleFromChatMessage(
+    Request request,
+    String messageId,
+  ) async {
+    final started = await _fetchWeChatArticleFromTempChatMessage(messageId);
+    if (!started) {
+      return _jsonResponse(
+        {'ok': false, 'error': 'No WeChat article link found'},
+        statusCode: 400,
+      );
+    }
+    return _jsonResponse({'ok': true});
   }
 
   Future<Response> _handleClearChat(Request request) async {
@@ -4167,6 +4201,25 @@ function extractFirstUrl(text) {
   return null;
 }
 
+function extractWeChatArticleUrl(text) {
+  const value = String(text || '');
+  const urlPattern = /https?:\\/\\/[^\\s<>()]+/gi;
+  for (const match of value.matchAll(urlPattern)) {
+    const normalized = (match[0] || '').replace(/[\\]\\)\\}\\.,;:!?]+\$/, '');
+    try {
+      const url = new URL(normalized);
+      if (
+        (url.protocol === 'http:' || url.protocol === 'https:') &&
+        url.hostname.toLowerCase() === 'mp.weixin.qq.com' &&
+        (url.pathname === '/s' || url.pathname.startsWith('/s/'))
+      ) {
+        return url.toString();
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
 function renderCardText(text) {
   const value = String(text || '');
   if (!value.trim()) return '无文本内容';
@@ -4257,6 +4310,9 @@ function renderChat() {
     const expandAction = isLongArticle
       ? '<button class="chat-chip" data-action="toggle-chat-expanded" data-message-id="' + escapeHtml(message.id) + '">' + (isExpanded ? '收起正文' : '展开全文') + '</button>'
       : '';
+    const fetchAction = extractWeChatArticleUrl(message.text || '')
+      ? '<button class="chat-chip primary" data-action="fetch-wechat" data-message-id="' + escapeHtml(message.id) + '">获取</button>'
+      : '';
     return '<div class="chat-bubble ' + (mine ? 'me' : '') + '">' +
       '<button class="chat-copy-button" data-action="copy-chat" data-message-id="' + escapeHtml(message.id) + '" title="复制"><span class="material-symbols-outlined">content_copy</span></button>' +
       '<div class="chat-meta"><span class="chat-chip primary">' + (mine ? '我' : escapeHtml(message.sender || '对方')) + '</span><span class="chat-chip">' + new Date(message.createdAt).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) + '</span></div>' +
@@ -4264,6 +4320,7 @@ function renderChat() {
       (attachments ? '<div class="chat-attachments">' + attachments + '</div>' : '') +
       '<div class="chat-actions">' +
         expandAction +
+        fetchAction +
         '<button class="chat-chip primary" data-action="save-chat-card" data-message-id="' + escapeHtml(message.id) + '">存为卡片</button>' +
         '<button class="chat-chip" data-action="delete-chat" data-message-id="' + escapeHtml(message.id) + '">删除</button>' +
       '</div>' +
@@ -4305,6 +4362,16 @@ async function saveChatMessageAsCard(messageId) {
   await fetch('/api/chat/messages/' + encodeURIComponent(messageId) + '/save-card', {method: 'POST'});
   showToast('已存为卡片');
   await refreshCards();
+}
+
+async function fetchWeChatArticleFromMessage(messageId) {
+  const response = await fetch('/api/chat/messages/' + encodeURIComponent(messageId) + '/fetch-wechat', {method: 'POST'});
+  if (!response.ok) {
+    showToast('没有可获取的公众号文章');
+    return;
+  }
+  showToast('正在获取');
+  await refreshChat();
 }
 
 async function clearChat() {
@@ -4571,6 +4638,8 @@ chatWindow.addEventListener('click', async event => {
   const action = target.dataset.action || '';
   if (action === 'save-chat-card') {
     await saveChatMessageAsCard(messageId);
+  } else if (action === 'fetch-wechat') {
+    await fetchWeChatArticleFromMessage(messageId);
   } else if (action === 'toggle-chat-expanded') {
     if (chatExpandedIds.has(messageId)) chatExpandedIds.delete(messageId); else chatExpandedIds.add(messageId);
     renderChat();
@@ -5829,6 +5898,8 @@ class _LocalShareTempChatPage extends StatefulWidget {
     required this.onSaveMessageAsCard,
     required this.onDeleteMessage,
     required this.onCopyMessageText,
+    required this.onFetchWeChatArticle,
+    required this.hasWeChatArticleLink,
     required this.isFetchingWeChatArticle,
   });
 
@@ -5843,6 +5914,8 @@ class _LocalShareTempChatPage extends StatefulWidget {
   final Future<CardItem?> Function(String messageId) onSaveMessageAsCard;
   final Future<void> Function(String messageId) onDeleteMessage;
   final Future<void> Function(String text) onCopyMessageText;
+  final Future<bool> Function(String messageId) onFetchWeChatArticle;
+  final bool Function(String text) hasWeChatArticleLink;
   final bool Function() isFetchingWeChatArticle;
 
   @override
@@ -5984,6 +6057,8 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
                       final attachments = _attachmentsOf(message);
                       final isPhone = message.sender == 'phone';
                       final isWeChatArticle = message.sender == '微信公众号';
+                      final hasWeChatArticleLink =
+                          widget.hasWeChatArticleLink(message.text);
                       final isLongArticle =
                           isWeChatArticle && message.text.length > 520;
                       final isExpanded =
@@ -6119,6 +6194,36 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
                                         spacing: 8,
                                         runSpacing: 4,
                                         children: [
+                                          if (hasWeChatArticleLink)
+                                            ActionChip(
+                                              visualDensity:
+                                                  VisualDensity.compact,
+                                              avatar: const Icon(
+                                                Icons.download_rounded,
+                                                size: 16,
+                                              ),
+                                              label: const Text('获取'),
+                                              onPressed: () async {
+                                                final messenger =
+                                                    ScaffoldMessenger.of(
+                                                  context,
+                                                );
+                                                final started = await widget
+                                                    .onFetchWeChatArticle(
+                                                  message.id,
+                                                );
+                                                if (mounted) {
+                                                  messenger.showSnackBar(
+                                                    SnackBar(
+                                                      content: Text(started
+                                                          ? '正在获取'
+                                                          : '没有可获取的公众号文章'),
+                                                    ),
+                                                  );
+                                                  setState(() {});
+                                                }
+                                              },
+                                            ),
                                           ActionChip(
                                             visualDensity:
                                                 VisualDensity.compact,
