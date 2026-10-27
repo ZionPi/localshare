@@ -35,7 +35,7 @@ make release-apk
 flutter build apk --release
 ```
 
-裸命令不会注入 `WECHAT_ARTICLE_API_BASE_URL`，手机端复制微信公众号链接后会无法自动抓文章。
+裸命令不会注入 `WECHAT_ARTICLE_API_BASE_URL`，手机端复制支持的链接后会无法自动抓取正文。
 
 输出文件：
 

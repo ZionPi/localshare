@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'attachment_filename.dart';
+import 'web_upload.dart';
 import 'package:flutter/gestures.dart';
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
@@ -738,6 +740,8 @@ class _MyHomePageState extends State<MyHomePage>
   String? _lastCapturedClipboardFingerprint;
   String? _lastLocalShareCopiedText;
   final Set<String> _pendingWeChatFetchUrls = <String>{};
+  final Set<String> _pendingYouTubeTranscriptUrls = <String>{};
+  final Set<String> _pendingGenericTextUrls = <String>{};
 
   @override
   void initState() {
@@ -982,7 +986,12 @@ class _MyHomePageState extends State<MyHomePage>
       'messages': _chatMessages
           .map((message) => message.toPublicJson(_chatAttachments))
           .toList(),
-      'wechatFetchingCount': _pendingWeChatFetchUrls.length,
+      'wechatFetchingCount': _pendingWeChatFetchUrls.length +
+          _pendingYouTubeTranscriptUrls.length +
+          _pendingGenericTextUrls.length,
+      'linkTextFetchingCount': _pendingWeChatFetchUrls.length +
+          _pendingYouTubeTranscriptUrls.length +
+          _pendingGenericTextUrls.length,
       'serverTime': DateTime.now().toIso8601String(),
     };
   }
@@ -1028,15 +1037,15 @@ class _MyHomePageState extends State<MyHomePage>
       final displayName =
           payload.name.trim().isEmpty ? 'attachment' : payload.name.trim();
       final attachmentId = _generateId('chat-file');
-      final storedFileName = _buildStoredFileName(displayName, attachmentId);
+      final storedFileName = buildStoredFileName(displayName, attachmentId);
       final targetPath = '${storage.chatAttachmentsDir.path}/$storedFileName';
-      await File(targetPath).writeAsBytes(payload.bytes, flush: true);
+      await payload.writeTo(File(targetPath));
       final attachment = TempChatAttachment(
         id: attachmentId,
         messageId: message.id,
         name: displayName,
         mimeType: payload.mimeType,
-        size: payload.bytes.length,
+        size: await File(targetPath).length(),
         localPath: targetPath,
         kind: _kindFromMimeType(payload.mimeType, displayName),
         createdAt: now,
@@ -1118,7 +1127,8 @@ class _MyHomePageState extends State<MyHomePage>
         _IncomingAttachmentPayload(
           name: attachment.name,
           mimeType: attachment.mimeType,
-          bytes: await file.readAsBytes(),
+          bytes: const [],
+          sourceFile: file,
         ),
       );
     }
@@ -1186,10 +1196,7 @@ class _MyHomePageState extends State<MyHomePage>
       _lastCapturedClipboardFingerprint = fingerprint;
       await _createTempChatMessage(text: text, sender: '手机剪贴板');
 
-      final wechatUrl = _extractWeChatArticleUrl(text);
-      if (wechatUrl != null) {
-        unawaited(_fetchWeChatArticleToTempChat(wechatUrl));
-      }
+      _fetchSupportedLinkTextFromText(text);
     } catch (error) {
       debugPrint('clipboard monitor failed: $error');
     }
@@ -1213,7 +1220,7 @@ class _MyHomePageState extends State<MyHomePage>
         _chatMessages.last.text.trim() == value) {
       return false;
     }
-    if (_extractWeChatArticleUrl(value) != null) {
+    if (_extractSupportedTextUrl(value) != null) {
       return true;
     }
     if (_looksLikeSensitiveClipboard(value)) {
@@ -1257,6 +1264,74 @@ class _MyHomePageState extends State<MyHomePage>
       }
     }
     return null;
+  }
+
+  String? _extractFirstHttpUrl(String text) {
+    final matches = RegExp(r'https?://[^\s<>()]+').allMatches(text);
+    for (final match in matches) {
+      final candidate = (match.group(0) ?? '').replaceFirst(
+        RegExp(r'[\]\)\}\.,;:!?]+$'),
+        '',
+      );
+      final uri = Uri.tryParse(candidate);
+      if (uri == null) {
+        continue;
+      }
+      if (uri.scheme == 'http' || uri.scheme == 'https') {
+        return uri.toString();
+      }
+    }
+    return null;
+  }
+
+  String? _extractYouTubeUrl(String text) {
+    final matches = RegExp(r'https?://[^\s<>()]+').allMatches(text);
+    for (final match in matches) {
+      final candidate = (match.group(0) ?? '').replaceFirst(
+        RegExp(r'[\]\)\}\.,;:!?]+$'),
+        '',
+      );
+      final uri = Uri.tryParse(candidate);
+      if (uri == null) {
+        continue;
+      }
+      if (uri.scheme != 'http' && uri.scheme != 'https') {
+        continue;
+      }
+      final host = uri.host.toLowerCase();
+      final isYouTubeHost = host == 'youtu.be' ||
+          host == 'youtube.com' ||
+          host.endsWith('.youtube.com') ||
+          host == 'youtube-nocookie.com' ||
+          host.endsWith('.youtube-nocookie.com');
+      if (isYouTubeHost) {
+        return uri.toString();
+      }
+    }
+    return null;
+  }
+
+  String? _extractSupportedTextUrl(String text) {
+    return _extractWeChatArticleUrl(text) ??
+        _extractYouTubeUrl(text) ??
+        _extractFirstHttpUrl(text);
+  }
+
+  void _fetchSupportedLinkTextFromText(String text) {
+    final wechatUrl = _extractWeChatArticleUrl(text);
+    if (wechatUrl != null) {
+      unawaited(_fetchWeChatArticleToTempChat(wechatUrl));
+      return;
+    }
+    final youtubeUrl = _extractYouTubeUrl(text);
+    if (youtubeUrl != null) {
+      unawaited(_fetchYouTubeTranscriptToTempChat(youtubeUrl));
+      return;
+    }
+    final genericUrl = _extractFirstHttpUrl(text);
+    if (genericUrl != null) {
+      unawaited(_fetchGenericUrlTextToTempChat(genericUrl));
+    }
   }
 
   Future<void> _fetchWeChatArticleToTempChat(String url) async {
@@ -1305,11 +1380,21 @@ class _MyHomePageState extends State<MyHomePage>
       return false;
     }
     final wechatUrl = _extractWeChatArticleUrl(message.text);
-    if (wechatUrl == null) {
-      return false;
+    if (wechatUrl != null) {
+      unawaited(_fetchWeChatArticleToTempChat(wechatUrl));
+      return true;
     }
-    unawaited(_fetchWeChatArticleToTempChat(wechatUrl));
-    return true;
+    final youtubeUrl = _extractYouTubeUrl(message.text);
+    if (youtubeUrl != null) {
+      unawaited(_fetchYouTubeTranscriptToTempChat(youtubeUrl));
+      return true;
+    }
+    final genericUrl = _extractFirstHttpUrl(message.text);
+    if (genericUrl != null) {
+      unawaited(_fetchGenericUrlTextToTempChat(genericUrl));
+      return true;
+    }
+    return false;
   }
 
   Future<_WeChatArticleResult> _fetchWeChatArticle(String url) async {
@@ -1331,6 +1416,193 @@ class _MyHomePageState extends State<MyHomePage>
         throw StateError(message);
       }
       return _WeChatArticleResult.fromJson(decoded);
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _fetchYouTubeTranscriptToTempChat(String url) async {
+    if (_wechatArticleApiBaseUrl.trim().isEmpty) {
+      return;
+    }
+    if (!_pendingYouTubeTranscriptUrls.add(url)) {
+      return;
+    }
+    _broadcastChatSnapshot();
+    if (mounted) {
+      setState(() {});
+    }
+    try {
+      final transcript = await _fetchYouTubeTranscript(url);
+      final text = transcript.fullText.trim();
+      if (text.isEmpty) {
+        return;
+      }
+      final messageText = transcript.title.trim().isEmpty
+          ? text
+          : '${transcript.title}\n\n$text';
+      if (_chatMessages
+          .any((message) => message.text.trim() == messageText.trim())) {
+        return;
+      }
+      await _createTempChatMessage(text: messageText, sender: 'YouTube');
+    } catch (error) {
+      debugPrint('youtube transcript fetch failed: $error');
+      await _createTempChatMessage(
+        text: 'YouTube 文本获取失败：$url\n$error',
+        sender: 'YouTube',
+      );
+    } finally {
+      _pendingYouTubeTranscriptUrls.remove(url);
+      _broadcastChatSnapshot();
+      if (mounted) {
+        setState(() {});
+      }
+    }
+  }
+
+  Future<_YouTubeTranscriptResult> _fetchYouTubeTranscript(String url) async {
+    final client = HttpClient();
+    try {
+      client.connectionTimeout = const Duration(seconds: 10);
+      final createRequest = await client.postUrl(
+        Uri.parse('$_wechatArticleApiBaseUrl/api/transcript-jobs'),
+      );
+      createRequest.headers.contentType = ContentType.json;
+      createRequest.write(
+        jsonEncode({
+          'url': url,
+          'languages': <String>['zh-Hans', 'zh', 'en'],
+        }),
+      );
+      final createResponse = await createRequest.close().timeout(
+            const Duration(seconds: 25),
+          );
+      final createBody = await utf8.decoder.bind(createResponse).join();
+      final createPayload = jsonDecode(createBody) as Map<String, dynamic>;
+      if (createResponse.statusCode < 200 || createResponse.statusCode >= 300) {
+        final message = createPayload['error']?.toString() ?? '提交任务失败';
+        throw StateError(message);
+      }
+      final jobId = createPayload['id']?.toString().trim() ?? '';
+      if (jobId.isEmpty) {
+        throw StateError('字幕任务没有返回 id');
+      }
+
+      final deadline = DateTime.now().add(const Duration(minutes: 10));
+      while (DateTime.now().isBefore(deadline)) {
+        final statusRequest = await client.getUrl(
+          Uri.parse('$_wechatArticleApiBaseUrl/api/transcript-jobs/$jobId'),
+        );
+        final statusResponse = await statusRequest.close().timeout(
+              const Duration(seconds: 25),
+            );
+        final statusBody = await utf8.decoder.bind(statusResponse).join();
+        final statusPayload = jsonDecode(statusBody) as Map<String, dynamic>;
+        if (statusResponse.statusCode < 200 ||
+            statusResponse.statusCode >= 300) {
+          final message = statusPayload['error']?.toString() ?? '查询任务失败';
+          throw StateError(message);
+        }
+        final status = statusPayload['status']?.toString() ?? '';
+        if (status == 'completed') {
+          final inlineResult = statusPayload['result'];
+          final resultPayload = inlineResult is Map<String, dynamic>
+              ? inlineResult
+              : await _fetchYouTubeTranscriptJobResult(client, jobId);
+          return _YouTubeTranscriptResult.fromJson(resultPayload);
+        }
+        if (status == 'failed') {
+          final message = statusPayload['error']?.toString() ?? '字幕任务失败';
+          throw StateError(message);
+        }
+        await Future<void>.delayed(const Duration(seconds: 2));
+      }
+      throw StateError('字幕任务超时');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<Map<String, dynamic>> _fetchYouTubeTranscriptJobResult(
+    HttpClient client,
+    String jobId,
+  ) async {
+    final resultRequest = await client.getUrl(
+      Uri.parse('$_wechatArticleApiBaseUrl/api/transcript-jobs/$jobId/result'),
+    );
+    final resultResponse = await resultRequest.close().timeout(
+          const Duration(seconds: 25),
+        );
+    final resultBody = await utf8.decoder.bind(resultResponse).join();
+    final resultPayload = jsonDecode(resultBody) as Map<String, dynamic>;
+    if (resultResponse.statusCode < 200 || resultResponse.statusCode >= 300) {
+      final message = resultPayload['error']?.toString() ?? '获取字幕结果失败';
+      throw StateError(message);
+    }
+    return resultPayload;
+  }
+
+  Future<void> _fetchGenericUrlTextToTempChat(String url) async {
+    if (_wechatArticleApiBaseUrl.trim().isEmpty) {
+      return;
+    }
+    if (!_pendingGenericTextUrls.add(url)) {
+      return;
+    }
+    _broadcastChatSnapshot();
+    if (mounted) {
+      setState(() {});
+    }
+    try {
+      final text = (await _fetchGenericUrlText(url)).trim();
+      if (text.isEmpty) {
+        return;
+      }
+      final messageText = '网页正文\n$url\n\n$text';
+      if (_chatMessages
+          .any((message) => message.text.trim() == messageText.trim())) {
+        return;
+      }
+      await _createTempChatMessage(text: messageText, sender: '网页正文');
+    } catch (error) {
+      debugPrint('generic url text fetch failed: $error');
+      await _createTempChatMessage(
+        text: '网页正文获取失败：$url\n$error',
+        sender: '网页正文',
+      );
+    } finally {
+      _pendingGenericTextUrls.remove(url);
+      _broadcastChatSnapshot();
+      if (mounted) {
+        setState(() {});
+      }
+    }
+  }
+
+  Future<String> _fetchGenericUrlText(String url) async {
+    final client = HttpClient();
+    try {
+      client.connectionTimeout = const Duration(seconds: 10);
+      final request = await client.postUrl(
+        Uri.parse('$_wechatArticleApiBaseUrl/api/url-to-text'),
+      );
+      request.headers.contentType = ContentType.json;
+      request.write(jsonEncode({'url': url}));
+      final response = await request.close().timeout(
+            const Duration(seconds: 60),
+          );
+      final body = await utf8.decoder.bind(response).join();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        try {
+          final decoded = jsonDecode(body) as Map<String, dynamic>;
+          final message = decoded['error']?.toString() ?? '转换失败';
+          throw StateError(message);
+        } on FormatException {
+          throw StateError('转换失败：HTTP ${response.statusCode}');
+        }
+      }
+      return body;
     } finally {
       client.close(force: true);
     }
@@ -1537,21 +1809,33 @@ class _MyHomePageState extends State<MyHomePage>
       updatedAt: now,
       source: source,
     );
-    _cards.add(card);
-
-    if (attachments != null && attachments.isNotEmpty) {
-      for (final payload in attachments) {
-        await _createAttachment(
+    try {
+      for (final payload in attachments ?? const <_IncomingAttachmentPayload>[]) {
+        final attachment = await _createAttachment(
           cardId: card.id,
           fileName: payload.name,
           bytes: payload.bytes,
+          sourceFile: payload.sourceFile,
+          moveSourceFile: payload.moveSourceFile,
           mimeType: payload.mimeType,
           notify: false,
         );
+        card.attachmentIds.add(attachment.id);
       }
+      _cards.add(card);
+      await _persistStateNow();
+    } catch (_) {
+      _cards.remove(card);
+      for (final id in card.attachmentIds) {
+        final attachment = _attachments.remove(id);
+        if (attachment != null) {
+          try {
+            await File(attachment.localPath).delete();
+          } catch (_) {}
+        }
+      }
+      rethrow;
     }
-
-    await _persistStateNow();
     if (notify) {
       _broadcastSnapshot();
     }
@@ -1565,6 +1849,8 @@ class _MyHomePageState extends State<MyHomePage>
     required String cardId,
     required String? fileName,
     required List<int> bytes,
+    File? sourceFile,
+    bool moveSourceFile = false,
     required String mimeType,
     bool notify = true,
   }) async {
@@ -1577,17 +1863,32 @@ class _MyHomePageState extends State<MyHomePage>
         ? 'attachment'
         : fileName.trim();
     final attachmentId = _generateId('file');
-    final storedFileName = _buildStoredFileName(displayName, attachmentId);
+    final storedFileName = buildStoredFileName(displayName, attachmentId);
     final targetPath = '${storage.attachmentsDir.path}/$storedFileName';
     final file = File(targetPath);
-    await file.writeAsBytes(bytes, flush: true);
+    try {
+      if (sourceFile != null) {
+        if (moveSourceFile) {
+          await sourceFile.rename(targetPath);
+        } else {
+          await sourceFile.copy(targetPath);
+        }
+      } else {
+        await file.writeAsBytes(bytes, flush: true);
+      }
+    } catch (_) {
+      try {
+        await file.delete();
+      } catch (_) {}
+      rethrow;
+    }
 
     final attachment = CardAttachment(
       id: attachmentId,
       cardId: cardId,
       name: displayName,
       mimeType: mimeType,
-      size: bytes.length,
+      size: await file.length(),
       localPath: targetPath,
       kind: _kindFromMimeType(mimeType, displayName),
       createdAt: DateTime.now(),
@@ -1979,7 +2280,7 @@ class _MyHomePageState extends State<MyHomePage>
         continue;
       }
       final storedFileName =
-          _buildStoredFileName(attachment.name, attachment.id);
+          buildStoredFileName(attachment.name, attachment.id);
       final targetPath = '${storage.attachmentsDir.path}/$storedFileName';
       await File(targetPath).writeAsBytes(bytes, flush: true);
       restoredAttachments.add(
@@ -2292,8 +2593,11 @@ class _MyHomePageState extends State<MyHomePage>
           onCopyMessageText: _copyTempChatText,
           onFetchWeChatArticle: _fetchWeChatArticleFromTempChatMessage,
           hasWeChatArticleLink: (text) =>
-              _extractWeChatArticleUrl(text) != null,
-          isFetchingWeChatArticle: () => _pendingWeChatFetchUrls.isNotEmpty,
+              _extractSupportedTextUrl(text) != null,
+          isFetchingWeChatArticle: () =>
+              _pendingWeChatFetchUrls.isNotEmpty ||
+              _pendingYouTubeTranscriptUrls.isNotEmpty ||
+              _pendingGenericTextUrls.isNotEmpty,
         ),
       ),
     );
@@ -2930,12 +3234,16 @@ class _MyHomePageState extends State<MyHomePage>
         ..get('/', _handleIndex)
         ..get('/api/cards', _handleGetCards)
         ..post('/api/cards', _handleCreateCard)
+        ..post('/api/cards/upload', (Request request) =>
+            _handleWebUpload(request, isChat: false))
         ..post('/api/cards/<cardId>/delete', _handleDeleteCard)
         ..post('/api/cards/delete', _handleDeleteCards)
         ..post('/api/cards/reorder', _handleReorderCards)
         ..post('/api/cards/<cardId>/attachments', _handleAddAttachments)
         ..get('/api/chat', _handleGetChat)
         ..post('/api/chat/messages', _handleCreateChatMessage)
+        ..post('/api/chat/messages/upload', (Request request) =>
+            _handleWebUpload(request, isChat: true))
         ..post(
             '/api/chat/messages/<messageId>/delete', _handleDeleteChatMessage)
         ..post('/api/chat/messages/<messageId>/save-card',
@@ -3208,6 +3516,46 @@ class _MyHomePageState extends State<MyHomePage>
     return _jsonResponse(_buildSnapshot());
   }
 
+  Future<Response> _handleWebUpload(Request request, {required bool isChat}) async {
+    WebUpload? upload;
+    try {
+      final storage = _storage;
+      if (storage == null) throw StateError('Storage not initialized');
+      await storage.ensureReady();
+      upload = await WebUpload.receive(request.read(),
+          request.headers['content-type'] ?? '', storage.rootDir);
+      final entries = upload.metadata['attachments'] as List<dynamic>;
+      final attachments = <_IncomingAttachmentPayload>[
+        for (var i = 0; i < entries.length; i++)
+          _IncomingAttachmentPayload(
+            name: entries[i]['name'] as String,
+            mimeType: entries[i]['mimeType'] as String,
+            bytes: const [],
+            sourceFile: upload.files[i],
+            moveSourceFile: true,
+          ),
+      ];
+      final text = upload.metadata['text'] as String? ?? '';
+      if (isChat) {
+        final message = await _createTempChatMessage(
+          text: text,
+          sender: upload.metadata['sender'] as String? ?? 'web',
+          attachments: attachments,
+        );
+        return _jsonResponse({'ok': true, 'messageId': message.id});
+      }
+      final card = await _createCard(text: text, attachments: attachments);
+      return _jsonResponse({'ok': true, 'cardId': card.id});
+    } catch (error) {
+      debugPrint('web upload failed: $error');
+      return Response(400,
+          body: jsonEncode({'error': '上传失败，请重试或查看服务端日志'}),
+          headers: {'content-type': 'application/json; charset=utf-8'});
+    } finally {
+      await upload?.dispose();
+    }
+  }
+
   Future<Response> _handleCreateCard(Request request) async {
     final body = await request.readAsString();
     final payload = jsonDecode(body) as Map<String, dynamic>;
@@ -3323,7 +3671,7 @@ class _MyHomePageState extends State<MyHomePage>
     final started = await _fetchWeChatArticleFromTempChatMessage(messageId);
     if (!started) {
       return _jsonResponse(
-        {'ok': false, 'error': 'No WeChat article link found'},
+        {'ok': false, 'error': 'No supported link found'},
         statusCode: 400,
       );
     }
@@ -3470,10 +3818,6 @@ class _MyHomePageState extends State<MyHomePage>
 
   String _generateId(String prefix) {
     return '$prefix-${DateTime.now().microsecondsSinceEpoch}-${_random.nextInt(1 << 32)}';
-  }
-
-  String _buildStoredFileName(String fileName, String attachmentId) {
-    return '$attachmentId-${Uri.encodeComponent(fileName)}';
   }
 
   String _buildCardBundleFileName(CardItem card) {
@@ -3932,11 +4276,12 @@ body.temp-chat-mode .chat-panel { display:block; }
 .chat-window { margin-top: 14px; min-height: 260px; max-height: 460px; overflow:auto; padding: 14px; border-radius: 22px; background: #eef3fb; display:flex; flex-direction:column; gap:10px; }
 .chat-bubble { position:relative; max-width: min(78%, 680px); padding: 12px 42px 12px 12px; border-radius: 20px; background: white; box-shadow: 0 10px 26px rgba(19,83,216,.08); animation: bubbleIn .18s ease-out; }
 .chat-bubble.me { align-self:flex-end; background:#d8f8c6; }
-.chat-copy-button { position:absolute; top:9px; right:9px; width:26px; height:26px; border:0; border-radius:999px; background:rgba(19,83,216,.09); color:var(--primary); display:flex; align-items:center; justify-content:center; cursor:pointer; }
+.chat-copy-button { appearance:none; -webkit-appearance:none; position:absolute; top:11px; right:9px; width:26px; height:26px; padding:0; margin:0; border:0; border-radius:999px; background:rgba(19,83,216,.09); color:var(--primary); display:flex; align-items:center; justify-content:center; cursor:pointer; }
 .chat-copy-button .material-symbols-outlined { font-size:16px; }
-.chat-meta { display:flex; align-items:center; gap:6px; color:var(--muted); font-size:11px; margin-bottom:8px; flex-wrap:wrap; }
-.chat-chip { display:inline-flex; align-items:center; gap:4px; padding:4px 8px; border-radius:999px; background:#f3f6fb; color:#6e7788; font-size:11px; font-weight:800; border:0; cursor:default; }
+.chat-meta { min-height:26px; display:flex; align-items:center; gap:6px; color:var(--muted); font-size:11px; margin-bottom:8px; flex-wrap:wrap; }
+.chat-chip { appearance:none; -webkit-appearance:none; box-sizing:border-box; display:inline-flex; align-items:center; justify-content:center; gap:4px; height:24px; padding:0 8px; margin:0; border-radius:999px; background:#f3f6fb; color:#6e7788; font-family:inherit; font-size:11px; font-weight:800; line-height:1; border:0; cursor:default; vertical-align:middle; }
 .chat-chip.primary { background:#eaf1ff; color:var(--primary); }
+.chat-toggle-chip { cursor:pointer; }
 .chat-actions .chat-chip { cursor:pointer; }
 .chat-fetching-card { align-self:flex-start; min-width:min(78%, 420px); }
 .chat-fetching-card .chat-text { color:var(--primary); font-weight:900; }
@@ -3957,10 +4302,16 @@ body.temp-chat-mode .chat-panel { display:block; }
 .chat-file { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 10px; border-radius:12px; background:rgba(255,255,255,.65); border:1px solid rgba(216,222,232,.8); }
 .chat-input-row { margin-top: 12px; display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; }
 .chat-input-row textarea { flex: 1 1 320px; min-height: 58px; max-height: 150px; border:1px solid var(--outline); border-radius:18px; padding:12px 14px; resize:vertical; outline:none; }
+textarea.file-drag-over { outline: 2px dashed var(--primary); outline-offset: -4px; background: #f3f7ff; }
 .chat-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
 .card-actions { display:flex; align-items:center; gap:10px; margin-top: 14px; }
 .card-actions .btn { flex: 1 1 0; min-width: 0; }
 .empty { padding: 32px; text-align:center; color: var(--muted); border: 1px dashed var(--outline); border-radius: 28px; background: rgba(255,255,255,.72); }
+.upload-progress { margin-top:12px; padding:12px 14px; border:1px solid var(--outline); border-radius:14px; background:#f3f7ff; }
+.upload-progress[hidden] { display:none; }
+.upload-progress-label { color:var(--primary-dark); font-size:13px; line-height:1.6; overflow-wrap:anywhere; }
+.upload-progress progress { display:block; width:100%; height:10px; margin-top:8px; accent-color:var(--primary); }
+.upload-progress.failed .upload-progress-label { color:#b42318; }
 .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px); opacity: 0; background: rgba(25,28,30,.92); color:white; padding: 12px 16px; border-radius: 14px; transition: all .22s ease; z-index: 120; pointer-events: none; }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .status-dot { width: 10px; height: 10px; border-radius:999px; background:#98a2b3; display:inline-block; }
@@ -4001,8 +4352,9 @@ body.temp-chat-mode .chat-panel { display:block; }
   </section>
 
   <section class="panel composer">
-    <textarea id="composerInput" placeholder="写一句灵感、贴一段内容，或先选择附件再制卡"></textarea>
+    <textarea id="composerInput" placeholder="写一句灵感、贴一段内容，或拖入文件再制卡"></textarea>
     <div id="pickedFiles" class="chips"></div>
+    <div id="cardUploadProgress" class="upload-progress" hidden aria-live="polite"><div class="upload-progress-label"></div><progress max="100" value="0" aria-label="附件上传进度"></progress></div>
     <div class="composer-toolbar">
       <button id="pickFilesBtn" class="btn btn-soft">选择文件</button>
       <button id="pasteBtn" class="btn btn-paste btn-icon"><span class="material-symbols-outlined" style="font-size:18px;">content_paste_go</span><span>粘贴</span></button>
@@ -4040,8 +4392,9 @@ body.temp-chat-mode .chat-panel { display:block; }
     </div>
     <div id="chatWindow" class="chat-window"></div>
     <div id="chatPickedFiles" class="chips"></div>
+    <div id="chatUploadProgress" class="upload-progress" hidden aria-live="polite"><div class="upload-progress-label"></div><progress max="100" value="0" aria-label="附件上传进度"></progress></div>
     <div class="chat-input-row">
-      <textarea id="chatInput" placeholder="输入临时消息；调试命令、日志、链接、备注都可以放这里"></textarea>
+      <textarea id="chatInput" placeholder="输入临时消息，或拖入文件"></textarea>
       <button id="chatPickFilesBtn" class="btn btn-soft">选择文件</button>
       <button id="chatPasteBtn" class="btn btn-paste btn-icon"><span class="material-symbols-outlined" style="font-size:18px;">content_paste_go</span><span>粘贴</span></button>
       <button id="chatSendBtn" class="btn btn-primary">发送</button>
@@ -4220,6 +4573,36 @@ function extractWeChatArticleUrl(text) {
   return null;
 }
 
+function extractYouTubeUrl(text) {
+  const value = String(text || '');
+  const urlPattern = /https?:\\/\\/[^\\s<>()]+/gi;
+  for (const match of value.matchAll(urlPattern)) {
+    const normalized = (match[0] || '').replace(/[\\]\\)\\}\\.,;:!?]+\$/, '');
+    try {
+      const url = new URL(normalized);
+      const host = url.hostname.toLowerCase();
+      if (
+        url.protocol === 'http:' || url.protocol === 'https:'
+      ) {
+        if (
+          host === 'youtu.be' ||
+          host === 'youtube.com' ||
+          host.endsWith('.youtube.com') ||
+          host === 'youtube-nocookie.com' ||
+          host.endsWith('.youtube-nocookie.com')
+        ) {
+          return url.toString();
+        }
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
+function extractSupportedTextUrl(text) {
+  return extractWeChatArticleUrl(text) || extractYouTubeUrl(text) || extractFirstUrl(text);
+}
+
 function renderCardText(text) {
   const value = String(text || '');
   if (!value.trim()) return '无文本内容';
@@ -4293,7 +4676,7 @@ function renderChat() {
     return;
   }
   const fetchingHtml = chatFetchingCount
-    ? '<div class="chat-bubble chat-fetching-card"><div class="chat-meta"><span class="chat-chip primary">微信公众号</span><span class="chat-spinner"></span></div><div class="chat-text">正在抓取公众号文章…</div><div class="chat-skeleton"><span></span><span></span><span></span></div></div>'
+    ? '<div class="chat-bubble chat-fetching-card"><div class="chat-meta"><span class="chat-chip primary">链接正文</span><span class="chat-spinner"></span></div><div class="chat-text">正在获取链接正文…</div><div class="chat-skeleton"><span></span><span></span><span></span></div></div>'
     : '';
   const orderedMessages = [...chatMessages].reverse();
   chatWindow.innerHTML = fetchingHtml + orderedMessages.map(message => {
@@ -4304,22 +4687,22 @@ function renderChat() {
         : '';
       return '<div class="chat-file"><span>' + escapeHtml(file.name) + ' · ' + formatBytes(file.size || 0) + '</span><a class="action-link" href="' + file.downloadUrl + '" download>下载</a></div>' + preview;
     }).join('');
-    const isLongArticle = String(message.sender || '') === '微信公众号' && String(message.text || '').length > 520;
+    const isFetchedText = ['微信公众号', 'YouTube', '网页正文'].includes(String(message.sender || ''));
+    const isLongArticle = isFetchedText && String(message.text || '').length > 520;
     const isExpanded = chatExpandedIds.has(message.id);
     const textClass = 'chat-text' + (isLongArticle && !isExpanded ? ' collapsed' : '');
     const expandAction = isLongArticle
-      ? '<button class="chat-chip" data-action="toggle-chat-expanded" data-message-id="' + escapeHtml(message.id) + '">' + (isExpanded ? '收起正文' : '展开全文') + '</button>'
+      ? '<span class="chat-chip chat-toggle-chip" role="button" tabindex="0" data-action="toggle-chat-expanded" data-message-id="' + escapeHtml(message.id) + '">' + (isExpanded ? '折叠' : '展开') + '</span>'
       : '';
-    const fetchAction = extractWeChatArticleUrl(message.text || '')
+    const fetchAction = extractSupportedTextUrl(message.text || '')
       ? '<button class="chat-chip primary" data-action="fetch-wechat" data-message-id="' + escapeHtml(message.id) + '">获取</button>'
       : '';
     return '<div class="chat-bubble ' + (mine ? 'me' : '') + '">' +
       '<button class="chat-copy-button" data-action="copy-chat" data-message-id="' + escapeHtml(message.id) + '" title="复制"><span class="material-symbols-outlined">content_copy</span></button>' +
-      '<div class="chat-meta"><span class="chat-chip primary">' + (mine ? '我' : escapeHtml(message.sender || '对方')) + '</span><span class="chat-chip">' + new Date(message.createdAt).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) + '</span></div>' +
+      '<div class="chat-meta"><span class="chat-chip primary">' + (mine ? '我' : escapeHtml(message.sender || '对方')) + '</span><span class="chat-chip">' + new Date(message.createdAt).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) + '</span>' + expandAction + '</div>' +
       (message.text ? '<div class="' + textClass + '">' + renderCardText(message.text || '') + '</div>' : '') +
       (attachments ? '<div class="chat-attachments">' + attachments + '</div>' : '') +
       '<div class="chat-actions">' +
-        expandAction +
         fetchAction +
         '<button class="chat-chip primary" data-action="save-chat-card" data-message-id="' + escapeHtml(message.id) + '">存为卡片</button>' +
         '<button class="chat-chip" data-action="delete-chat" data-message-id="' + escapeHtml(message.id) + '">删除</button>' +
@@ -4333,24 +4716,28 @@ async function refreshChat() {
   const response = await fetch('/api/chat');
   const payload = await response.json();
   chatMessages = payload.messages || [];
-  chatFetchingCount = payload.wechatFetchingCount || 0;
+  chatFetchingCount = payload.linkTextFetchingCount || payload.wechatFetchingCount || 0;
   renderChat();
 }
 
 async function sendChatMessage() {
   const text = chatInput.value.trim();
   if (!text && chatPendingFiles.length === 0) return;
-  const attachments = await filesToPayload(chatPendingFiles);
-  await fetch('/api/chat/messages', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({text, sender: clientId, attachments}),
-  });
-  chatInput.value = '';
-  chatPendingFiles = [];
-  chatFileInput.value = '';
-  renderChatPickedFiles();
-  await refreshChat();
+  const button = document.getElementById('chatSendBtn');
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    await uploadFiles('/api/chat/messages/upload', text, chatPendingFiles, clientId, 'chatUploadProgress');
+    chatInput.value = '';
+    chatPendingFiles = [];
+    chatFileInput.value = '';
+    renderChatPickedFiles();
+    await refreshChat();
+  } catch (error) {
+    showToast(error.message || '上传失败，请重试');
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function deleteChatMessage(messageId) {
@@ -4367,7 +4754,7 @@ async function saveChatMessageAsCard(messageId) {
 async function fetchWeChatArticleFromMessage(messageId) {
   const response = await fetch('/api/chat/messages/' + encodeURIComponent(messageId) + '/fetch-wechat', {method: 'POST'});
   if (!response.ok) {
-    showToast('没有可获取的公众号文章');
+    showToast('没有可获取的链接正文');
     return;
   }
   showToast('正在获取');
@@ -4526,45 +4913,117 @@ function connectWs() {
       renderCards();
     } else if (payload.type === 'chatSnapshot') {
       chatMessages = payload.messages || [];
-      chatFetchingCount = payload.wechatFetchingCount || 0;
+      chatFetchingCount = payload.linkTextFetchingCount || payload.wechatFetchingCount || 0;
       applyTempChatMode(payload.tempChatMode);
       renderChat();
     }
   };
 }
 
-async function filesToPayload(files) {
-  return Promise.all(files.map(file => new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result || '');
-      const commaIndex = result.indexOf(',');
-      resolve({
-        name: file.name,
-        mimeType: file.type || 'application/octet-stream',
-        base64: commaIndex >= 0 ? result.slice(commaIndex + 1) : result,
-      });
+async function uploadFiles(url, text, files, sender, progressId) {
+  const form = new FormData();
+  form.append('metadata', JSON.stringify({text, sender, attachments: files.map(file => ({
+    name: file.name,
+    mimeType: file.type || 'application/octet-stream',
+    size: file.size,
+  }))}));
+  for (const file of files) form.append('file', file, file.name);
+  const panel = document.getElementById(progressId);
+  const label = panel?.querySelector('.upload-progress-label');
+  const bar = panel?.querySelector('progress');
+  const startedAt = Date.now();
+  let lastProgressAt = startedAt;
+  let loaded = 0;
+  let total = 0;
+  let phase = 'uploading';
+  function render() {
+    if (!panel) return;
+    panel.hidden = false;
+    panel.classList.remove('failed');
+    const seconds = Math.max(1, (Date.now() - startedAt) / 1000);
+    if (phase === 'saving') {
+      bar.value = 100;
+      label.textContent = '传输完成，正在保存到手机… 已用时 ' + Math.floor(seconds) + ' 秒';
+      return;
+    }
+    const percent = total > 0 ? Math.min(100, Math.floor(loaded / total * 100)) : null;
+    if (percent === null) bar.removeAttribute('value');
+    else bar.value = percent;
+    const speed = loaded / seconds;
+    label.textContent = (percent === null ? '正在上传…' : '正在上传 ' + percent + '%') +
+      ' · ' + formatBytes(loaded) + (total > 0 ? ' / ' + formatBytes(total) : '') +
+      (speed > 0 ? ' · ' + formatBytes(speed) + '/秒' : '') +
+      ' · 已用时 ' + Math.floor(seconds) + ' 秒' +
+      (Date.now() - lastProgressAt >= 10000 ? ' · 暂无新进度，正在等待连接' : '');
+  }
+  render();
+  await new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const timer = setInterval(render, 1000);
+    let settled = false;
+    function finish(error) {
+      if (settled) return;
+      settled = true;
+      clearInterval(timer);
+      if (panel) {
+        if (error) {
+          panel.classList.add('failed');
+          label.textContent = error.message;
+        } else {
+          bar.value = 100;
+          label.textContent = '已保存到手机 · 用时 ' + Math.max(1, Math.round((Date.now() - startedAt) / 1000)) + ' 秒';
+        }
+      }
+      if (error) reject(error);
+      else resolve();
+    }
+    xhr.upload.onprogress = event => {
+      loaded = event.loaded;
+      total = event.lengthComputable ? event.total : 0;
+      lastProgressAt = Date.now();
+      if (total > 0 && loaded >= total) phase = 'saving';
+      render();
     };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  })));
+    xhr.upload.onload = () => { phase = 'saving'; render(); };
+    xhr.onload = () => {
+      let payload = {};
+      try { payload = JSON.parse(xhr.responseText); } catch (_) {}
+      if (xhr.status >= 200 && xhr.status < 300 && payload.ok === true) finish();
+      else finish(new Error(payload.error || '上传未确认保存成功，请检查卡片列表后重试'));
+    };
+    xhr.onerror = () => finish(new Error('网络连接中断，请检查卡片列表后重试'));
+    xhr.onabort = () => finish(new Error('上传已中止，请检查卡片列表后重试'));
+    try {
+      xhr.open('POST', url);
+      xhr.send(form);
+    } catch (error) {
+      finish(error);
+    }
+  });
 }
 
 async function createCard() {
   const text = composerInput.value.trim();
   if (!text && pendingFiles.length === 0) return;
-  const attachments = await filesToPayload(pendingFiles);
-  await fetch('/api/cards', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({text, attachments}),
-  });
-  composerInput.value = '';
-  pendingFiles = [];
-  fileInput.value = '';
-  renderPickedFiles();
-  showToast('卡片已保存');
-  await refreshCards();
+  const button = document.getElementById('createBtn');
+  if (button.disabled) return;
+  button.disabled = true;
+  const label = button.textContent;
+  button.textContent = '正在保存…';
+  try {
+    await uploadFiles('/api/cards/upload', text, pendingFiles, undefined, 'cardUploadProgress');
+    composerInput.value = '';
+    pendingFiles = [];
+    fileInput.value = '';
+    renderPickedFiles();
+    showToast('卡片已保存');
+    await refreshCards();
+  } catch (error) {
+    showToast(error.message || '上传失败，请重试');
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
 }
 
 async function deleteCard(cardId) {
@@ -4630,7 +5089,7 @@ cardsRoot.addEventListener('click', async event => {
 });
 
 chatWindow.addEventListener('click', async event => {
-  const target = event.target.closest('button[data-action]');
+  const target = event.target.closest('[data-action]');
   if (!target) return;
   const messageId = target.dataset.messageId || '';
   const message = chatMessages.find(item => item.id === messageId);
@@ -4784,6 +5243,31 @@ document.getElementById('clearSearchBtn').addEventListener('click', () => {
 fileInput.addEventListener('change', event => {
   pendingFiles = Array.from(event.target.files || []);
   renderPickedFiles();
+});
+function enableFileDrop(input, addFiles) {
+  const hasFiles = event => Array.from(event.dataTransfer?.types || []).includes('Files');
+  input.addEventListener('dragover', event => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    input.classList.add('file-drag-over');
+  });
+  input.addEventListener('dragleave', () => input.classList.remove('file-drag-over'));
+  input.addEventListener('drop', event => {
+    input.classList.remove('file-drag-over');
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    const files = Array.from(event.dataTransfer.files || []);
+    if (files.length) addFiles(files);
+  });
+}
+enableFileDrop(composerInput, files => {
+  pendingFiles = pendingFiles.concat(files);
+  renderPickedFiles();
+});
+enableFileDrop(chatInput, files => {
+  chatPendingFiles = chatPendingFiles.concat(files);
+  renderChatPickedFiles();
 });
 chatFileInput.addEventListener('change', event => {
   chatPendingFiles = Array.from(event.target.files || []);
@@ -5962,6 +6446,54 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
     return '$hour:$minute';
   }
 
+  Widget _buildChatMetaPill({
+    required String label,
+    Color backgroundColor = const Color(0xFFF3F6FB),
+    Color foregroundColor = const Color(0xFF6E7788),
+    FontWeight fontWeight = FontWeight.w800,
+    IconData? icon,
+    VoidCallback? onTap,
+  }) {
+    final content = Container(
+      height: 32,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: BoxDecoration(
+        color: backgroundColor,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 15, color: foregroundColor),
+            const SizedBox(width: 6),
+          ],
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 12,
+              height: 1,
+              fontWeight: fontWeight,
+              color: foregroundColor,
+            ),
+          ),
+        ],
+      ),
+    );
+    if (onTap == null) {
+      return content;
+    }
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: content,
+      ),
+    );
+  }
+
   Future<void> _send() async {
     final text = _controller.text.trim();
     if (text.isEmpty || _sending) {
@@ -6056,11 +6588,13 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
                       final message = messages[messageIndex];
                       final attachments = _attachmentsOf(message);
                       final isPhone = message.sender == 'phone';
-                      final isWeChatArticle = message.sender == '微信公众号';
+                      final isFetchedText = message.sender == '微信公众号' ||
+                          message.sender == 'YouTube' ||
+                          message.sender == '网页正文';
                       final hasWeChatArticleLink =
                           widget.hasWeChatArticleLink(message.text);
                       final isLongArticle =
-                          isWeChatArticle && message.text.length > 520;
+                          isFetchedText && message.text.length > 520;
                       final isExpanded =
                           _expandedMessageIds.contains(message.id);
                       return Align(
@@ -6091,49 +6625,44 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
                                       Wrap(
                                         spacing: 6,
                                         runSpacing: 6,
+                                        crossAxisAlignment:
+                                            WrapCrossAlignment.center,
                                         children: [
-                                          Chip(
-                                            materialTapTargetSize:
-                                                MaterialTapTargetSize
-                                                    .shrinkWrap,
-                                            visualDensity:
-                                                VisualDensity.compact,
-                                            label: Text(
-                                              isPhone
-                                                  ? '我'
-                                                  : message.sender.isEmpty
-                                                      ? '对方'
-                                                      : message.sender,
-                                            ),
-                                            labelStyle: const TextStyle(
-                                              fontSize: 11,
-                                              fontWeight: FontWeight.w800,
-                                              color: Color(0xFF1353D8),
-                                            ),
+                                          _buildChatMetaPill(
+                                            label: isPhone
+                                                ? '我'
+                                                : message.sender.isEmpty
+                                                    ? '对方'
+                                                    : message.sender,
                                             backgroundColor:
                                                 const Color(0xFFEAF1FF),
-                                            side: BorderSide.none,
+                                            foregroundColor:
+                                                const Color(0xFF1353D8),
                                           ),
-                                          Chip(
-                                            materialTapTargetSize:
-                                                MaterialTapTargetSize
-                                                    .shrinkWrap,
-                                            visualDensity:
-                                                VisualDensity.compact,
-                                            label: Text(
-                                              _formatTimeChip(
-                                                message.createdAt,
-                                              ),
+                                          _buildChatMetaPill(
+                                            label: _formatTimeChip(
+                                              message.createdAt,
                                             ),
-                                            labelStyle: const TextStyle(
-                                              fontSize: 11,
-                                              fontWeight: FontWeight.w700,
-                                              color: Color(0xFF6E7788),
-                                            ),
-                                            backgroundColor:
-                                                const Color(0xFFF3F6FB),
-                                            side: BorderSide.none,
+                                            fontWeight: FontWeight.w700,
                                           ),
+                                          if (isLongArticle)
+                                            _buildChatMetaPill(
+                                              label: isExpanded ? '折叠' : '展开',
+                                              icon: isExpanded
+                                                  ? Icons.unfold_less_rounded
+                                                  : Icons.unfold_more_rounded,
+                                              onTap: () {
+                                                setState(() {
+                                                  if (isExpanded) {
+                                                    _expandedMessageIds
+                                                        .remove(message.id);
+                                                  } else {
+                                                    _expandedMessageIds
+                                                        .add(message.id);
+                                                  }
+                                                });
+                                              },
+                                            ),
                                         ],
                                       ),
                                       const SizedBox(height: 8),
@@ -6153,32 +6682,6 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
                                           style: const TextStyle(height: 1.45),
                                         ),
                                       ),
-                                      if (isLongArticle) ...[
-                                        const SizedBox(height: 8),
-                                        ActionChip(
-                                          visualDensity: VisualDensity.compact,
-                                          avatar: Icon(
-                                            isExpanded
-                                                ? Icons.unfold_less_rounded
-                                                : Icons.unfold_more_rounded,
-                                            size: 16,
-                                          ),
-                                          label: Text(
-                                            isExpanded ? '收起正文' : '展开全文',
-                                          ),
-                                          onPressed: () {
-                                            setState(() {
-                                              if (isExpanded) {
-                                                _expandedMessageIds
-                                                    .remove(message.id);
-                                              } else {
-                                                _expandedMessageIds
-                                                    .add(message.id);
-                                              }
-                                            });
-                                          },
-                                        ),
-                                      ],
                                       if (attachments.isNotEmpty) ...[
                                         const SizedBox(height: 8),
                                         Text(
@@ -6217,7 +6720,7 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
                                                     SnackBar(
                                                       content: Text(started
                                                           ? '正在获取'
-                                                          : '没有可获取的公众号文章'),
+                                                          : '没有可获取的链接正文'),
                                                     ),
                                                   );
                                                   setState(() {});
@@ -6272,9 +6775,14 @@ class _LocalShareTempChatPageState extends State<_LocalShareTempChatPage> {
                                   ),
                                 ),
                                 Positioned(
-                                  top: 2,
-                                  right: 2,
+                                  top: 7,
+                                  right: 7,
                                   child: IconButton(
+                                    constraints: const BoxConstraints.tightFor(
+                                      width: 32,
+                                      height: 32,
+                                    ),
+                                    padding: EdgeInsets.zero,
                                     visualDensity: VisualDensity.compact,
                                     tooltip: '复制',
                                     icon: const Icon(
@@ -6378,7 +6886,7 @@ class _WeChatFetchingBubbleState extends State<_WeChatFetchingBubble>
                   Chip(
                     materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                     visualDensity: VisualDensity.compact,
-                    label: Text('微信公众号'),
+                    label: Text('链接正文'),
                     labelStyle: TextStyle(
                       fontSize: 11,
                       fontWeight: FontWeight.w800,
@@ -6396,7 +6904,7 @@ class _WeChatFetchingBubbleState extends State<_WeChatFetchingBubble>
               ),
               const SizedBox(height: 10),
               const Text(
-                '正在抓取公众号文章…',
+                '正在获取链接正文…',
                 style: TextStyle(
                   fontWeight: FontWeight.w900,
                   color: Color(0xFF1353D8),
@@ -6590,7 +7098,7 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
                     style: TextStyle(fontWeight: FontWeight.w800),
                   ),
                   subtitle: const Text(
-                    '服务运行时捕获手机复制的文本进入临时聊天；已配置私有接口时会自动抓取公众号正文',
+                    '服务运行时捕获手机复制的文本进入临时聊天；已配置私有接口时会自动抓取链接正文',
                   ),
                   onChanged: (value) {
                     setState(() {
@@ -7563,14 +8071,34 @@ class _IncomingAttachmentPayload {
     required this.name,
     required this.mimeType,
     required this.bytes,
+    this.sourceFile,
+    this.moveSourceFile = false,
   });
 
   final String name;
   final String mimeType;
   final List<int> bytes;
+  final File? sourceFile;
+  final bool moveSourceFile;
+
+  Future<void> writeTo(File target) async {
+    final source = sourceFile;
+    if (source != null) {
+      if (moveSourceFile) {
+        await source.rename(target.path);
+      } else {
+        await source.copy(target.path);
+      }
+    } else {
+      await target.writeAsBytes(bytes, flush: true);
+    }
+  }
 
   factory _IncomingAttachmentPayload.fromJson(Map<String, dynamic> json) {
-    final base64 = json['base64'] as String? ?? '';
+    final base64 = json['base64'] as String?;
+    if (base64 == null || base64.isEmpty) {
+      throw const FormatException('附件内容为空，请重新上传');
+    }
     return _IncomingAttachmentPayload(
       name: json['name'] as String? ?? 'attachment',
       mimeType: json['mimeType'] as String? ?? 'application/octet-stream',
@@ -7595,6 +8123,38 @@ class _WeChatArticleResult {
       url: json['url'] as String? ?? '',
       title: json['title'] as String? ?? '',
       content: json['content'] as String? ?? '',
+    );
+  }
+}
+
+class _YouTubeTranscriptResult {
+  const _YouTubeTranscriptResult({
+    required this.videoId,
+    required this.fullText,
+  });
+
+  final String videoId;
+  final String fullText;
+
+  String get title =>
+      videoId.trim().isEmpty ? 'YouTube 文本' : 'YouTube 文本 $videoId';
+
+  factory _YouTubeTranscriptResult.fromJson(Map<String, dynamic> json) {
+    final items = json['items'] as List<dynamic>? ?? const <dynamic>[];
+    var fullText = '';
+    for (final item in items) {
+      if (item is! Map<String, dynamic>) {
+        continue;
+      }
+      final text = item['full_text']?.toString().trim() ?? '';
+      if (text.isNotEmpty) {
+        fullText = text;
+        break;
+      }
+    }
+    return _YouTubeTranscriptResult(
+      videoId: json['video_id']?.toString() ?? '',
+      fullText: fullText,
     );
   }
 }

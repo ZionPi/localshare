@@ -57,7 +57,7 @@ apk:
 	@$(FLUTTER) build apk --debug $(FLUTTER_BUILD_ARGS)
 
 check-release-config:
-	@test -n "$(findstring $(REQUIRED_RELEASE_DART_DEFINE),$(FLUTTER_BUILD_ARGS))" || (echo "缺少 WECHAT_ARTICLE_API_BASE_URL。release 包必须通过 localshare.local.mk 注入 --dart-define，否则手机端复制微信公众号链接不会自动抓文章。" && exit 1)
+	@test -n "$(findstring $(REQUIRED_RELEASE_DART_DEFINE),$(FLUTTER_BUILD_ARGS))" || (echo "缺少 WECHAT_ARTICLE_API_BASE_URL。release 包必须通过 localshare.local.mk 注入 --dart-define，否则手机端复制支持的链接不会自动抓取正文。" && exit 1)
 
 release-apk: check-release-config
 	@$(FLUTTER) build apk --release $(FLUTTER_BUILD_ARGS)
