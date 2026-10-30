@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'api_docs.dart';
 import 'attachment_filename.dart';
 import 'web_upload.dart';
 import 'package:flutter/gestures.dart';
@@ -323,6 +324,14 @@ class CardItem {
     );
   }
 }
+
+/// Public, read-only API payload. Includes archived cards but no chat data.
+Map<String, dynamic> buildPublicCardsResponse(
+  Iterable<CardItem> cards,
+  Map<String, CardAttachment> attachments,
+) => {
+      'cards': cards.map((card) => card.toPublicJson(attachments)).toList(),
+    };
 
 class TempChatAttachment {
   TempChatAttachment({
@@ -2628,6 +2637,7 @@ class _MyHomePageState extends State<MyHomePage>
           initialPort: _preferredPort,
           initialConfirmDelete: _confirmDelete,
           initialClipboardToTempChat: _clipboardToTempChatEnabled,
+          apiAddress: () => _isServerRunning ? _ipServerAddress : null,
           onImportTap: _importAllCards,
           onExportTap: _exportAllCards,
           onTempChatTap: _openTempChatPage,
@@ -3335,7 +3345,14 @@ class _MyHomePageState extends State<MyHomePage>
 
       final router = shelf_router.Router()
         ..get('/', _handleIndex)
+        ..get('/api/docs', _handleApiDocs)
         ..get('/api/cards', _handleGetCards)
+        ..get('/api/v1/cards', _handleGetPublicCards)
+        ..post('/api/v1/cards', _handlePublicCreateCard)
+        ..post('/api/v1/cards/upload', (Request request) => _handleWebUpload(request, isChat: false))
+        ..get('/api/v1/cards/<cardId>', _handlePublicGetCard)
+        ..patch('/api/v1/cards/<cardId>', _handlePublicUpdateCard)
+        ..delete('/api/v1/cards/<cardId>', _handlePublicDeleteCard)
         ..post('/api/cards', _handleCreateCard)
         ..post('/api/cards/upload', (Request request) =>
             _handleWebUpload(request, isChat: false))
@@ -3615,8 +3632,97 @@ class _MyHomePageState extends State<MyHomePage>
     );
   }
 
+  Future<Response> _handleApiDocs(Request request) async => Response.ok(
+        localShareApiDocsHtml,
+        headers: {'content-type': 'text/html; charset=utf-8'},
+      );
+
   Future<Response> _handleGetCards(Request request) async {
     return _jsonResponse(_buildSnapshot());
+  }
+
+  Future<Response> _handleGetPublicCards(Request request) async {
+    final params = request.url.queryParameters;
+    final archived = params['archived'];
+    if (archived != null && archived != 'true' && archived != 'false') {
+      return _jsonResponse({'error': 'archived 必须是 true 或 false'}, statusCode: 400);
+    }
+    final query = params['q']?.trim().toLowerCase() ?? '';
+    final cards = _cards.where((card) {
+      if (archived != null && card.isArchived != (archived == 'true')) return false;
+      return query.isEmpty || card.text.toLowerCase().contains(query) ||
+          card.attachmentIds.any((id) => _attachments[id]?.name.toLowerCase().contains(query) ?? false);
+    });
+    return _jsonResponse(buildPublicCardsResponse(_sortCards(cards), _attachments));
+  }
+
+  Future<Map<String, dynamic>> _readPublicJson(Request request) async {
+    if (request.contentLength != null && request.contentLength! > 1024 * 1024) {
+      throw const FormatException('请求内容过大');
+    }
+    final bytes = <int>[];
+    await for (final chunk in request.read()) {
+      if (bytes.length + chunk.length > 1024 * 1024) throw const FormatException('请求内容过大');
+      bytes.addAll(chunk);
+    }
+    final decoded = jsonDecode(utf8.decode(bytes));
+    if (decoded is! Map<String, dynamic>) throw const FormatException('请求体必须是 JSON 对象');
+    return decoded;
+  }
+
+  Future<Response> _handlePublicGetCard(Request request, String cardId) async {
+    final card = _findCard(cardId);
+    if (card == null) return _jsonResponse({'error': '卡片不存在'}, statusCode: 404);
+    return _jsonResponse({'card': card.toPublicJson(_attachments)});
+  }
+
+  Future<Response> _handlePublicCreateCard(Request request) async {
+    Map<String, dynamic> data;
+    try { data = await _readPublicJson(request); } on FormatException {
+      return _jsonResponse({'error': '请求体必须是有效的 JSON 对象，且不超过 1 MiB'}, statusCode: 400);
+    }
+    if (data['text'] is! String || (data['text'] as String).trim().isEmpty) {
+      return _jsonResponse({'error': 'text 必须是非空字符串'}, statusCode: 400);
+    }
+    final card = await _createCard(text: data['text'] as String);
+    return _jsonResponse({'card': card.toPublicJson(_attachments)}, statusCode: 201);
+  }
+
+  Future<Response> _handlePublicUpdateCard(Request request, String cardId) async {
+    final card = _findCard(cardId);
+    if (card == null) return _jsonResponse({'error': '卡片不存在'}, statusCode: 404);
+    Map<String, dynamic> data;
+    try { data = await _readPublicJson(request); } on FormatException {
+      return _jsonResponse({'error': '请求体必须是有效的 JSON 对象，且不超过 1 MiB'}, statusCode: 400);
+    }
+    if (data.isEmpty || data.keys.any((key) => !{'text', 'pinned', 'archived'}.contains(key)) ||
+        (data.containsKey('text') && data['text'] is! String) ||
+        (data.containsKey('pinned') && data['pinned'] is! bool) ||
+        (data.containsKey('archived') && data['archived'] is! bool)) {
+      return _jsonResponse({'error': '请提供 text（字符串）、pinned 或 archived（布尔值）'}, statusCode: 400);
+    }
+    final archived = data['archived'] as bool? ?? card.isArchived;
+    final pinned = data['pinned'] as bool? ?? (archived ? false : card.isPinned);
+    if (archived && pinned) return _jsonResponse({'error': '归档卡片不能置顶'}, statusCode: 400);
+    if (pinned && !card.isPinned && _cards.where((item) => item.isPinned).length >= _maxPinnedCards) {
+      return _jsonResponse({'error': '置顶卡片已达上限'}, statusCode: 400);
+    }
+    final now = DateTime.now();
+    if (data.containsKey('text')) card.text = (data['text'] as String).trim();
+    card.archivedAt = archived ? card.archivedAt ?? now : null;
+    card.pinnedAt = pinned ? card.pinnedAt ?? now : null;
+    card.updatedAt = now;
+    await _persistStateNow();
+    _broadcastSnapshot();
+    if (mounted) setState(() {});
+    return _jsonResponse({'card': card.toPublicJson(_attachments)});
+  }
+
+  Future<Response> _handlePublicDeleteCard(Request request, String cardId) async {
+    final card = _findCard(cardId);
+    if (card == null) return _jsonResponse({'error': '卡片不存在'}, statusCode: 404);
+    await _deleteCard(cardId);
+    return _jsonResponse({'ok': true});
   }
 
   Future<Response> _handleWebUpload(Request request, {required bool isChat}) async {
@@ -3824,12 +3930,12 @@ class _MyHomePageState extends State<MyHomePage>
       return Response.notFound('File missing');
     }
     final isPreview = request.url.queryParameters['view'] == '1';
-    final bytes = await file.readAsBytes();
+    final length = await file.length();
     return Response.ok(
-      bytes,
+      file.openRead(),
       headers: {
         'content-type': attachment.mimeType,
-        'content-length': bytes.length.toString(),
+        'content-length': length.toString(),
         'cache-control': 'no-cache',
         'content-disposition': _buildContentDisposition(
           attachment.name,
@@ -7053,6 +7159,7 @@ class LocalShareSettingsPage extends StatefulWidget {
     required this.initialUseFixedPort,
     required this.initialConfirmDelete,
     required this.initialClipboardToTempChat,
+    required this.apiAddress,
     required this.onImportTap,
     required this.onExportTap,
     required this.onTempChatTap,
@@ -7064,6 +7171,7 @@ class LocalShareSettingsPage extends StatefulWidget {
   final bool initialUseFixedPort;
   final bool initialConfirmDelete;
   final bool initialClipboardToTempChat;
+  final String? Function() apiAddress;
   final Future<void> Function() onImportTap;
   final Future<void> Function() onExportTap;
   final Future<void> Function(BuildContext context) onTempChatTap;
@@ -7221,6 +7329,18 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
                 ),
                 const SizedBox(height: 14),
                 OutlinedButton.icon(
+                  onPressed: () => Navigator.of(context).push<void>(
+                    MaterialPageRoute<void>(builder: (_) => LocalShareApiPage(baseAddress: widget.apiAddress())),
+                  ),
+                  icon: const Icon(Icons.api_rounded),
+                  label: const Text('局域网 API', style: TextStyle(fontWeight: FontWeight.w900)),
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size.fromHeight(48),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                OutlinedButton.icon(
                   onPressed: () => widget.onTempChatTap(context),
                   icon: const Icon(Icons.chat_bubble_outline_rounded),
                   label: const Text(
@@ -7319,6 +7439,92 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
               ],
             ),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+class LocalShareApiPage extends StatelessWidget {
+  const LocalShareApiPage({super.key, required this.baseAddress});
+
+  final String? baseAddress;
+
+  @override
+  Widget build(BuildContext context) {
+    final url = baseAddress == null ? null : '$baseAddress/api/v1/cards';
+    final example = url ?? 'http://手机IP:端口/api/v1/cards';
+    return Scaffold(
+      appBar: AppBar(title: const Text('局域网 API')),
+      body: ListView(padding: const EdgeInsets.all(20), children: [
+        const Text('获取所有卡片', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        const Text('GET  /api/v1/cards', style: TextStyle(fontFamily: 'monospace', fontWeight: FontWeight.bold)),
+        const SizedBox(height: 12),
+        Text(url == null ? '服务未启动或当前没有可用的局域网地址。请连接 Wi-Fi 并启动服务。' : '当前接口地址'),
+        const SizedBox(height: 8),
+        if (url != null) ...[
+          SelectableText(url),
+          Align(alignment: Alignment.centerLeft, child: TextButton.icon(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: url));
+              if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('接口地址已复制')));
+            },
+            icon: const Icon(Icons.copy), label: const Text('复制地址'),
+          )),
+          const SizedBox(height: 8),
+          const Text('网页接口文档'),
+          SelectableText('$baseAddress/api/docs'),
+          Align(alignment: Alignment.centerLeft, child: TextButton.icon(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: '$baseAddress/api/docs'));
+              if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('文档地址已复制')));
+            },
+            icon: const Icon(Icons.copy), label: const Text('复制文档地址'),
+          )),
+        ],
+        const SizedBox(height: 16),
+        const Text('调用示例', style: TextStyle(fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        SelectableText('curl "$example"', style: const TextStyle(fontFamily: 'monospace')),
+        const SizedBox(height: 16),
+        const Text('以下路径均拼接在服务地址后。JSON 请求需设置 Content-Type: application/json；成功响应为 JSON，附件下载返回文件。id 从列表或创建结果中取得。'),
+        const SizedBox(height: 16),
+        const Text('接口无需登录；能访问服务的局域网设备也能创建、修改和删除内容。请只在可信网络中启用服务。端口可能随服务重启变化，可设置固定端口。'),
+        const SizedBox(height: 16),
+        const Text('卡片', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        _apiEntry('GET', '/api/v1/cards', '获取所有卡片，包括归档；可选 q 搜索正文或附件名，archived=true 或 false 筛选归档状态。返回 {"cards":[...]}。', 'curl "$example?q=关键词&archived=false"'),
+        _apiEntry('GET', '/api/v1/cards/{id}', '获取单张卡片，返回 {"card":{...}}。卡片不存在返回 404。', 'curl "${baseAddress ?? 'http://手机IP:端口'}/api/v1/cards/卡片ID"'),
+        _apiEntry('POST', '/api/v1/cards', '创建文本卡片。请求体为 JSON，例如 {"text":"你好"}；返回 201 和 card。', "curl -X POST '$example' -H 'Content-Type: application/json' -d '{\"text\":\"你好\"}'"),
+        _apiEntry('PATCH', '/api/v1/cards/{id}', '修改卡片；可提供 text 字符串、pinned 和 archived 布尔值。归档会取消置顶，置顶上限为 5 张。', "curl -X PATCH '${baseAddress ?? 'http://手机IP:端口'}/api/v1/cards/卡片ID' -H 'Content-Type: application/json' -d '{\"text\":\"新内容\",\"pinned\":true}'"),
+        _apiEntry('DELETE', '/api/v1/cards/{id}', '删除卡片及应用内附件；已保存到下载目录的文件会保留。此操作不可撤销。', "curl -X DELETE '${baseAddress ?? 'http://手机IP:端口'}/api/v1/cards/卡片ID'"),
+        _apiEntry('POST', '/api/v1/cards/upload', '创建包含文件的卡片。multipart/form-data 第一部分必须是 metadata JSON：{"text":"备注","attachments":[{"name":"a.txt","mimeType":"text/plain","size":3}]}；随后依次添加名为 file 的文件部分。size 是文件字节数。返回 {"ok":true,"cardId":"..."}。', "curl -X POST '${baseAddress ?? 'http://手机IP:端口'}/api/v1/cards/upload' -F 'metadata={\"text\":\"备注\",\"attachments\":[{\"name\":\"a.txt\",\"mimeType\":\"text/plain\",\"size\":3}]}' -F 'file=@a.txt'"),
+        const SizedBox(height: 16),
+        const Text('附件', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        _apiEntry('GET', '/files/{attachmentId}', '下载附件；添加 ?view=1 可请求浏览器内预览。卡片 attachments 中包含 downloadUrl 和 previewUrl 相对路径。', "curl -OJ '${baseAddress ?? 'http://手机IP:端口'}/files/附件ID'"),
+        _apiEntry('GET', '/cards/{cardId}/bundle', '打包下载卡片的全部附件（ZIP）。', "curl -OJ '${baseAddress ?? 'http://手机IP:端口'}/cards/卡片ID/bundle'"),
+        const SizedBox(height: 16),
+        const Text('临时聊天', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        _apiEntry('GET', '/api/chat', '获取临时聊天消息；返回对象中的 messages 为消息列表。', "curl '${baseAddress ?? 'http://手机IP:端口'}/api/chat'"),
+        _apiEntry('POST', '/api/chat/messages', '发送文本消息，请求体示例 {"text":"你好","sender":"api"}。', "curl -X POST '${baseAddress ?? 'http://手机IP:端口'}/api/chat/messages' -H 'Content-Type: application/json' -d '{\"text\":\"你好\",\"sender\":\"api\"}'"),
+        _apiEntry('POST', '/api/chat/messages/upload', '发送文件消息，multipart 格式与卡片上传相同；metadata 可额外包含 sender。', 'metadata 必须放在 file 之前，attachments 顺序必须与文件顺序一致。'),
+        _apiEntry('POST', '/api/chat/messages/{id}/save-card', '把一条临时消息保存为卡片；返回 cardId。', "curl -X POST '${baseAddress ?? 'http://手机IP:端口'}/api/chat/messages/消息ID/save-card'"),
+        _apiEntry('POST', '/api/chat/messages/{id}/delete', '删除一条临时消息及其临时附件。', "curl -X POST '${baseAddress ?? 'http://手机IP:端口'}/api/chat/messages/消息ID/delete'"),
+        _apiEntry('POST', '/api/chat/clear', '清空临时聊天及其附件，此操作不可撤销。', "curl -X POST '${baseAddress ?? 'http://手机IP:端口'}/api/chat/clear'"),
+        _apiEntry('GET', '/chat/files/{attachmentId}', '下载临时消息附件；添加 ?view=1 可请求预览。', "curl -OJ '${baseAddress ?? 'http://手机IP:端口'}/chat/files/附件ID'"),
+      ]),
+    );
+  }
+
+  Widget _apiEntry(String method, String path, String description, String example) {
+    return Card(
+      child: ExpansionTile(
+        title: Text('$method  $path', style: const TextStyle(fontFamily: 'monospace', fontSize: 14, fontWeight: FontWeight.bold)),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        children: [
+          Align(alignment: Alignment.centerLeft, child: Text(description)),
+          const SizedBox(height: 12),
+          Align(alignment: Alignment.centerLeft, child: SelectableText(example, style: const TextStyle(fontFamily: 'monospace', fontSize: 12))),
         ],
       ),
     );
