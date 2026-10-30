@@ -181,6 +181,7 @@ class CardAttachment {
     required this.localPath,
     required this.kind,
     required this.createdAt,
+    this.inDownloads = false,
   });
 
   final String id;
@@ -191,6 +192,7 @@ class CardAttachment {
   final String localPath;
   final AttachmentKind kind;
   final DateTime createdAt;
+  final bool inDownloads;
 
   bool get isPreviewable =>
       kind == AttachmentKind.image ||
@@ -206,6 +208,7 @@ class CardAttachment {
       'mimeType': mimeType,
       'size': size,
       'localPath': localPath,
+      'inDownloads': inDownloads,
       'kind': kind.name,
       'createdAt': createdAt.toIso8601String(),
     };
@@ -234,6 +237,7 @@ class CardAttachment {
       mimeType: json['mimeType'] as String? ?? 'application/octet-stream',
       size: (json['size'] as num?)?.toInt() ?? 0,
       localPath: json['localPath'] as String,
+      inDownloads: json['inDownloads'] as bool? ?? false,
       kind: AttachmentKind.values.firstWhere(
         (value) => value.name == json['kind'],
         orElse: () => AttachmentKind.other,
@@ -728,6 +732,7 @@ class _MyHomePageState extends State<MyHomePage>
   bool _isServerRunning = false;
   bool _isPickingFiles = false;
   bool _isExporting = false;
+  final Map<String, ValueNotifier<(int, int)>> _downloadProgress = {};
   File? _exportCancelFile;
   bool _isLoading = true;
   DateTime? _lastStateSyncAt;
@@ -746,6 +751,14 @@ class _MyHomePageState extends State<MyHomePage>
   @override
   void initState() {
     super.initState();
+    _downloadChannel.setMethodCallHandler((call) async {
+      if (call.method != 'saveProgress') return;
+      final args = Map<Object?, Object?>.from(call.arguments as Map);
+      final progress = _downloadProgress[args['requestId']];
+      if (progress != null) {
+        progress.value = (args['copied'] as int, args['total'] as int);
+      }
+    });
     _addressGlowController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 2200),
@@ -827,6 +840,7 @@ class _MyHomePageState extends State<MyHomePage>
 
   @override
   void dispose() {
+    _downloadChannel.setMethodCallHandler(null);
     WidgetsBinding.instance.removeObserver(this);
     unawaited(_stopServer());
     _addressGlowController.dispose();
@@ -1924,7 +1938,7 @@ class _MyHomePageState extends State<MyHomePage>
     }
     for (final attachmentId in card.attachmentIds) {
       final attachment = _attachments.remove(attachmentId);
-      if (attachment != null) {
+      if (attachment != null && !attachment.inDownloads) {
         final file = File(attachment.localPath);
         if (await file.exists()) {
           await file.delete();
@@ -2043,13 +2057,14 @@ class _MyHomePageState extends State<MyHomePage>
     }
     final confirmed = await _showDeleteConfirmDialog(
       title: '清空所有卡片',
-      message: '这会删除全部卡片和所有附件，且无法恢复。',
+      message: '这会删除全部卡片及应用内附件，且无法恢复；已保存到下载目录的文件会保留。',
       confirmLabel: '全部清空',
     );
     if (!confirmed) {
       return;
     }
     for (final attachment in _attachments.values) {
+      if (attachment.inDownloads) continue;
       final file = File(attachment.localPath);
       if (await file.exists()) {
         await file.delete();
@@ -2254,6 +2269,7 @@ class _MyHomePageState extends State<MyHomePage>
     }
     await storage.ensureReady();
     for (final attachment in _attachments.values) {
+      if (attachment.inDownloads) continue;
       final file = File(attachment.localPath);
       if (await file.exists()) {
         await file.delete();
@@ -2736,12 +2752,52 @@ class _MyHomePageState extends State<MyHomePage>
     required String sourcePath,
     required String fileName,
     required String mimeType,
+    bool unique = false,
   }) async {
-    return _downloadChannel.invokeMethod<String>('saveFileToDownloads', {
-      'sourcePath': sourcePath,
-      'fileName': fileName,
-      'mimeType': mimeType,
-    });
+    final requestId = _generateId('download');
+    final progress = ValueNotifier<(int, int)>((0, 0));
+    _downloadProgress[requestId] = progress;
+    final navigator = Navigator.of(context, rootNavigator: true);
+    final route = DialogRoute<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => PopScope(
+        canPop: false,
+        child: AlertDialog(
+          title: const Text('正在保存到下载目录'),
+          content: ValueListenableBuilder<(int, int)>(
+            valueListenable: progress,
+            builder: (context, value, _) {
+              final (copied, total) = value;
+              final fraction = total > 0 ? (copied / total).clamp(0.0, 1.0) : null;
+              return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(fileName, maxLines: 2, overflow: TextOverflow.ellipsis),
+                const SizedBox(height: 16),
+                LinearProgressIndicator(value: fraction),
+                const SizedBox(height: 8),
+                Text(total > 0
+                    ? '${(fraction! * 100).toStringAsFixed(0)}% · ${_formatBytes(copied)} / ${_formatBytes(total)}'
+                    : '正在准备保存…'),
+              ]);
+            },
+          ),
+        ),
+      ),
+    );
+    unawaited(navigator.push(route));
+    try {
+      return await _downloadChannel.invokeMethod<String>('saveFileToDownloads', {
+        'sourcePath': sourcePath,
+        'fileName': fileName,
+        'mimeType': mimeType,
+        'requestId': requestId,
+        'unique': unique,
+      });
+    } finally {
+      _downloadProgress.remove(requestId);
+      if (route.isActive) navigator.removeRoute(route);
+      progress.dispose();
+    }
   }
 
   Future<String?> _buildCardBundleTempFile(CardItem card) async {
@@ -2783,32 +2839,79 @@ class _MyHomePageState extends State<MyHomePage>
     return outputPath;
   }
 
+  Future<void> _showDownloadedLocation(String path) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('文件位于下载目录'),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          SelectableText(path),
+          const SizedBox(height: 12),
+          const Text('可在手机文件管理器的“下载”中找到。卡片引用这份文件；如果在文件管理器中移动或删除它，卡片将无法访问。'),
+        ]),
+        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('知道了'))],
+      ),
+    );
+  }
+
   Future<void> _openAttachment(
     CardAttachment attachment, {
     bool preview = false,
   }) async {
-    final uri = _buildAttachmentUri(attachment, preview: preview);
-    if (uri == null) {
-      _showToast('服务尚未启动');
-      return;
-    }
     if (!preview && Platform.isAndroid) {
+      if (attachment.inDownloads) {
+        if (!await File(attachment.localPath).exists()) {
+          _showToast('文件已被移动或删除，请检查下载目录');
+          return;
+        }
+        await _showDownloadedLocation(attachment.localPath);
+        return;
+      }
       try {
         final savedPath = await _saveLocalFileToAndroidDownloads(
           sourcePath: attachment.localPath,
           fileName: attachment.name,
           mimeType: attachment.mimeType,
+          unique: true,
         );
-        _showToast(savedPath == null ? '已保存到下载目录' : '已保存到 $savedPath');
+        if (savedPath == null || savedPath.isEmpty) {
+          throw StateError('未获取到保存位置');
+        }
+        final current = _attachments[attachment.id];
+        if (current == null || current.localPath != attachment.localPath) {
+          _showToast('附件已变化，文件另存于 $savedPath');
+          return;
+        }
+        final updated = CardAttachment.fromJson({
+          ...current.toJson(),
+          'localPath': savedPath,
+          'inDownloads': true,
+        });
+        _attachments[attachment.id] = updated;
+        try {
+          await _persistStateNow();
+        } catch (_) {
+          _attachments[attachment.id] = current;
+          rethrow;
+        }
+        try {
+          await File(attachment.localPath).delete();
+        } catch (error) {
+          debugPrint('Could not remove original attachment: $error');
+        }
+        _broadcastSnapshot();
+        if (mounted) setState(() {});
+        await _showDownloadedLocation(savedPath);
       } catch (error) {
         debugPrint('save local attachment failed: $error');
-        await _downloadToAndroidDownloads(
-          uri: uri,
-          fileName: attachment.name,
-          mimeType: attachment.mimeType,
-          successMessage: '已开始下载到下载目录',
-        );
+        _showToast('保存失败，原附件仍在卡片中');
       }
+      return;
+    }
+    final uri = _buildAttachmentUri(attachment, preview: preview);
+    if (uri == null) {
+      _showToast('服务尚未启动');
       return;
     }
     final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);

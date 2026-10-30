@@ -97,8 +97,8 @@ class MainActivity: FlutterActivity() {
                 }
             }
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "localshare/download")
-            .setMethodCallHandler { call, result ->
+        val downloadChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "localshare/download")
+        downloadChannel.setMethodCallHandler { call, result ->
                 when (call.method) {
                     "enqueueDownload" -> {
                         val url = call.argument<String>("url").orEmpty()
@@ -114,11 +114,22 @@ class MainActivity: FlutterActivity() {
                         val sourcePath = call.argument<String>("sourcePath").orEmpty()
                         val fileName = call.argument<String>("fileName").orEmpty()
                         val mimeType = call.argument<String>("mimeType").orEmpty()
-                        try {
-                            result.success(saveFileToDownloads(sourcePath, fileName, mimeType))
-                        } catch (error: Exception) {
-                            result.error("save_failed", error.message, null)
-                        }
+                        val requestId = call.argument<String>("requestId")
+                        val unique = call.argument<Boolean>("unique") == true
+                        Thread {
+                            try {
+                                val path = saveFileToDownloads(sourcePath, fileName, mimeType, unique) { copied, total ->
+                                    if (requestId != null) runOnUiThread {
+                                        downloadChannel.invokeMethod("saveProgress", mapOf(
+                                            "requestId" to requestId, "copied" to copied, "total" to total
+                                        ))
+                                    }
+                                }
+                                runOnUiThread { result.success(path) }
+                            } catch (error: Exception) {
+                                runOnUiThread { result.error("save_failed", error.message, null) }
+                            }
+                        }.start()
                     }
                     else -> result.notImplemented()
                 }
@@ -373,7 +384,7 @@ class MainActivity: FlutterActivity() {
         return safeFileName
     }
 
-    private fun saveFileToDownloads(sourcePath: String, fileName: String, mimeType: String): String {
+    private fun saveFileToDownloads(sourcePath: String, fileName: String, mimeType: String, unique: Boolean, progress: (Long, Long) -> Unit): String {
         require(sourcePath.isNotBlank()) { "sourcePath is required" }
         val sourceFile = File(sourcePath)
         require(sourceFile.exists()) { "source file does not exist" }
@@ -382,8 +393,41 @@ class MainActivity: FlutterActivity() {
         if (!targetDir.exists()) {
             targetDir.mkdirs()
         }
-        val targetFile = File(targetDir, safeFileName)
-        sourceFile.copyTo(targetFile, overwrite = true)
+        var targetFile = File(targetDir, safeFileName)
+        if (unique) {
+            val extension = targetFile.extension
+            val base = if (extension.isEmpty()) safeFileName else safeFileName.dropLast(extension.length + 1)
+            var index = 0
+            while (!targetFile.createNewFile()) {
+                index++
+                val suffix = if (extension.isEmpty()) "" else ".$extension"
+                targetFile = File(targetDir, "$base ($index)$suffix")
+            }
+        }
+        val total = sourceFile.length()
+        var copied = 0L
+        var lastUpdate = 0L
+        try { sourceFile.inputStream().use { input ->
+            targetFile.outputStream().use { output ->
+                val buffer = ByteArray(256 * 1024)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    output.write(buffer, 0, count)
+                    copied += count
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    if (now - lastUpdate >= 200 || copied == total) {
+                        progress(copied, total)
+                        lastUpdate = now
+                    }
+                }
+            }
+        }
+            check(copied == total && targetFile.length() == total) { "source file changed or copy was incomplete" }
+        } catch (error: Exception) {
+            if (unique) targetFile.delete()
+            throw error
+        }
         if (mimeType.isNotBlank()) {
             sendBroadcast(
                 Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE).apply {
