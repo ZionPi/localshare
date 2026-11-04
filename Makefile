@@ -107,3 +107,8 @@ uninstall:
 
 clean:
 	$(FLUTTER) clean
+
+.PHONY: whiteboard
+whiteboard:
+	cd whiteboard && npm ci --no-audit --no-fund
+	cd whiteboard && npm run build

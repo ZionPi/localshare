@@ -68,3 +68,10 @@ ios/Flutter/flutter_export_environment.sh
 # Private local build config
 localshare.local.mk
 *.local.mk
+
+# Whiteboard frontend build cache (the packaged ZIP is tracked)
+whiteboard/node_modules/
+whiteboard/dist/
+
+# Local browser QA state
+.gstack/

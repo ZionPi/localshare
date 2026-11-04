@@ -1,0 +1,13 @@
+{
+  "name": "localshare-whiteboard",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "build": "vite build && node bundle.mjs" },
+  "dependencies": {
+    "@excalidraw/excalidraw": "0.18.0",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": { "vite": "6.4.1" }
+}

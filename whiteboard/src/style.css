@@ -1,0 +1,34 @@
+* { box-sizing: border-box; }
+body { margin: 0; color: #172234; background: #fff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.app { height: 100dvh; display: flex; flex-direction: column; }
+.topbar { min-height: 62px; padding: 12px 20px; display: flex; align-items: center; gap: 20px; flex-wrap: wrap; border-bottom: 1px solid #e8ebf1; }
+.back { color: #1353d8; text-decoration: none; font-size: 14px; }
+.topbar strong { font-size: 18px; }
+.status { font-size: 13px; color: #6b7280; }
+.status.saved { color: #27844a; }
+.status.error, .status.conflict { color: #b45309; }
+.actions { margin-left: auto; display: flex; gap: 8px; }
+button { cursor: pointer; border: 1px solid #dce2ec; border-radius: 8px; padding: 8px 12px; color: #283a58; background: #fff; font-size: 13px; }
+button:hover { background: #f1f5fc; }
+button:disabled { opacity: .45; cursor: default; }
+.canvas { flex: 1; min-height: 0; position: relative; }
+.empty { height: 100%; display: grid; place-items: center; color: #667085; }
+.notice { background: #fffbeb; color: #92400e; font-size: 13px; padding: 8px 20px; }
+@media (max-width: 760px) {
+  .topbar { padding: 10px 12px; gap: 10px; }
+  .status { flex: 1; }
+  .actions { width: 100%; justify-content: flex-end; }
+}
+.embedded .topbar { min-height: 40px; padding: 6px 10px; gap: 10px; }
+.embedded .topbar strong { display: none; }
+.embedded .actions { width: auto; }
+.embedded .actions button { padding: 5px 8px; }
+.workspace { height:100dvh; display:flex; flex-direction:column; }
+.workspace > .app { flex:1; min-height:0; height:auto; }
+.board-picker, .board-form { display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid #e8ebf1; flex-wrap:wrap; }
+.board-picker label, .board-form label { font-size:13px; font-weight:600; }
+.board-picker select, .board-form input { min-width:0; max-width:260px; border:1px solid #dce2ec; padding:7px 10px; border-radius:8px; background:white; color:#172234; font-size:14px; }
+.board-picker select { flex:1; }
+.follow-hint { font-size:12px; color:#667085; margin-left:auto; }
+.workspace-notice { font-size:12px; padding:5px 12px; background:#f1f6ff; color:#264d88; }
+.workspace .board-title { display:none; }

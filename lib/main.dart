@@ -5,6 +5,8 @@ import 'dart:math';
 import 'api_docs.dart';
 import 'attachment_filename.dart';
 import 'web_upload.dart';
+import 'whiteboard.dart';
+import 'whiteboard_editor.dart';
 import 'package:flutter/gestures.dart';
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
@@ -83,6 +85,15 @@ String? _buildExportArchive(Map<String, dynamic> request) {
     } catch (_) {}
     rethrow;
   }
+}
+
+/// User feedback replaces older messages immediately, including queued ones.
+void showLocalShareMessage(BuildContext context, String message) {
+  final messenger = ScaffoldMessenger.maybeOf(context);
+  messenger
+    ?..clearSnackBars()
+    ..removeCurrentSnackBar()
+    ..showSnackBar(SnackBar(content: Text(message)));
 }
 
 void main() {
@@ -183,6 +194,7 @@ class CardAttachment {
     required this.kind,
     required this.createdAt,
     this.inDownloads = false,
+    this.downloadedPath,
   });
 
   final String id;
@@ -194,6 +206,7 @@ class CardAttachment {
   final AttachmentKind kind;
   final DateTime createdAt;
   final bool inDownloads;
+  final String? downloadedPath;
 
   bool get isPreviewable =>
       kind == AttachmentKind.image ||
@@ -210,6 +223,7 @@ class CardAttachment {
       'size': size,
       'localPath': localPath,
       'inDownloads': inDownloads,
+      'downloadedPath': downloadedPath,
       'kind': kind.name,
       'createdAt': createdAt.toIso8601String(),
     };
@@ -239,6 +253,7 @@ class CardAttachment {
       size: (json['size'] as num?)?.toInt() ?? 0,
       localPath: json['localPath'] as String,
       inDownloads: json['inDownloads'] as bool? ?? false,
+      downloadedPath: json['downloadedPath'] as String?,
       kind: AttachmentKind.values.firstWhere(
         (value) => value.name == json['kind'],
         orElse: () => AttachmentKind.other,
@@ -247,6 +262,73 @@ class CardAttachment {
           DateTime.now(),
     );
   }
+}
+
+/// Recovers the old download-as-original format without removing user files.
+Future<CardAttachment> preserveAttachmentOriginal(
+  CardAttachment attachment,
+  Directory originalsDirectory,
+) async {
+  if (!attachment.inDownloads) return attachment;
+  await originalsDirectory.create(recursive: true);
+  final original = File(
+    '${originalsDirectory.path}/${buildStoredFileName(attachment.name, attachment.id)}',
+  );
+  if (!await original.exists() || await original.length() != attachment.size) {
+    final source = File(attachment.localPath);
+    if (!await source.exists()) {
+      throw StateError('原件已丢失，无法重新下载，请重新上传文件');
+    }
+    final temporary = File('${original.path}.recovering');
+    await source.copy(temporary.path);
+    if (await temporary.length() != attachment.size) {
+      throw StateError('原文件已变化，无法保留完整原件');
+    }
+    await temporary.rename(original.path);
+  }
+  return CardAttachment.fromJson({
+    ...attachment.toJson(),
+    'localPath': original.path,
+    'inDownloads': false,
+    'downloadedPath': attachment.downloadedPath ?? attachment.localPath,
+  });
+}
+
+class AttachmentDownloadResult {
+  const AttachmentDownloadResult(this.path, {required this.alreadyDownloaded});
+  final String path;
+  final bool alreadyDownloaded;
+}
+
+Future<AttachmentDownloadResult> downloadCardAttachment(
+  CardAttachment attachment, {
+  required Directory originalsDirectory,
+  required Future<String?> Function(CardAttachment) saveCopy,
+  required Future<void> Function(CardAttachment) persist,
+}) async {
+  final retained = await preserveAttachmentOriginal(attachment, originalsDirectory);
+  if (!identical(retained, attachment)) await persist(retained);
+  final existingPath = retained.downloadedPath;
+  if (existingPath != null && await File(existingPath).exists()) {
+    return AttachmentDownloadResult(existingPath, alreadyDownloaded: true);
+  }
+  if (!await File(retained.localPath).exists()) {
+    throw StateError('原件已丢失，无法下载，请重新上传文件');
+  }
+  final savedPath = await saveCopy(retained);
+  if (savedPath == null || savedPath.isEmpty) {
+    throw StateError('未获取到下载位置，请重试');
+  }
+  final updated = CardAttachment.fromJson({
+    ...retained.toJson(),
+    'downloadedPath': savedPath,
+  });
+  try {
+    await persist(updated);
+  } catch (_) {
+    throw StateError('文件已保存到 $savedPath，但下载记录保存失败');
+  }
+  return AttachmentDownloadResult(savedPath, alreadyDownloaded: false);
 }
 
 class CardItem {
@@ -258,6 +340,8 @@ class CardItem {
     this.pinnedAt,
     this.archivedAt,
     this.source = 'local',
+    this.whiteboardId,
+    this.whiteboardName,
     List<String>? attachmentIds,
   }) : attachmentIds = attachmentIds ?? <String>[];
 
@@ -268,6 +352,8 @@ class CardItem {
   DateTime? pinnedAt;
   DateTime? archivedAt;
   String source;
+  final String? whiteboardId;
+  final String? whiteboardName;
   final List<String> attachmentIds;
 
   bool get isPinned => pinnedAt != null;
@@ -282,6 +368,8 @@ class CardItem {
       'pinnedAt': pinnedAt?.toIso8601String(),
       'archivedAt': archivedAt?.toIso8601String(),
       'source': source,
+      if (whiteboardId != null) 'whiteboardId': whiteboardId,
+      if (whiteboardName != null) 'whiteboardName': whiteboardName,
       'attachmentIds': attachmentIds,
     };
   }
@@ -300,6 +388,8 @@ class CardItem {
       'pinnedAt': pinnedAt?.toIso8601String(),
       'archivedAt': archivedAt?.toIso8601String(),
       'source': source,
+      if (whiteboardId != null) 'whiteboardId': whiteboardId,
+      if (whiteboardName != null) 'whiteboardName': whiteboardName,
       'archived': isArchived,
       'pinned': isPinned,
       'attachments': attachments,
@@ -318,6 +408,8 @@ class CardItem {
       pinnedAt: DateTime.tryParse(json['pinnedAt'] as String? ?? ''),
       archivedAt: DateTime.tryParse(json['archivedAt'] as String? ?? ''),
       source: json['source'] as String? ?? 'local',
+      whiteboardId: json['whiteboardId'] as String?,
+      whiteboardName: json['whiteboardName'] as String?,
       attachmentIds: (json['attachmentIds'] as List<dynamic>? ?? <dynamic>[])
           .map((value) => value as String)
           .toList(),
@@ -721,6 +813,7 @@ class _MyHomePageState extends State<MyHomePage>
       <_IncomingAttachmentPayload>[];
 
   LocalShareStorage? _storage;
+  WhiteboardService? _whiteboard;
   HttpServer? _server;
   StreamSubscription? _intentDataStreamSubscription;
   Timer? _saveDebounceTimer;
@@ -741,7 +834,8 @@ class _MyHomePageState extends State<MyHomePage>
   bool _isServerRunning = false;
   bool _isPickingFiles = false;
   bool _isExporting = false;
-  final Map<String, ValueNotifier<(int, int)>> _downloadProgress = {};
+  final Set<String> _downloadingAttachmentIds = {};
+  final Set<String> _downloadingCardIds = {};
   File? _exportCancelFile;
   bool _isLoading = true;
   DateTime? _lastStateSyncAt;
@@ -750,6 +844,7 @@ class _MyHomePageState extends State<MyHomePage>
   bool _isAutoStartingServer = false;
   bool _clipboardToTempChatEnabled = false;
   bool _isTempChatMode = false;
+  bool _isWhiteboardMode = false;
   bool _hasUnreadTempChat = false;
   String? _lastCapturedClipboardFingerprint;
   String? _lastLocalShareCopiedText;
@@ -760,14 +855,6 @@ class _MyHomePageState extends State<MyHomePage>
   @override
   void initState() {
     super.initState();
-    _downloadChannel.setMethodCallHandler((call) async {
-      if (call.method != 'saveProgress') return;
-      final args = Map<Object?, Object?>.from(call.arguments as Map);
-      final progress = _downloadProgress[args['requestId']];
-      if (progress != null) {
-        progress.value = (args['copied'] as int, args['total'] as int);
-      }
-    });
     _addressGlowController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 2200),
@@ -787,6 +874,13 @@ class _MyHomePageState extends State<MyHomePage>
       _attachments
         ..clear()
         ..addEntries(state.attachments.map((e) => MapEntry(e.id, e)));
+      await _preserveLegacyDownloadOriginals();
+      _whiteboard = WhiteboardService(_storage!.rootDir, onSaved: _updateWhiteboardCard);
+      try {
+        await _whiteboard!.refreshCard();
+      } catch (_) {
+        _showToast('白板卡片暂时无法更新，请进入白板后重试保存');
+      }
       final chatState = await _loadTempChatState();
       _chatMessages
         ..clear()
@@ -811,6 +905,26 @@ class _MyHomePageState extends State<MyHomePage>
         });
       }
     }
+  }
+
+  Future<void> _preserveLegacyDownloadOriginals() async {
+    var changed = false;
+    var failed = 0;
+    for (final attachment in _attachments.values.toList()) {
+      if (!attachment.inDownloads) continue;
+      try {
+        final retained = await preserveAttachmentOriginal(
+          attachment, _storage!.attachmentsDir,
+        );
+        _attachments[attachment.id] = retained;
+        changed = true;
+      } catch (error) {
+        debugPrint('Could not preserve original attachment: $error');
+        failed++;
+      }
+    }
+    if (changed) await _persistStateNow();
+    if (failed > 0) _showToast('$failed 个旧附件无法保留原件，请检查文件是否已删除或存储空间是否充足');
   }
 
   Future<void> _loadPreferences() async {
@@ -849,7 +963,6 @@ class _MyHomePageState extends State<MyHomePage>
 
   @override
   void dispose() {
-    _downloadChannel.setMethodCallHandler(null);
     WidgetsBinding.instance.removeObserver(this);
     unawaited(_stopServer());
     _addressGlowController.dispose();
@@ -1006,6 +1119,7 @@ class _MyHomePageState extends State<MyHomePage>
     return {
       'type': 'chatSnapshot',
       'tempChatMode': _isTempChatMode,
+      'whiteboardMode': _isWhiteboardMode,
       'messages': _chatMessages
           .map((message) => message.toPublicJson(_chatAttachments))
           .toList(),
@@ -1036,6 +1150,13 @@ class _MyHomePageState extends State<MyHomePage>
     if (mounted) {
       setState(() {});
     }
+  }
+
+  void _setWhiteboardMode(bool enabled) {
+    if (_isWhiteboardMode == enabled) return;
+    _isWhiteboardMode = enabled;
+    _broadcastSnapshot();
+    _broadcastChatSnapshot();
   }
 
   Future<TempChatMessage> _createTempChatMessage({
@@ -2294,6 +2415,8 @@ class _MyHomePageState extends State<MyHomePage>
             pinnedAt: card.pinnedAt,
             archivedAt: card.archivedAt,
             source: card.source,
+            whiteboardId: card.whiteboardId,
+            whiteboardName: card.whiteboardName,
             attachmentIds: List<String>.from(card.attachmentIds),
           ),
         )
@@ -2438,10 +2561,7 @@ class _MyHomePageState extends State<MyHomePage>
     if (!mounted) {
       return;
     }
-    final messenger = ScaffoldMessenger.maybeOf(context);
-    messenger
-      ?..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+    showLocalShareMessage(context, message);
   }
 
   Future<void> _syncForegroundService() async {
@@ -2629,6 +2749,97 @@ class _MyHomePageState extends State<MyHomePage>
     _setTempChatMode(false);
   }
 
+  Future<void> _updateWhiteboardCard(Map<String, dynamic> board) async {
+    final preview = board['previewDataURL'];
+    final storage = _storage;
+    if (preview is! String || storage == null) return;
+    final revision = board['revision'] as int;
+    final boardId = board['id'] as String? ?? 'default';
+    final boardName = board['name'] as String? ?? '画布 1';
+    final cardId = boardId == 'default' ? 'localshare-whiteboard' : 'localshare-whiteboard-$boardId';
+    final attachmentId = boardId == 'default' ? 'whiteboard-preview-$revision' : 'whiteboard-$boardId-preview-$revision';
+    final previousCard = _findCard(cardId);
+    if (previousCard?.attachmentIds.contains(attachmentId) == true &&
+        _attachments[attachmentId] != null &&
+        await File(_attachments[attachmentId]!.localPath).exists() &&
+        previousCard?.text != '白板' &&
+        previousCard?.whiteboardName == boardName) { return; }
+    final bytes = UriData.parse(preview).contentAsBytes();
+    if (bytes.length < 8 || bytes[0] != 137 || bytes[1] != 80 || bytes[2] != 78 || bytes[3] != 71) {
+      throw const FormatException('Invalid whiteboard preview');
+    }
+    await storage.ensureReady();
+    final path = '${storage.attachmentsDir.path}/$attachmentId.png';
+    await File(path).writeAsBytes(bytes, flush: true);
+    final now = DateTime.now();
+    final oldAttachments = <String, CardAttachment>{
+      for (final id in previousCard?.attachmentIds ?? <String>[])
+        if (_attachments[id] != null) id: _attachments[id]!,
+    };
+    final updated = CardItem(
+      id: cardId, text: previousCard?.text == '白板' ? '' : (previousCard?.text ?? ''), source: 'whiteboard',
+      whiteboardId: boardId, whiteboardName: boardName,
+      createdAt: previousCard?.createdAt ?? now, updatedAt: now,
+      pinnedAt: previousCard?.pinnedAt, archivedAt: previousCard?.archivedAt,
+      attachmentIds: [attachmentId],
+    );
+    final oldIndex = _cards.indexWhere((card) => card.id == cardId);
+    if (oldIndex >= 0) { _cards[oldIndex] = updated; } else { _cards.add(updated); }
+    for (final id in oldAttachments.keys) { _attachments.remove(id); }
+    _attachments[attachmentId] = CardAttachment(
+      id: attachmentId, cardId: cardId, name: '$boardName.png', mimeType: 'image/png',
+      downloadedPath: oldAttachments[attachmentId]?.downloadedPath,
+      size: bytes.length, localPath: path, kind: AttachmentKind.image, createdAt: now,
+    );
+    try {
+      await _persistStateNow();
+    } catch (_) {
+      _attachments.remove(attachmentId);
+      _attachments.addAll(oldAttachments);
+      if (oldIndex >= 0) { _cards[oldIndex] = previousCard!; } else { _cards.remove(updated); }
+      rethrow;
+    }
+    _broadcastSnapshot();
+    if (mounted) setState(() {});
+    for (final old in oldAttachments.values) {
+      if (old.inDownloads || old.localPath == path) continue;
+      try { await File(old.localPath).delete(); } catch (_) {}
+    }
+  }
+
+  Future<void> _openWhiteboard(BuildContext pageContext, {String? boardId}) async {
+    final whiteboard = _whiteboard;
+    if (whiteboard == null) { _showToast('白板尚未准备好，请稍后重试'); return; }
+    HttpServer? localServer;
+    try {
+      if (boardId != null) await whiteboard.activateBoard(boardId);
+      localServer = await shelf_io.serve(whiteboard.handle, InternetAddress.loopbackIPv4, 0);
+      if (!pageContext.mounted) return;
+      _setWhiteboardMode(true);
+      await Navigator.of(pageContext).push<void>(MaterialPageRoute<void>(builder: (_) => WhiteboardEditorPage(
+        uri: Uri.parse('http://127.0.0.1:${localServer!.port}/whiteboard/?app=1'),
+        onDownload: (name, bytes, mimeType) async {
+          _showToast('正在保存到下载目录…');
+          final temporaryDirectory = await getTemporaryDirectory();
+          final temporary = File('${temporaryDirectory.path}/${buildStoredFileName(name, _generateId('whiteboard-export'))}');
+          try {
+            await temporary.writeAsBytes(bytes, flush: true);
+            final saved = await _saveLocalFileToAndroidDownloads(sourcePath: temporary.path, fileName: name, mimeType: mimeType, unique: true);
+            if (saved == null || saved.isEmpty) throw StateError('未获取到下载位置');
+            _showToast('下载成功，已保存到：$saved');
+          } catch (_) { _showToast('下载失败，请检查存储空间和文件权限'); }
+          finally { try { await temporary.delete(); } catch (_) {} }
+        },
+      )));
+    } catch (error) {
+      debugPrint('open whiteboard failed: $error');
+      _showToast('无法打开白板，请稍后重试');
+    } finally {
+      _setWhiteboardMode(false);
+      await localServer?.close(force: true);
+    }
+  }
+
   Future<void> _openSettings() async {
     final nextSettings = await Navigator.of(context).push<_PortSettingsResult>(
       MaterialPageRoute<_PortSettingsResult>(
@@ -2641,6 +2852,7 @@ class _MyHomePageState extends State<MyHomePage>
           onImportTap: _importAllCards,
           onExportTap: _exportAllCards,
           onTempChatTap: _openTempChatPage,
+          onWhiteboardTap: _openWhiteboard,
           onManageCardsTap: (settingsContext) async {
             await Navigator.of(settingsContext).push<void>(
               MaterialPageRoute<void>(
@@ -2734,27 +2946,19 @@ class _MyHomePageState extends State<MyHomePage>
     required Uri uri,
     required String fileName,
     required String mimeType,
-    required String successMessage,
   }) async {
     try {
-      final savedFileName =
-          await _downloadChannel.invokeMethod<String>('enqueueDownload', {
+      final file = await _downloadChannel.invokeMethod<String>('enqueueDownload', {
         'url': uri.toString(),
         'fileName': fileName,
         'mimeType': mimeType,
       });
-      _showToast(
-        savedFileName == null || savedFileName.isEmpty
-            ? successMessage
-            : '$successMessage：$savedFileName',
-      );
+      _showToast('已开始下载：${file ?? fileName}，请在下载目录查看');
     } on PlatformException catch (error) {
       debugPrint('enqueueDownload failed: $error');
       final launched =
           await launchUrl(uri, mode: LaunchMode.externalApplication);
-      if (!launched) {
-        _showToast('无法开始下载');
-      }
+      _showToast(launched ? '已交给浏览器下载，请查看浏览器下载记录' : '无法开始下载，请重试');
     }
   }
 
@@ -2764,50 +2968,12 @@ class _MyHomePageState extends State<MyHomePage>
     required String mimeType,
     bool unique = false,
   }) async {
-    final requestId = _generateId('download');
-    final progress = ValueNotifier<(int, int)>((0, 0));
-    _downloadProgress[requestId] = progress;
-    final navigator = Navigator.of(context, rootNavigator: true);
-    final route = DialogRoute<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => PopScope(
-        canPop: false,
-        child: AlertDialog(
-          title: const Text('正在保存到下载目录'),
-          content: ValueListenableBuilder<(int, int)>(
-            valueListenable: progress,
-            builder: (context, value, _) {
-              final (copied, total) = value;
-              final fraction = total > 0 ? (copied / total).clamp(0.0, 1.0) : null;
-              return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text(fileName, maxLines: 2, overflow: TextOverflow.ellipsis),
-                const SizedBox(height: 16),
-                LinearProgressIndicator(value: fraction),
-                const SizedBox(height: 8),
-                Text(total > 0
-                    ? '${(fraction! * 100).toStringAsFixed(0)}% · ${_formatBytes(copied)} / ${_formatBytes(total)}'
-                    : '正在准备保存…'),
-              ]);
-            },
-          ),
-        ),
-      ),
-    );
-    unawaited(navigator.push(route));
-    try {
-      return await _downloadChannel.invokeMethod<String>('saveFileToDownloads', {
-        'sourcePath': sourcePath,
-        'fileName': fileName,
-        'mimeType': mimeType,
-        'requestId': requestId,
-        'unique': unique,
-      });
-    } finally {
-      _downloadProgress.remove(requestId);
-      if (route.isActive) navigator.removeRoute(route);
-      progress.dispose();
-    }
+    return _downloadChannel.invokeMethod<String>('saveFileToDownloads', {
+      'sourcePath': sourcePath,
+      'fileName': fileName,
+      'mimeType': mimeType,
+      'unique': unique,
+    });
   }
 
   Future<String?> _buildCardBundleTempFile(CardItem card) async {
@@ -2828,7 +2994,7 @@ class _MyHomePageState extends State<MyHomePage>
       for (final attachment in cardAttachments) {
         final file = File(attachment.localPath);
         if (!await file.exists()) {
-          continue;
+          throw StateError('附件“${attachment.name}”的原件已丢失，无法完成全部下载');
         }
         encoder.addFile(
           file,
@@ -2849,73 +3015,58 @@ class _MyHomePageState extends State<MyHomePage>
     return outputPath;
   }
 
-  Future<void> _showDownloadedLocation(String path) async {
-    if (!mounted) return;
-    await showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('文件位于下载目录'),
-        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-          SelectableText(path),
-          const SizedBox(height: 12),
-          const Text('可在手机文件管理器的“下载”中找到。卡片引用这份文件；如果在文件管理器中移动或删除它，卡片将无法访问。'),
-        ]),
-        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('知道了'))],
-      ),
-    );
-  }
-
   Future<void> _openAttachment(
     CardAttachment attachment, {
     bool preview = false,
   }) async {
     if (!preview && Platform.isAndroid) {
-      if (attachment.inDownloads) {
-        if (!await File(attachment.localPath).exists()) {
-          _showToast('文件已被移动或删除，请检查下载目录');
-          return;
-        }
-        await _showDownloadedLocation(attachment.localPath);
+      if (!_downloadingAttachmentIds.add(attachment.id)) {
+        _showToast('正在下载，请稍候');
         return;
       }
       try {
-        final savedPath = await _saveLocalFileToAndroidDownloads(
-          sourcePath: attachment.localPath,
-          fileName: attachment.name,
-          mimeType: attachment.mimeType,
-          unique: true,
-        );
-        if (savedPath == null || savedPath.isEmpty) {
-          throw StateError('未获取到保存位置');
-        }
-        final current = _attachments[attachment.id];
-        if (current == null || current.localPath != attachment.localPath) {
-          _showToast('附件已变化，文件另存于 $savedPath');
+        final current = _attachments[attachment.id] ?? attachment;
+        final existingPath = current.downloadedPath ??
+            (current.inDownloads ? current.localPath : null);
+        if (existingPath != null && await File(existingPath).exists()) {
+          _showToast('已下载，文件位于：$existingPath');
           return;
         }
-        final updated = CardAttachment.fromJson({
-          ...current.toJson(),
-          'localPath': savedPath,
-          'inDownloads': true,
-        });
-        _attachments[attachment.id] = updated;
-        try {
-          await _persistStateNow();
-        } catch (_) {
-          _attachments[attachment.id] = current;
-          rethrow;
-        }
-        try {
-          await File(attachment.localPath).delete();
-        } catch (error) {
-          debugPrint('Could not remove original attachment: $error');
-        }
-        _broadcastSnapshot();
-        if (mounted) setState(() {});
-        await _showDownloadedLocation(savedPath);
+        _showToast('正在保存到下载目录…');
+        final storage = _storage;
+        if (storage == null) throw StateError('应用尚未准备好，请稍后重试');
+        final result = await downloadCardAttachment(
+          current,
+          originalsDirectory: storage.attachmentsDir,
+          saveCopy: (source) => _saveLocalFileToAndroidDownloads(
+            sourcePath: source.localPath,
+            fileName: source.name,
+            mimeType: source.mimeType,
+            unique: true,
+          ),
+          persist: (updated) async {
+            final current = _attachments[attachment.id];
+            if (current == null) throw StateError('卡片已删除');
+            _attachments[attachment.id] = updated;
+            try {
+              await _persistStateNow();
+            } catch (_) {
+              _attachments[attachment.id] = current;
+              rethrow;
+            }
+          },
+        );
+        if (!result.alreadyDownloaded) _broadcastSnapshot();
+        _showToast(result.alreadyDownloaded
+            ? '已下载，文件位于：${result.path}'
+            : '下载成功，已保存到：${result.path}');
       } catch (error) {
         debugPrint('save local attachment failed: $error');
-        _showToast('保存失败，原附件仍在卡片中');
+        _showToast(error is StateError
+            ? error.message.toString()
+            : '下载失败，请检查存储空间和文件权限后重试');
+      } finally {
+        _downloadingAttachmentIds.remove(attachment.id);
       }
       return;
     }
@@ -2927,43 +3078,63 @@ class _MyHomePageState extends State<MyHomePage>
     final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
     if (!launched) {
       _showToast(preview ? '无法打开预览' : '无法打开下载链接');
+    } else if (!preview) {
+      _showToast('已交给浏览器下载，请查看浏览器下载记录');
     }
   }
 
   Future<void> _downloadCardBundle(CardItem card) async {
-    final uri = _buildCardBundleUri(card);
-    if (uri == null) {
-      _showToast('服务尚未启动');
+    if (!_downloadingCardIds.add(card.id)) {
+      _showToast('正在打包下载，请稍候');
       return;
     }
-    final bundleName = _buildCardBundleFileName(card);
-    if (Platform.isAndroid) {
-      try {
-        final localBundlePath = await _buildCardBundleTempFile(card);
-        if (localBundlePath == null) {
-          _showToast('没有可下载的附件');
-          return;
-        }
-        final savedPath = await _saveLocalFileToAndroidDownloads(
-          sourcePath: localBundlePath,
-          fileName: bundleName,
-          mimeType: 'application/zip',
-        );
-        _showToast(savedPath == null ? '已保存到下载目录' : '已保存到 $savedPath');
-      } catch (error) {
-        debugPrint('save local bundle failed: $error');
-        await _downloadToAndroidDownloads(
-          uri: uri,
-          fileName: bundleName,
-          mimeType: 'application/zip',
-          successMessage: '已开始打包下载到下载目录',
-        );
+    try {
+      final uri = _buildCardBundleUri(card);
+      if (uri == null) {
+        _showToast('服务尚未启动，无法下载');
+        return;
       }
-      return;
-    }
-    final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
-    if (!launched) {
-      _showToast('无法开始批量下载');
+      final bundleName = _buildCardBundleFileName(card);
+      if (Platform.isAndroid) {
+        _showToast('正在打包并保存到下载目录…');
+        try {
+          final localBundlePath = await _buildCardBundleTempFile(card);
+          if (localBundlePath == null) {
+            _showToast('没有可下载的附件');
+            return;
+          }
+          final savedPath = await _saveLocalFileToAndroidDownloads(
+            sourcePath: localBundlePath,
+            fileName: bundleName,
+            mimeType: 'application/zip',
+            unique: true,
+          );
+          if (savedPath == null || savedPath.isEmpty) {
+            throw StateError('未获取到下载位置');
+          }
+          _showToast('下载成功，已保存到：$savedPath');
+        } catch (error) {
+          debugPrint('save local bundle failed: $error');
+          if (error is StateError) {
+            _showToast(error.message.toString());
+            return;
+          }
+          _showToast('本地打包保存失败，正在尝试系统下载…');
+          await _downloadToAndroidDownloads(
+            uri: uri,
+            fileName: bundleName,
+            mimeType: 'application/zip',
+          );
+        }
+        return;
+      }
+      final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      _showToast(launched ? '已交给浏览器下载，请查看浏览器下载记录' : '无法开始批量下载，请重试');
+    } catch (error) {
+      debugPrint('download bundle failed: $error');
+      _showToast('下载失败，请稍后重试');
+    } finally {
+      _downloadingCardIds.remove(card.id);
     }
   }
 
@@ -3343,6 +3514,7 @@ class _MyHomePageState extends State<MyHomePage>
         return;
       }
 
+      final whiteboard = _whiteboard!;
       final router = shelf_router.Router()
         ..get('/', _handleIndex)
         ..get('/api/docs', _handleApiDocs)
@@ -3396,6 +3568,9 @@ class _MyHomePageState extends State<MyHomePage>
         _recordObservedRequestAddress(request);
         if (request.url.path == 'ws') {
           return wsHandler(request);
+        }
+        if (WhiteboardService.handles(request.url.path)) {
+          return whiteboard.handle(request);
         }
         return router.call(request);
       }
@@ -3510,6 +3685,7 @@ class _MyHomePageState extends State<MyHomePage>
       'discoveryHint': _discoveryHint,
       'bookmarkAddress': _bookmarkAddress,
       'tempChatMode': _isTempChatMode,
+      'whiteboardMode': _isWhiteboardMode,
       'chatMessages': _buildChatSnapshot()['messages'],
     };
   }
@@ -4533,9 +4709,11 @@ textarea.file-drag-over { outline: 2px dashed var(--primary); outline-offset: -4
   .image-viewer-stage { padding: 82px 14px 96px; }
   .image-viewer-close, .image-viewer-arrow { width: 44px; height: 44px; }
 }
+body.whiteboard-mode > .header, body.whiteboard-mode > main.shell { display:none; }
 </style>
 </head>
 <body>
+<iframe id="whiteboardFrame" title="白板模式" hidden style="position:fixed;inset:0;width:100%;height:100dvh;border:0;z-index:100;"></iframe>
 <header class="header">
   <div class="header-inner">
     <div class="brand"><span class="material-symbols-outlined">share</span><span>本地分享</span></div>
@@ -4665,6 +4843,7 @@ const initialAddress = ${jsonEncode(_serverAddress)};
 const initialDiscoveryHint = ${jsonEncode(_discoveryHint)};
 const initialBookmarkAddress = ${jsonEncode(_bookmarkAddress)};
 const initialTempChatMode = ${jsonEncode(_isTempChatMode)};
+const initialWhiteboardMode = ${jsonEncode(_isWhiteboardMode)};
 const cardsRoot = document.getElementById('cardsRoot');
 const searchInput = document.getElementById('searchInput');
 const composerInput = document.getElementById('composerInput');
@@ -4708,6 +4887,7 @@ addressText.textContent = initialAddress;
 renderBookmarkAddress(initialBookmarkAddress);
 renderDiscoveryHint(initialDiscoveryHint);
 applyTempChatMode(initialTempChatMode);
+applyWhiteboardMode(initialWhiteboardMode);
 
 function showToast(message) {
   toast.textContent = message;
@@ -4732,6 +4912,18 @@ function applyTempChatMode(enabled) {
     renderChat();
     refreshChat();
   }
+}
+
+function applyWhiteboardMode(enabled) {
+  const active = Boolean(enabled);
+  const frame = document.getElementById('whiteboardFrame');
+  document.body.classList.toggle('whiteboard-mode', active);
+  if (active && !frame.getAttribute('src')) frame.src = '/whiteboard/?shared=1';
+  if (!active && frame.contentWindow?.localShareSave) {
+    frame.contentWindow.localShareSave().catch(() => {});
+  }
+  if (active) frame.contentWindow?.localShareRefresh?.();
+  frame.hidden = !active;
 }
 
 function escapeHtml(value) {
@@ -4855,6 +5047,7 @@ function cardTypeLabel(attachments) {
 function renderCardTags(card) {
   const labels = ['创建 ' + new Date(card.createdAt).toLocaleString()];
   if (card.source === 'shared') labels.push('分享导入');
+  if (card.source === 'whiteboard') { labels.push('白板'); if (card.whiteboardName) labels.push(card.whiteboardName); }
   const typeLabel = cardTypeLabel(card.attachments || []);
   if (typeLabel) labels.push(typeLabel);
   if (card.pinned) labels.push('置顶');
@@ -5119,11 +5312,13 @@ function connectWs() {
       renderBookmarkAddress(payload.bookmarkAddress || '');
       renderDiscoveryHint(payload.discoveryHint || '');
       applyTempChatMode(payload.tempChatMode);
+      applyWhiteboardMode(payload.whiteboardMode);
       renderCards();
     } else if (payload.type === 'chatSnapshot') {
       chatMessages = payload.messages || [];
       chatFetchingCount = payload.linkTextFetchingCount || payload.wechatFetchingCount || 0;
       applyTempChatMode(payload.tempChatMode);
+      applyWhiteboardMode(payload.whiteboardMode);
       renderChat();
     }
   };
@@ -6146,6 +6341,8 @@ connectWs();
     final hasText = card.text.trim().isNotEmpty;
     final metaLabels = <String>[
       if (card.source == 'shared') '分享导入',
+      if (card.source == 'whiteboard') '白板',
+      if (card.source == 'whiteboard' && card.whiteboardName != null) card.whiteboardName!,
       if (_cardTypeLabel(cardAttachments) case final typeLabel?) typeLabel,
     ];
 
@@ -6155,7 +6352,7 @@ connectWs();
           label: '编辑',
           icon: Icons.edit_note_rounded,
           color: const Color(0xFF0D44B3),
-          onTap: () => _openCardEditor(card),
+          onTap: () => card.source == 'whiteboard' ? _openWhiteboard(context, boardId: card.whiteboardId ?? 'default') : _openCardEditor(card),
         ),
         _SwipeActionSpec(
           label: '归档',
@@ -7165,6 +7362,7 @@ class LocalShareSettingsPage extends StatefulWidget {
     required this.onTempChatTap,
     required this.onManageCardsTap,
     required this.onArchivedCardsTap,
+    required this.onWhiteboardTap,
   });
 
   final int initialPort;
@@ -7177,6 +7375,7 @@ class LocalShareSettingsPage extends StatefulWidget {
   final Future<void> Function(BuildContext context) onTempChatTap;
   final Future<void> Function(BuildContext context) onManageCardsTap;
   final Future<void> Function(BuildContext context) onArchivedCardsTap;
+  final Future<void> Function(BuildContext context) onWhiteboardTap;
 
   @override
   State<LocalShareSettingsPage> createState() => _LocalShareSettingsPageState();
@@ -7338,6 +7537,13 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
                     minimumSize: const Size.fromHeight(48),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
                   ),
+                ),
+                const SizedBox(height: 10),
+                OutlinedButton.icon(
+                  onPressed: () => widget.onWhiteboardTap(context),
+                  icon: const Icon(Icons.draw_outlined),
+                  label: const Text('白板模式'),
+                  style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(48)),
                 ),
                 const SizedBox(height: 10),
                 OutlinedButton.icon(
