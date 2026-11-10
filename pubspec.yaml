@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.34+35
+version: 1.0.35+36
 
 environment:
   sdk: ^3.6.0
@@ -50,9 +50,7 @@ dependencies:
   webview_flutter: ^4.10.0
   webview_flutter_android: ^4.3.0
   receive_sharing_intent:
-    git:
-      url: https://github.com/KasemJaffer/receive_sharing_intent
-      ref: 2cea396843cd3ab1b5ec4334be4233864637874e
+    path: packages/receive_sharing_intent
 
 dev_dependencies:
   flutter_launcher_icons: "^0.14.3"

@@ -1858,13 +1858,20 @@ class _MyHomePageState extends State<MyHomePage>
     try {
       _intentDataStreamSubscription = ReceiveSharingIntent.instance
           .getMediaStream()
-          .listen((items) => _consumeSharedItems(items, autoClose: true));
+          .listen((items) => _consumeSharedItems(items, autoClose: true),
+              onError: (Object error) {
+        _showToast('读取分享文件失败，请重新分享');
+        debugPrint('share read failed: $error');
+      });
       final initialItems =
           await ReceiveSharingIntent.instance.getInitialMedia();
       if (initialItems.isNotEmpty) {
         await _consumeSharedItems(initialItems, autoClose: true);
         await ReceiveSharingIntent.instance.reset();
       }
+    } on PlatformException catch (error) {
+      _showToast('读取分享文件失败，请重新分享');
+      debugPrint('initial share read failed: $error');
     } catch (_) {
       // Unsupported platform/test env.
     }
@@ -1878,37 +1885,38 @@ class _MyHomePageState extends State<MyHomePage>
       return;
     }
 
-    final textParts = <String>[];
-    final filePayloads = <_IncomingAttachmentPayload>[];
-
-    for (final item in files) {
-      if (item.type == SharedMediaType.text && item.path.isNotEmpty) {
-        textParts.add(item.path.trim());
-        continue;
-      }
-
-      final file = File(item.path);
-      if (!await file.exists()) {
-        continue;
-      }
-      final bytes = await file.readAsBytes();
-      final fileName = _basename(item.path);
-      filePayloads.add(
-        _IncomingAttachmentPayload(
-          name: fileName,
-          mimeType: _guessMimeType(fileName),
-          bytes: bytes,
-        ),
-      );
-    }
-
-    if (textParts.isEmpty && filePayloads.isEmpty) {
-      return;
-    }
-
-    final textContent =
-        textParts.where((value) => value.isNotEmpty).join('\n\n');
     try {
+      final textParts = <String>[];
+      final filePayloads = <_IncomingAttachmentPayload>[];
+
+      for (final item in files) {
+        if (item.type == SharedMediaType.text ||
+            item.type == SharedMediaType.url) {
+          textParts.add(item.path.trim());
+          continue;
+        }
+
+        final file = File(item.path);
+        if (!await file.exists()) {
+          throw FileSystemException('Shared file is unavailable', item.path);
+        }
+        final fileName = _basename(item.path);
+        filePayloads.add(
+          _IncomingAttachmentPayload(
+            name: fileName,
+            mimeType: item.mimeType ?? _guessMimeType(fileName),
+            bytes: const [],
+            sourceFile: file,
+          ),
+        );
+      }
+
+      if (textParts.isEmpty && filePayloads.isEmpty) {
+        return;
+      }
+
+      final textContent =
+          textParts.where((value) => value.isNotEmpty).join('\n\n');
       await _createCard(
         text: textContent,
         attachments: filePayloads,
