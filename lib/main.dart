@@ -4628,7 +4628,7 @@ button { cursor: pointer; }
   box-shadow: 0 18px 48px rgba(0,0,0,.28);
 }
 .image-viewer-close, .image-viewer-arrow {
-  position:absolute; border:0; border-radius:999px;
+  position:absolute; z-index: 1; border:0; border-radius:999px;
   width:48px; height:48px;
   display:grid; place-items:center;
   background: rgba(255,255,255,.14);
@@ -5731,7 +5731,7 @@ imageViewerClose.addEventListener('click', closeImageViewer);
 imageViewerPrev.addEventListener('click', () => stepImageViewer(-1));
 imageViewerNext.addEventListener('click', () => stepImageViewer(1));
 imageViewer.addEventListener('click', event => {
-  if (event.target === imageViewer) {
+  if (event.target === imageViewer || event.target.classList.contains('image-viewer-stage')) {
     closeImageViewer();
   }
 });
