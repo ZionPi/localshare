@@ -800,6 +800,8 @@ class _MyHomePageState extends State<MyHomePage>
   final TextEditingController _searchController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final GlobalKey _cardsSectionKey = GlobalKey();
+  final Map<String, GlobalKey> _cardKeys = <String, GlobalKey>{};
+  int _cardScrollRequest = 0;
   final List<WebSocketChannel> _webSocketClients = <WebSocketChannel>[];
   final Random _random = Random();
 
@@ -2529,6 +2531,43 @@ class _MyHomePageState extends State<MyHomePage>
     );
   }
 
+  Future<void> _scrollToCard(String cardId) async {
+    final request = ++_cardScrollRequest;
+    while (mounted &&
+        request == _cardScrollRequest &&
+        _scrollController.hasClients) {
+      final cards = _sortedCards;
+      final targetIndex = cards.indexWhere((card) => card.id == cardId);
+      if (targetIndex < 0) return;
+
+      final targetContext = _cardKeys[cardId]?.currentContext;
+      if (targetContext != null) {
+        await Scrollable.ensureVisible(
+          targetContext,
+          alignment: 0.08,
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOutCubic,
+        );
+        return;
+      }
+
+      // Offscreen cards are built lazily. Move by less than one viewport so
+      // the target cannot be skipped, then align it once it has been built.
+      final firstBuiltIndex = cards.indexWhere(
+        (card) => _cardKeys[card.id]?.currentContext != null,
+      );
+      final forward = firstBuiltIndex < 0 || targetIndex > firstBuiltIndex;
+      final position = _scrollController.position;
+      final step = max(1.0, position.viewportDimension * 0.9);
+      final nextOffset = (position.pixels + (forward ? step : -step))
+          .clamp(position.minScrollExtent, position.maxScrollExtent)
+          .toDouble();
+      if ((nextOffset - position.pixels).abs() < 0.5) return;
+      _scrollController.jumpTo(nextOffset);
+      await WidgetsBinding.instance.endOfFrame;
+    }
+  }
+
   Future<void> _openUri(Uri uri) async {
     final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
     if (!launched) {
@@ -3156,10 +3195,16 @@ class _MyHomePageState extends State<MyHomePage>
     if (!mounted) {
       return;
     }
-    final pageController = PageController(initialPage: initialIndex);
+    _cardScrollRequest++;
+    final transform = TransformationController();
+    final activePointers = <int>{};
     var currentIndex = initialIndex;
-    await showGeneralDialog<void>(
-      context: context,
+    var zoomed = false;
+    var gestureHadPinch = false;
+    var gestureStart = Offset.zero;
+    var gestureEnd = Offset.zero;
+    var doubleTapPosition = Offset.zero;
+    final route = RawDialogRoute<void>(
       barrierLabel: '图片预览',
       barrierDismissible: true,
       barrierColor: Colors.black.withValues(alpha: 0.88),
@@ -3167,44 +3212,138 @@ class _MyHomePageState extends State<MyHomePage>
       pageBuilder: (context, animation, secondaryAnimation) {
         return StatefulBuilder(
           builder: (context, setOverlayState) {
+            void changeImage(int offset) {
+              final nextIndex = currentIndex + offset;
+              if (nextIndex < 0 || nextIndex >= images.length) return;
+              setOverlayState(() {
+                currentIndex = nextIndex;
+                zoomed = false;
+                transform.value = Matrix4.identity();
+              });
+            }
+
+            final attachment = images[currentIndex];
             return SafeArea(
               child: Stack(
                 children: [
                   Positioned.fill(
-                    child: GestureDetector(
-                      onTap: () => Navigator.of(context).pop(),
-                      child: ColoredBox(
-                        color: Colors.black.withValues(alpha: 0.01),
-                        child: PageView.builder(
-                          controller: pageController,
-                          itemCount: images.length,
-                          onPageChanged: (value) {
-                            setOverlayState(() {
-                              currentIndex = value;
-                            });
-                          },
-                          itemBuilder: (context, index) {
-                            final attachment = images[index];
-                            return Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 20,
-                                vertical: 28,
-                              ),
-                              child: Center(
+                    child: ColoredBox(
+                      color: Colors.black.withValues(alpha: 0.01),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 20,
+                          vertical: 64,
+                        ),
+                        child: LayoutBuilder(
+                          builder: (context, constraints) {
+                            return Listener(
+                              onPointerDown: (event) {
+                                if (activePointers.isEmpty)
+                                  gestureHadPinch = false;
+                                activePointers.add(event.pointer);
+                                if (activePointers.length > 1)
+                                  gestureHadPinch = true;
+                              },
+                              onPointerUp: (event) =>
+                                  activePointers.remove(event.pointer),
+                              onPointerCancel: (event) =>
+                                  activePointers.remove(event.pointer),
+                              child: GestureDetector(
+                                onDoubleTapDown: (details) {
+                                  doubleTapPosition = details.localPosition;
+                                },
+                                onDoubleTap: () {
+                                  final magnified =
+                                      transform.value.getMaxScaleOnAxis() >
+                                      1.01;
+                                  if (magnified) {
+                                    transform.value = Matrix4.identity();
+                                  } else {
+                                    const scale = 3.0;
+                                    final x =
+                                        (doubleTapPosition.dx * (1 - scale))
+                                            .clamp(
+                                              constraints.maxWidth *
+                                                  (1 - scale),
+                                              0.0,
+                                            )
+                                            .toDouble();
+                                    final y =
+                                        (doubleTapPosition.dy * (1 - scale))
+                                            .clamp(
+                                              constraints.maxHeight *
+                                                  (1 - scale),
+                                              0.0,
+                                            )
+                                            .toDouble();
+                                    transform.value = Matrix4.identity()
+                                      ..setEntry(0, 0, scale)
+                                      ..setEntry(1, 1, scale)
+                                      ..setEntry(0, 3, x)
+                                      ..setEntry(1, 3, y);
+                                  }
+                                  setOverlayState(() {
+                                    zoomed = !magnified;
+                                  });
+                                },
                                 child: InteractiveViewer(
-                                  minScale: 0.8,
-                                  maxScale: 4,
-                                  child: Hero(
-                                    tag: 'attachment-preview-${attachment.id}',
-                                    child: Image.file(
-                                      File(attachment.localPath),
-                                      fit: BoxFit.contain,
-                                      errorBuilder:
-                                          (context, error, stackTrace) {
-                                        return _buildImagePreviewFallback(
-                                          compact: false,
-                                        );
-                                      },
+                                  key: ValueKey(attachment.id),
+                                  transformationController: transform,
+                                  minScale: 1,
+                                  maxScale: 8,
+                                  panEnabled: zoomed,
+                                  onInteractionStart: (details) {
+                                    gestureStart = details.localFocalPoint;
+                                    gestureEnd = gestureStart;
+                                  },
+                                  onInteractionUpdate: (details) {
+                                    gestureEnd = details.localFocalPoint;
+                                    if (details.pointerCount > 1)
+                                      gestureHadPinch = true;
+                                    final nextZoomed =
+                                        transform.value.getMaxScaleOnAxis() >
+                                        1.01;
+                                    if (zoomed != nextZoomed) {
+                                      setOverlayState(() {
+                                        zoomed = nextZoomed;
+                                      });
+                                    }
+                                  },
+                                  onInteractionEnd: (_) {
+                                    if (!context.mounted) return;
+                                    final nextZoomed =
+                                        transform.value.getMaxScaleOnAxis() >
+                                        1.01;
+                                    if (!nextZoomed)
+                                      transform.value = Matrix4.identity();
+                                    final delta = gestureEnd - gestureStart;
+                                    if (!nextZoomed &&
+                                        !gestureHadPinch &&
+                                        delta.dx.abs() > 40 &&
+                                        delta.dx.abs() > delta.dy.abs() * 1.2) {
+                                      changeImage(delta.dx < 0 ? 1 : -1);
+                                    } else {
+                                      setOverlayState(() {
+                                        zoomed = nextZoomed;
+                                      });
+                                    }
+                                  },
+                                  child: SizedBox(
+                                    width: constraints.maxWidth,
+                                    height: constraints.maxHeight,
+                                    child: Hero(
+                                      tag:
+                                          'attachment-preview-${attachment.id}',
+                                      child: Image.file(
+                                        File(attachment.localPath),
+                                        fit: BoxFit.contain,
+                                        errorBuilder:
+                                            (context, error, stackTrace) {
+                                              return _buildImagePreviewFallback(
+                                                compact: false,
+                                              );
+                                            },
+                                      ),
                                     ),
                                   ),
                                 ),
@@ -3247,12 +3386,7 @@ class _MyHomePageState extends State<MyHomePage>
                           icon: Icons.chevron_left_rounded,
                           onTap: currentIndex == 0
                               ? null
-                              : () {
-                                  pageController.previousPage(
-                                    duration: const Duration(milliseconds: 220),
-                                    curve: Curves.easeOutCubic,
-                                  );
-                                },
+                              : () => changeImage(-1),
                         ),
                       ),
                     ),
@@ -3265,12 +3399,7 @@ class _MyHomePageState extends State<MyHomePage>
                           icon: Icons.chevron_right_rounded,
                           onTap: currentIndex == images.length - 1
                               ? null
-                              : () {
-                                  pageController.nextPage(
-                                    duration: const Duration(milliseconds: 220),
-                                    curve: Curves.easeOutCubic,
-                                  );
-                                },
+                              : () => changeImage(1),
                         ),
                       ),
                     ),
@@ -3289,7 +3418,7 @@ class _MyHomePageState extends State<MyHomePage>
                             borderRadius: BorderRadius.circular(999),
                           ),
                           child: const Text(
-                            '左右滑动查看同卡图片',
+                            '双指缩放 · 双击放大或还原 · 还原后左右滑动切图',
                             style: TextStyle(
                               color: Colors.white,
                               fontSize: 12,
@@ -3340,7 +3469,13 @@ class _MyHomePageState extends State<MyHomePage>
         );
       },
     );
-    pageController.dispose();
+    try {
+      await Navigator.of(context, rootNavigator: true).push(route);
+      await _scrollToCard(images[currentIndex].cardId);
+      await route.completed;
+    } finally {
+      transform.dispose();
+    }
   }
 
   Future<void> _createCardFromComposer() async {
@@ -4406,16 +4541,20 @@ class _MyHomePageState extends State<MyHomePage>
     return '${attachment.name} · ${_formatBytes(attachment.size)}';
   }
 
-  Widget _buildImageAttachmentPreview(
-    CardAttachment attachment, {
-    required List<CardAttachment> imageAttachments,
-    required int initialIndex,
-  }) {
+  Widget _buildImageAttachmentPreview(CardAttachment attachment) {
     return GestureDetector(
-      onTap: () => _showImagePreview(
-        imageAttachments,
-        initialIndex: initialIndex,
-      ),
+      onTap: () {
+        final images = _sortedCards
+            .expand((card) => card.attachmentIds)
+            .map((id) => _attachments[id])
+            .whereType<CardAttachment>()
+            .where((file) => file.kind == AttachmentKind.image)
+            .toList();
+        _showImagePreview(
+          images,
+          initialIndex: images.indexWhere((file) => file.id == attachment.id),
+        );
+      },
       child: Hero(
         tag: 'attachment-preview-${attachment.id}',
         child: ClipRRect(
@@ -4570,7 +4709,7 @@ button { cursor: pointer; }
 .search-clear { width:34px; height:34px; border:0; border-radius:999px; background:#f3f6fb; color:#6e7788; display:grid; place-items:center; cursor:pointer; }
 .search-clear:hover { background:#eaf1ff; color:var(--primary); }
 .cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-.card { padding: 18px; min-height: 176px; max-height: 460px; display:flex; flex-direction:column; overflow:hidden; }
+.card { padding: 18px; min-height: 176px; max-height: 460px; display:flex; flex-direction:column; overflow:hidden; scroll-margin-top:88px; }
 .card.collapsed { height: 210px; }
 .card-body { min-height:0; overflow:auto; }
 .card.collapsed .card-body { display:block; overflow:hidden; }
@@ -4618,15 +4757,31 @@ button { cursor: pointer; }
 .image-viewer-stage {
   position:absolute; inset: 0;
   display:flex; align-items:center; justify-content:center;
-  padding: 72px 22px 92px;
+  padding: 72px 22px 116px;
+  overflow:hidden; touch-action:none; user-select:none; -webkit-user-select:none;
 }
+.image-viewer-stage.zoomed { cursor:grab; }
+.image-viewer-stage.dragging { cursor:grabbing; }
 .image-viewer-image {
   max-width: min(92vw, 1100px);
-  max-height: calc(100vh - 164px);
+  max-height: calc(100dvh - 188px);
+  flex-shrink:0; transform-origin:center; cursor:zoom-in;
+  user-select:none; -webkit-user-drag:none;
   border-radius: 18px;
   object-fit: contain;
   box-shadow: 0 18px 48px rgba(0,0,0,.28);
 }
+.image-viewer-stage.zoomed .image-viewer-image { cursor:inherit; }
+.image-viewer-zoom {
+  position:absolute; z-index:1; left:50%; bottom:18px; transform:translateX(-50%);
+  display:flex; align-items:center; gap:8px; padding:6px; border-radius:999px;
+  background:rgba(12,16,22,.85);
+}
+.image-viewer-zoom button {
+  border:0; border-radius:999px; height:44px; min-width:44px;
+  padding:0 12px; background:rgba(255,255,255,.14); color:white; font:inherit;
+}
+.image-viewer-zoom button[disabled] { opacity:.36; }
 .image-viewer-close, .image-viewer-arrow {
   position:absolute; z-index: 1; border:0; border-radius:999px;
   width:48px; height:48px;
@@ -4640,16 +4795,18 @@ button { cursor: pointer; }
 .image-viewer-arrow.next { right: 16px; }
 .image-viewer-arrow[disabled] { opacity:.36; }
 .image-viewer-meta {
-  position:absolute; left: 16px; top: 16px;
-  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  position:absolute; z-index:1; left:16px; top:16px; max-width:calc(100% - 96px);
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap; pointer-events:none;
 }
+.image-viewer-meta .image-viewer-pill { overflow-wrap:anywhere; }
 .image-viewer-pill {
   padding: 8px 12px; border-radius: 999px;
   background: rgba(255,255,255,.14); color: white;
   font-size: 13px; font-weight: 700;
 }
 .image-viewer-caption {
-  position:absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
+  position:absolute; z-index:1; left:50%; bottom:84px; transform:translateX(-50%);
+  max-width:calc(100% - 32px); text-align:center; pointer-events:none;
   padding: 10px 14px; border-radius: 999px;
   background: rgba(255,255,255,.12); color: white;
   font-size: 12px; font-weight: 700;
@@ -4714,7 +4871,8 @@ textarea.file-drag-over { outline: 2px dashed var(--primary); outline-offset: -4
   .grid { grid-template-columns: 1fr; }
   .cards { grid-template-columns: 1fr; }
   .address-hint { align-items:flex-start; flex-direction:column; }
-  .image-viewer-stage { padding: 82px 14px 96px; }
+  .image-viewer-stage { padding: 82px 14px 124px; }
+  .image-viewer-image { max-height:calc(100dvh - 206px); }
   .image-viewer-close, .image-viewer-arrow { width: 44px; height: 44px; }
 }
 body.whiteboard-mode > .header, body.whiteboard-mode > main.shell { display:none; }
@@ -4837,13 +4995,18 @@ body.whiteboard-mode > .header, body.whiteboard-mode > main.shell { display:none
   <button id="imageViewerPrev" class="image-viewer-arrow prev" type="button" aria-label="上一张">
     <span class="material-symbols-outlined">chevron_left</span>
   </button>
-  <div class="image-viewer-stage">
-    <img id="imageViewerImg" class="image-viewer-image" alt="">
+  <div id="imageViewerStage" class="image-viewer-stage">
+    <img id="imageViewerImg" class="image-viewer-image" alt="" draggable="false">
   </div>
   <button id="imageViewerNext" class="image-viewer-arrow next" type="button" aria-label="下一张">
     <span class="material-symbols-outlined">chevron_right</span>
   </button>
-  <div id="imageViewerHint" class="image-viewer-caption">左右滑动查看同卡图片</div>
+  <div id="imageViewerHint" class="image-viewer-caption">滚轮或双指缩放 · 双击放大/还原</div>
+  <div class="image-viewer-zoom" role="group" aria-label="图片缩放">
+    <button id="imageViewerZoomOut" type="button" aria-label="缩小">−</button>
+    <button id="imageViewerZoomReset" type="button" aria-label="还原图片大小" title="还原图片大小">100%</button>
+    <button id="imageViewerZoomIn" type="button" aria-label="放大">+</button>
+  </div>
 </div>
 <script>
 const wsUrl = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host + '/ws';
@@ -4871,6 +5034,10 @@ const discoveryHintText = document.getElementById('discoveryHintText');
 const toast = document.getElementById('toast');
 const imageViewer = document.getElementById('imageViewer');
 const imageViewerImg = document.getElementById('imageViewerImg');
+const imageViewerStage = document.getElementById('imageViewerStage');
+const imageViewerZoomIn = document.getElementById('imageViewerZoomIn');
+const imageViewerZoomOut = document.getElementById('imageViewerZoomOut');
+const imageViewerZoomReset = document.getElementById('imageViewerZoomReset');
 const imageViewerClose = document.getElementById('imageViewerClose');
 const imageViewerPrev = document.getElementById('imageViewerPrev');
 const imageViewerNext = document.getElementById('imageViewerNext');
@@ -4887,7 +5054,14 @@ const clientId = 'web-' + Math.random().toString(36).slice(2, 8);
 let socket;
 let viewerImages = [];
 let viewerIndex = 0;
-let viewerTouchStartX = null;
+let viewerScale = 1;
+let viewerPanX = 0;
+let viewerPanY = 0;
+const viewerPointers = new Map();
+let viewerGestureStart = null;
+let viewerGestureMoved = false;
+let viewerHadPinch = false;
+let viewerLastTap = null;
 let selectedCardIds = new Set();
 let expandedCardIds = new Set();
 let currentFilteredIds = [];
@@ -5225,7 +5399,7 @@ function renderCards() {
       '</div>';
     }).join('');
 
-    return '<article class="panel card ' + (collapsed ? 'collapsed' : '') + '">' +
+    return '<article class="panel card ' + (collapsed ? 'collapsed' : '') + '" data-card-id="' + escapeHtml(card.id) + '">' +
       '<div class="card-top">' +
         '<div class="card-meta">' + renderCardTags(card) + '</div>' +
         '<button class="card-copy-button" data-action="copy-card" data-card-id="' + escapeHtml(card.id) + '" title="复制"><span class="material-symbols-outlined">content_copy</span></button>' +
@@ -5253,24 +5427,35 @@ function updateSelectedCount() {
 function openImageViewer(cardId, imageIndex) {
   const card = cards.find(item => item.id === cardId);
   if (!card) return;
-  viewerImages = (card.attachments || []).filter(file => file.kind === 'image');
-  if (!viewerImages.length) return;
-  viewerIndex = Math.max(0, Math.min(imageIndex, viewerImages.length - 1));
-  renderImageViewer();
+  const selectedImage = (card.attachments || []).filter(file => file.kind === 'image')[imageIndex];
+  if (!selectedImage) return;
+  const visibleIds = new Set(currentFilteredIds);
+  viewerImages = cards
+    .filter(item => visibleIds.has(item.id))
+    .flatMap(item => (item.attachments || [])
+      .filter(file => file.kind === 'image')
+      .map(file => ({...file, cardId: item.id})));
+  viewerIndex = viewerImages.findIndex(file => file.cardId === cardId && file.id === selectedImage.id);
+  if (viewerIndex < 0) return;
   imageViewer.classList.add('show');
   imageViewer.setAttribute('aria-hidden', 'false');
   document.body.style.overflow = 'hidden';
+  renderImageViewer();
 }
 
 function closeImageViewer() {
+  const cardId = viewerImages[viewerIndex]?.cardId;
   imageViewer.classList.remove('show');
   imageViewer.setAttribute('aria-hidden', 'true');
   document.body.style.overflow = '';
-  viewerTouchStartX = null;
+  resetViewerZoom();
+  requestAnimationFrame(() => {
+    const card = Array.from(cardsRoot.children).find(node => node.dataset.cardId === cardId);
+    card?.scrollIntoView({behavior: 'smooth', block: 'start'});
+  });
 }
 
 function stepImageViewer(offset) {
-  if (!viewerImages.length) return;
   const nextIndex = viewerIndex + offset;
   if (nextIndex < 0 || nextIndex >= viewerImages.length) return;
   viewerIndex = nextIndex;
@@ -5286,7 +5471,53 @@ function renderImageViewer() {
   imageViewerName.textContent = file.name || '图片';
   imageViewerPrev.disabled = viewerIndex === 0;
   imageViewerNext.disabled = viewerIndex === viewerImages.length - 1;
-  imageViewerHint.style.display = viewerImages.length > 1 ? 'block' : 'none';
+  imageViewerHint.textContent = '滚轮或双指缩放 · 双击放大/还原' +
+    (viewerImages.length > 1 ? ' · 还原后左右滑动切图' : '');
+  resetViewerZoom();
+}
+
+function renderViewerTransform() {
+  const style = getComputedStyle(imageViewerStage);
+  const width = imageViewerStage.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  const height = imageViewerStage.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+  const limitX = Math.max(0, (imageViewerImg.offsetWidth * viewerScale - width) / 2);
+  const limitY = Math.max(0, (imageViewerImg.offsetHeight * viewerScale - height) / 2);
+  viewerPanX = Math.max(-limitX, Math.min(limitX, viewerPanX));
+  viewerPanY = Math.max(-limitY, Math.min(limitY, viewerPanY));
+  imageViewerImg.style.transform = 'translate(' + viewerPanX + 'px,' + viewerPanY + 'px) scale(' + viewerScale + ')';
+  imageViewerStage.classList.toggle('zoomed', viewerScale > 1);
+  imageViewerZoomReset.textContent = Math.round(viewerScale * 100) + '%';
+  imageViewerZoomOut.disabled = viewerScale <= 1;
+  imageViewerZoomIn.disabled = viewerScale >= 8;
+}
+
+function zoomViewer(scale, clientX, clientY, movementX = 0, movementY = 0) {
+  const nextScale = Math.max(1, Math.min(8, scale));
+  const rect = imageViewerImg.getBoundingClientRect();
+  const centerX = rect.left + rect.width / 2 - viewerPanX;
+  const centerY = rect.top + rect.height / 2 - viewerPanY;
+  const anchorX = (clientX ?? centerX) - centerX;
+  const anchorY = (clientY ?? centerY) - centerY;
+  const ratio = nextScale / viewerScale;
+  viewerPanX = anchorX - (anchorX - viewerPanX) * ratio + movementX;
+  viewerPanY = anchorY - (anchorY - viewerPanY) * ratio + movementY;
+  viewerScale = nextScale;
+  if (viewerScale === 1) { viewerPanX = 0; viewerPanY = 0; }
+  renderViewerTransform();
+}
+
+function resetViewerZoom() {
+  viewerScale = 1;
+  viewerPanX = 0;
+  viewerPanY = 0;
+  for (const id of viewerPointers.keys()) {
+    if (imageViewerStage.hasPointerCapture(id)) imageViewerStage.releasePointerCapture(id);
+  }
+  viewerPointers.clear();
+  viewerGestureStart = null;
+  viewerLastTap = null;
+  imageViewerStage.classList.remove('dragging');
+  renderViewerTransform();
 }
 
 async function refreshCards() {
@@ -5730,22 +5961,90 @@ document.getElementById('expandAllBtn').addEventListener('click', () => { curren
 imageViewerClose.addEventListener('click', closeImageViewer);
 imageViewerPrev.addEventListener('click', () => stepImageViewer(-1));
 imageViewerNext.addEventListener('click', () => stepImageViewer(1));
-imageViewer.addEventListener('click', event => {
-  if (event.target === imageViewer || event.target.classList.contains('image-viewer-stage')) {
-    closeImageViewer();
+imageViewerZoomIn.addEventListener('click', () => zoomViewer(viewerScale * 1.5));
+imageViewerZoomOut.addEventListener('click', () => zoomViewer(viewerScale / 1.5));
+imageViewerZoomReset.addEventListener('click', resetViewerZoom);
+imageViewerImg.addEventListener('load', renderViewerTransform);
+window.addEventListener('resize', () => {
+  if (imageViewer.classList.contains('show')) renderViewerTransform();
+});
+imageViewerStage.addEventListener('wheel', event => {
+  event.preventDefault();
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? imageViewerStage.clientHeight : 1;
+  zoomViewer(viewerScale * Math.exp(-event.deltaY * unit * 0.002), event.clientX, event.clientY);
+}, {passive: false});
+imageViewerStage.addEventListener('dblclick', event => event.preventDefault());
+imageViewerStage.addEventListener('pointerdown', event => {
+  if (event.pointerType === 'mouse' && event.button !== 0) return;
+  if (!viewerPointers.size) {
+    viewerGestureStart = {x: event.clientX, y: event.clientY, backdrop: event.target === imageViewerStage};
+    viewerGestureMoved = false;
+    viewerHadPinch = false;
+  }
+  viewerPointers.set(event.pointerId, {x: event.clientX, y: event.clientY});
+  imageViewerStage.setPointerCapture(event.pointerId);
+  if (viewerPointers.size > 1) { viewerHadPinch = true; viewerLastTap = null; }
+  imageViewerStage.classList.toggle('dragging', viewerScale > 1);
+});
+imageViewerStage.addEventListener('pointermove', event => {
+  const previous = viewerPointers.get(event.pointerId);
+  if (!previous) return;
+  const before = Array.from(viewerPointers.values());
+  viewerPointers.set(event.pointerId, {x: event.clientX, y: event.clientY});
+  if (viewerGestureStart && Math.hypot(event.clientX - viewerGestureStart.x, event.clientY - viewerGestureStart.y) > 5) {
+    viewerGestureMoved = true;
+  }
+  if (viewerPointers.size === 2) {
+    const after = Array.from(viewerPointers.values());
+    const distance = points => Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
+    const oldDistance = distance(before);
+    if (oldDistance < 1) return;
+    const oldX = (before[0].x + before[1].x) / 2;
+    const oldY = (before[0].y + before[1].y) / 2;
+    const nextX = (after[0].x + after[1].x) / 2;
+    const nextY = (after[0].y + after[1].y) / 2;
+    zoomViewer(viewerScale * distance(after) / oldDistance, oldX, oldY, nextX - oldX, nextY - oldY);
+  } else if (viewerPointers.size === 1 && viewerScale > 1) {
+    viewerPanX += event.clientX - previous.x;
+    viewerPanY += event.clientY - previous.y;
+    renderViewerTransform();
   }
 });
-imageViewer.addEventListener('touchstart', event => {
-  viewerTouchStartX = event.changedTouches[0]?.clientX ?? null;
-}, {passive: true});
-imageViewer.addEventListener('touchend', event => {
-  if (viewerTouchStartX == null) return;
-  const touchEndX = event.changedTouches[0]?.clientX ?? viewerTouchStartX;
-  const deltaX = touchEndX - viewerTouchStartX;
-  viewerTouchStartX = null;
-  if (Math.abs(deltaX) < 40) return;
-  stepImageViewer(deltaX < 0 ? 1 : -1);
-}, {passive: true});
+function finishViewerPointer(event) {
+  if (!viewerPointers.has(event.pointerId)) return;
+  viewerPointers.delete(event.pointerId);
+  if (imageViewerStage.hasPointerCapture(event.pointerId)) imageViewerStage.releasePointerCapture(event.pointerId);
+  if (viewerPointers.size) return;
+  imageViewerStage.classList.remove('dragging');
+  const start = viewerGestureStart;
+  viewerGestureStart = null;
+  if (!start || event.type !== 'pointerup' || viewerHadPinch) return;
+  const deltaX = event.clientX - start.x;
+  const deltaY = event.clientY - start.y;
+  if (viewerScale === 1 && Math.abs(deltaX) > 40 && Math.abs(deltaX) > Math.abs(deltaY) * 1.2) {
+    stepImageViewer(deltaX < 0 ? 1 : -1);
+  } else if (!viewerGestureMoved) {
+    if (start.backdrop) { closeImageViewer(); return; }
+    const now = Date.now();
+    if (viewerLastTap && now - viewerLastTap.time < 300 &&
+        Math.hypot(event.clientX - viewerLastTap.x, event.clientY - viewerLastTap.y) < 30) {
+      zoomViewer(viewerScale > 1 ? 1 : 3, event.clientX, event.clientY);
+      viewerLastTap = null;
+    } else {
+      viewerLastTap = {time: now, x: event.clientX, y: event.clientY};
+    }
+  }
+}
+imageViewerStage.addEventListener('pointerup', finishViewerPointer);
+imageViewerStage.addEventListener('pointercancel', finishViewerPointer);
+imageViewerStage.addEventListener('lostpointercapture', event => {
+  if (viewerPointers.has(event.pointerId)) {
+    viewerPointers.clear();
+    viewerGestureStart = null;
+    viewerLastTap = null;
+    imageViewerStage.classList.remove('dragging');
+  }
+});
 document.addEventListener('keydown', event => {
   if (!imageViewer.classList.contains('show')) return;
   if (event.key === 'Escape') {
@@ -5754,6 +6053,15 @@ document.addEventListener('keydown', event => {
     stepImageViewer(-1);
   } else if (event.key === 'ArrowRight') {
     stepImageViewer(1);
+  } else if (event.key === '+' || event.key === '=') {
+    event.preventDefault();
+    zoomViewer(viewerScale * 1.5);
+  } else if (event.key === '-') {
+    event.preventDefault();
+    zoomViewer(viewerScale / 1.5);
+  } else if (event.key === '0') {
+    event.preventDefault();
+    resetViewerZoom();
   }
 });
 renderPickedFiles();
@@ -5771,6 +6079,8 @@ connectWs();
   @override
   Widget build(BuildContext context) {
     final cards = _sortedCards;
+    final visibleCardIds = cards.map((card) => card.id).toSet();
+    _cardKeys.removeWhere((id, _) => !visibleCardIds.contains(id));
     return Scaffold(
       appBar: AppBar(
         toolbarHeight: 60,
@@ -5881,8 +6191,13 @@ connectWs();
                                 )
                               : SliverList.separated(
                                   itemCount: cards.length,
-                                  itemBuilder: (context, index) =>
-                                      _buildCardTile(cards[index], index + 1),
+                                  itemBuilder: (context, index) => KeyedSubtree(
+                                    key: _cardKeys.putIfAbsent(
+                                      cards[index].id,
+                                      () => GlobalKey(),
+                                    ),
+                                    child: _buildCardTile(cards[index], index + 1),
+                                  ),
                                   separatorBuilder: (context, index) =>
                                       const SizedBox(height: 14),
                                 ),
@@ -6343,9 +6658,6 @@ connectWs();
         .map((id) => _attachments[id])
         .whereType<CardAttachment>()
         .toList();
-    final imageAttachments = cardAttachments
-        .where((attachment) => attachment.kind == AttachmentKind.image)
-        .toList();
     final hasText = card.text.trim().isNotEmpty;
     final metaLabels = <String>[
       if (card.source == 'shared') '分享导入',
@@ -6481,13 +6793,7 @@ connectWs();
                               children: [
                                 if (attachment.kind ==
                                     AttachmentKind.image) ...[
-                                  _buildImageAttachmentPreview(
-                                    attachment,
-                                    imageAttachments: imageAttachments,
-                                    initialIndex: imageAttachments.indexWhere(
-                                      (item) => item.id == attachment.id,
-                                    ),
-                                  ),
+                                  _buildImageAttachmentPreview(attachment),
                                   const SizedBox(height: 12),
                                 ],
                                 Row(
