@@ -787,6 +787,8 @@ class _MyHomePageState extends State<MyHomePage>
   static const String _useFixedPortKey = 'use_fixed_server_port';
   static const String _confirmDeleteKey = 'confirm_delete_before_remove';
   static const String _clipboardToTempChatKey = 'clipboard_to_temp_chat';
+  static const String _clipboardToCardsKey = 'clipboard_to_cards';
+  static const String _lastClipboardCardKey = 'last_clipboard_card_fingerprint';
   static const String _clipboardToTempChatAutoEnabledKey =
       'clipboard_to_temp_chat_auto_enabled_v1';
   static const String _wechatArticleApiBaseUrl = String.fromEnvironment(
@@ -845,6 +847,11 @@ class _MyHomePageState extends State<MyHomePage>
   bool _autoStartWhenWifiAvailable = true;
   bool _isAutoStartingServer = false;
   bool _clipboardToTempChatEnabled = false;
+  bool _clipboardToCardsEnabled = false;
+  bool _clipboardReady = false;
+  bool _isPollingClipboard = false;
+  bool _clipboardPollRequested = false;
+  String? _lastClipboardCardFingerprint;
   bool _isTempChatMode = false;
   bool _isWhiteboardMode = false;
   bool _hasUnreadTempChat = false;
@@ -862,6 +869,11 @@ class _MyHomePageState extends State<MyHomePage>
       duration: const Duration(milliseconds: 2200),
     )..repeat();
     WidgetsBinding.instance.addObserver(this);
+    _clipboardChannel.setMethodCallHandler((call) async {
+      if (call.method == 'clipboardChanged') {
+        await _pollClipboard();
+      }
+    });
     _initializeApp();
   }
 
@@ -897,7 +909,7 @@ class _MyHomePageState extends State<MyHomePage>
       await _initializeBackgroundExecution();
       await _startServer();
       _startStateRefreshLoop();
-      _syncClipboardMonitor();
+      _clipboardReady = true;
     } catch (error) {
       _showToast('初始化失败: $error');
     } finally {
@@ -905,6 +917,7 @@ class _MyHomePageState extends State<MyHomePage>
         setState(() {
           _isLoading = false;
         });
+        _syncClipboardMonitor();
       }
     }
   }
@@ -939,6 +952,8 @@ class _MyHomePageState extends State<MyHomePage>
     }
     _clipboardToTempChatEnabled =
         prefs.getBool(_clipboardToTempChatKey) ?? true;
+    _clipboardToCardsEnabled = prefs.getBool(_clipboardToCardsKey) ?? false;
+    _lastClipboardCardFingerprint = prefs.getString(_lastClipboardCardKey);
     final savedPort = prefs.getInt(_preferredPortKey);
     if (savedPort != null && savedPort >= 1 && savedPort <= 65535) {
       _preferredPort = savedPort;
@@ -950,16 +965,19 @@ class _MyHomePageState extends State<MyHomePage>
     required int port,
     required bool confirmDelete,
     required bool clipboardToTempChat,
+    required bool clipboardToCards,
   }) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_useFixedPortKey, useFixedPort);
     await prefs.setInt(_preferredPortKey, port);
     await prefs.setBool(_confirmDeleteKey, confirmDelete);
     await prefs.setBool(_clipboardToTempChatKey, clipboardToTempChat);
+    await prefs.setBool(_clipboardToCardsKey, clipboardToCards);
     _useFixedPort = useFixedPort;
     _preferredPort = port;
     _confirmDelete = confirmDelete;
     _clipboardToTempChatEnabled = clipboardToTempChat;
+    _clipboardToCardsEnabled = clipboardToCards;
     _syncClipboardMonitor();
   }
 
@@ -975,6 +993,7 @@ class _MyHomePageState extends State<MyHomePage>
     _broadcastDebounceTimer?.cancel();
     _stateRefreshTimer?.cancel();
     _clipboardMonitorTimer?.cancel();
+    _clipboardChannel.setMethodCallHandler(null);
     _intentDataStreamSubscription?.cancel();
     super.dispose();
   }
@@ -983,6 +1002,7 @@ class _MyHomePageState extends State<MyHomePage>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       unawaited(_refreshStateFromStorageIfChanged(force: true));
+      unawaited(_pollClipboard());
     }
     if (_isServerRunning &&
         (state == AppLifecycleState.resumed ||
@@ -1303,48 +1323,193 @@ class _MyHomePageState extends State<MyHomePage>
     );
   }
 
+  bool get _clipboardMonitorEnabled =>
+      mounted &&
+      _clipboardReady &&
+      Platform.isAndroid &&
+      (_clipboardToCardsEnabled ||
+          (_clipboardToTempChatEnabled && _isServerRunning));
+
   void _syncClipboardMonitor() {
     _clipboardMonitorTimer?.cancel();
     _clipboardMonitorTimer = null;
-    if (!Platform.isAndroid ||
-        !_clipboardToTempChatEnabled ||
-        !_isServerRunning) {
-      return;
-    }
+    if (!_clipboardMonitorEnabled) return;
     _clipboardMonitorTimer = Timer.periodic(
       const Duration(seconds: 2),
-      (_) => unawaited(_pollClipboardToTempChat()),
+      (_) => unawaited(_pollClipboard()),
     );
-    unawaited(_pollClipboardToTempChat());
+    unawaited(_pollClipboard());
   }
 
-  Future<void> _pollClipboardToTempChat() async {
-    if (!Platform.isAndroid ||
-        !_clipboardToTempChatEnabled ||
-        !_isServerRunning ||
-        _storage == null) {
+  Future<void> _pollClipboard() async {
+    if (!_clipboardMonitorEnabled ||
+        _storage == null ||
+        _isLoading ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
       return;
     }
+    if (_isPollingClipboard) {
+      _clipboardPollRequested = true;
+      return;
+    }
+    _isPollingClipboard = true;
     try {
-      final payload = await _clipboardChannel
-          .invokeMapMethod<String, dynamic>('readClipboardPayload');
-      if (payload == null || payload['type'] != 'text') {
-        return;
-      }
-      final text = (payload['text'] as String? ?? '').trim();
-      final timestamp = payload['timestamp']?.toString() ?? '';
-      final hasNativeTimestamp = timestamp.isNotEmpty && timestamp != '0';
-      final fingerprint =
-          hasNativeTimestamp ? 'text:$timestamp:$text' : 'text:$text';
-      if (!_shouldCaptureClipboardText(text, fingerprint, hasNativeTimestamp)) {
-        return;
-      }
-      _lastCapturedClipboardFingerprint = fingerprint;
-      await _createTempChatMessage(text: text, sender: '手机剪贴板');
-
-      _fetchSupportedLinkTextFromText(text);
+      do {
+        _clipboardPollRequested = false;
+        await _consumeClipboard();
+      } while (_clipboardPollRequested &&
+          _clipboardMonitorEnabled &&
+          WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed);
     } catch (error) {
       debugPrint('clipboard monitor failed: $error');
+    } finally {
+      _isPollingClipboard = false;
+    }
+  }
+
+  Future<void> _consumeClipboard() async {
+    final payload = await _clipboardChannel
+        .invokeMapMethod<String, dynamic>('readClipboardPayload', {
+          'includeImages': _clipboardToCardsEnabled,
+          'includeFiles': _clipboardToCardsEnabled,
+        });
+    if (payload == null || !_clipboardMonitorEnabled) return;
+    if (_clipboardToCardsEnabled) {
+      try {
+        await _createCardFromClipboard(payload);
+      } catch (error) {
+        debugPrint('clipboard card save failed: $error');
+      }
+    }
+    if (!_clipboardToTempChatEnabled ||
+        !_isServerRunning ||
+        payload['type'] != 'text')
+      return;
+    final text = (payload['text'] as String? ?? '').trim();
+    final timestamp = payload['timestamp']?.toString() ?? '';
+    final hasNativeTimestamp = timestamp.isNotEmpty && timestamp != '0';
+    final fingerprint = hasNativeTimestamp
+        ? 'text:$timestamp:$text'
+        : 'text:$text';
+    if (!_shouldCaptureClipboardText(text, fingerprint, hasNativeTimestamp))
+      return;
+    _lastCapturedClipboardFingerprint = fingerprint;
+    await _createTempChatMessage(text: text, sender: '手机剪贴板');
+    _fetchSupportedLinkTextFromText(text);
+  }
+
+  Future<void> _createCardFromClipboard(Map<String, dynamic> payload) async {
+    final timestamp = payload['timestamp']?.toString() ?? '';
+    late final String fingerprint;
+    if (payload['type'] == 'text') {
+      final text = (payload['text'] as String? ?? '').trim();
+      if (text.isEmpty || text == _lastLocalShareCopiedText) return;
+      fingerprint = 'text:$timestamp:${payload['fingerprint'] ?? text}';
+      if (fingerprint == _lastClipboardCardFingerprint) return;
+      if (!_cards.any((card) => card.text.trim() == text)) {
+        await _createCard(text: text, source: 'clipboard');
+      }
+    } else if (payload['type'] == 'files') {
+      final files = (payload['files'] as List?)?.cast<Map<dynamic, dynamic>>();
+      if (files == null || files.isEmpty) return;
+      fingerprint = 'files:$timestamp:${payload['fingerprint']}';
+      if (fingerprint == _lastClipboardCardFingerprint) return;
+      final cachedFiles = <File>[];
+      final attachments = <_IncomingAttachmentPayload>[];
+      try {
+        for (final item in files) {
+          final path = await _clipboardChannel.invokeMethod<String>(
+            'cacheClipboardFile',
+            {'uri': item['uri'], 'name': item['name']},
+          );
+          if (path == null) throw StateError('Could not read clipboard file');
+          final source = File(path);
+          cachedFiles.add(source);
+          if (!mounted || !_clipboardToCardsEnabled) return;
+          if (await _clipboardFileAlreadySaved(source)) continue;
+          var repeatedInBatch = false;
+          for (final attachment in attachments) {
+            if (await _clipboardFilesEqual(source, attachment.sourceFile!)) {
+              repeatedInBatch = true;
+              break;
+            }
+          }
+          if (repeatedInBatch) continue;
+          final name = item['name'] as String? ?? _basename(path);
+          final mimeType = item['mimeType'] as String?;
+          attachments.add(
+            _IncomingAttachmentPayload(
+              name: name,
+              mimeType:
+                  mimeType == null || mimeType.isEmpty || mimeType.contains('*')
+                  ? _guessMimeType(name)
+                  : mimeType,
+              bytes: const [],
+              sourceFile: source,
+              moveSourceFile: true,
+            ),
+          );
+        }
+        if (!mounted || !_clipboardToCardsEnabled) return;
+        if (attachments.isNotEmpty) {
+          await _createCard(
+            text: '',
+            attachments: attachments,
+            source: 'clipboard',
+          );
+        }
+      } finally {
+        for (final source in cachedFiles) {
+          try {
+            if (await source.exists()) await source.delete();
+            await source.parent.delete();
+          } catch (error) {
+            debugPrint('clipboard cache cleanup failed: $error');
+          }
+        }
+      }
+    } else {
+      return;
+    }
+    // Mark completed copy events only after saving succeeds. Persist this so
+    // restarting after deleting a card does not recreate it from the old clip.
+    final prefs = await SharedPreferences.getInstance();
+    if (!await prefs.setString(_lastClipboardCardKey, fingerprint)) {
+      throw StateError('Could not record the clipboard capture');
+    }
+    _lastClipboardCardFingerprint = fingerprint;
+  }
+
+  Future<bool> _clipboardFileAlreadySaved(File source) async {
+    final size = await source.length();
+    final cardIds = _cards.map((card) => card.id).toSet();
+    for (final attachment in _attachments.values.toList()) {
+      if (!cardIds.contains(attachment.cardId) || attachment.size != size)
+        continue;
+      final existing = File(attachment.localPath);
+      if (await existing.exists() &&
+          await _clipboardFilesEqual(source, existing))
+        return true;
+    }
+    return false;
+  }
+
+  Future<bool> _clipboardFilesEqual(File first, File second) async {
+    if (await first.length() != await second.length()) return false;
+    final left = await first.open();
+    try {
+      final right = await second.open();
+      try {
+        while (true) {
+          final bytes = await left.read(256 * 1024);
+          if (bytes.isEmpty) return (await right.read(1)).isEmpty;
+          if (!listEquals(bytes, await right.read(bytes.length))) return false;
+        }
+      } finally {
+        await right.close();
+      }
+    } finally {
+      await left.close();
     }
   }
 
@@ -2486,14 +2651,14 @@ class _MyHomePageState extends State<MyHomePage>
   }
 
   Future<void> _copyCardText(String text) async {
-    await Clipboard.setData(ClipboardData(text: text));
     _lastLocalShareCopiedText = text.trim();
+    await Clipboard.setData(ClipboardData(text: text));
     _showToast(text.trim().isEmpty ? '空卡片已复制' : '卡片内容已复制');
   }
 
   Future<void> _copyTempChatText(String text) async {
-    await Clipboard.setData(ClipboardData(text: text));
     _lastLocalShareCopiedText = text.trim();
+    await Clipboard.setData(ClipboardData(text: text));
     _showToast(text.trim().isEmpty ? '空消息已复制' : '临时消息已复制');
   }
 
@@ -2895,6 +3060,7 @@ class _MyHomePageState extends State<MyHomePage>
           initialPort: _preferredPort,
           initialConfirmDelete: _confirmDelete,
           initialClipboardToTempChat: _clipboardToTempChatEnabled,
+          initialClipboardToCards: _clipboardToCardsEnabled,
           apiAddress: () => _isServerRunning ? _ipServerAddress : null,
           onImportTap: _importAllCards,
           onExportTap: _exportAllCards,
@@ -2935,32 +3101,34 @@ class _MyHomePageState extends State<MyHomePage>
             nextSettings.useFixedPort == _useFixedPort &&
             nextSettings.confirmDelete == _confirmDelete &&
             nextSettings.clipboardToTempChat == _clipboardToTempChatEnabled &&
+            nextSettings.clipboardToCards == _clipboardToCardsEnabled &&
             !nextSettings.clearAllCards)) {
       return;
     }
+    final serverSettingsChanged = nextSettings.useFixedPort != _useFixedPort ||
+        nextSettings.port != _preferredPort;
     await _savePortSettings(
       useFixedPort: nextSettings.useFixedPort,
       port: nextSettings.port,
       confirmDelete: nextSettings.confirmDelete,
       clipboardToTempChat: nextSettings.clipboardToTempChat,
+      clipboardToCards: nextSettings.clipboardToCards,
     );
     if (nextSettings.clearAllCards) {
       await _clearAllCards();
     }
     _showToast(
-      nextSettings.clearAllCards
+      !serverSettingsChanged || nextSettings.clearAllCards
           ? '设置已更新'
           : nextSettings.useFixedPort
               ? '固定端口已更新为 ${nextSettings.port}'
               : '已切换为随机端口',
     );
-    if (_isServerRunning) {
+    if (_isServerRunning && serverSettingsChanged) {
       await _stopServer();
       await _startServer();
     } else if (mounted) {
-      setState(() {
-        _serverAddress = '服务未启动';
-      });
+      setState(() {});
     }
   }
 
@@ -3787,6 +3955,7 @@ class _MyHomePageState extends State<MyHomePage>
       _isServerRunning = false;
       _ipServerAddress = null;
     }
+    _syncClipboardMonitor();
   }
 
   Future<String?> _getLocalIpAddress() async {
@@ -5229,6 +5398,7 @@ function cardTypeLabel(attachments) {
 function renderCardTags(card) {
   const labels = ['创建 ' + new Date(card.createdAt).toLocaleString()];
   if (card.source === 'shared') labels.push('分享导入');
+  if (card.source === 'clipboard') labels.push('剪贴板');
   if (card.source === 'whiteboard') { labels.push('白板'); if (card.whiteboardName) labels.push(card.whiteboardName); }
   const typeLabel = cardTypeLabel(card.attachments || []);
   if (typeLabel) labels.push(typeLabel);
@@ -6416,11 +6586,11 @@ connectWs();
                           icon: Icons.copy_rounded,
                           onTap: _isServerRunning
                               ? () async {
+                                  _lastLocalShareCopiedText =
+                                      _serverAddress.trim();
                                   await Clipboard.setData(
                                     ClipboardData(text: _serverAddress),
                                   );
-                                  _lastLocalShareCopiedText =
-                                      _serverAddress.trim();
                                   _showToast('已复制当前访问地址');
                                 }
                               : null,
@@ -6661,6 +6831,7 @@ connectWs();
     final hasText = card.text.trim().isNotEmpty;
     final metaLabels = <String>[
       if (card.source == 'shared') '分享导入',
+      if (card.source == 'clipboard') '剪贴板',
       if (card.source == 'whiteboard') '白板',
       if (card.source == 'whiteboard' && card.whiteboardName != null) card.whiteboardName!,
       if (_cardTypeLabel(cardAttachments) case final typeLabel?) typeLabel,
@@ -7670,6 +7841,7 @@ class LocalShareSettingsPage extends StatefulWidget {
     required this.initialUseFixedPort,
     required this.initialConfirmDelete,
     required this.initialClipboardToTempChat,
+    this.initialClipboardToCards = false,
     required this.apiAddress,
     required this.onImportTap,
     required this.onExportTap,
@@ -7683,6 +7855,7 @@ class LocalShareSettingsPage extends StatefulWidget {
   final bool initialUseFixedPort;
   final bool initialConfirmDelete;
   final bool initialClipboardToTempChat;
+  final bool initialClipboardToCards;
   final String? Function() apiAddress;
   final Future<void> Function() onImportTap;
   final Future<void> Function() onExportTap;
@@ -7701,6 +7874,7 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
   late bool _useFixedPort = widget.initialUseFixedPort;
   late bool _confirmDelete = widget.initialConfirmDelete;
   late bool _clipboardToTempChat = widget.initialClipboardToTempChat;
+  late bool _clipboardToCards = widget.initialClipboardToCards;
 
   @override
   void dispose() {
@@ -7716,6 +7890,7 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
           port: widget.initialPort,
           confirmDelete: _confirmDelete,
           clipboardToTempChat: _clipboardToTempChat,
+          clipboardToCards: _clipboardToCards,
           clearAllCards: clearAllCards,
         ),
       );
@@ -7734,6 +7909,7 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
         port: value,
         confirmDelete: _confirmDelete,
         clipboardToTempChat: _clipboardToTempChat,
+        clipboardToCards: _clipboardToCards,
         clearAllCards: clearAllCards,
       ),
     );
@@ -7827,6 +8003,23 @@ class _LocalShareSettingsPageState extends State<LocalShareSettingsPage> {
                   onChanged: (value) {
                     setState(() {
                       _clipboardToTempChat = value;
+                    });
+                  },
+                ),
+                const SizedBox(height: 4),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: _clipboardToCards,
+                  title: const Text(
+                    '复制后自动生成卡片',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  subtitle: const Text(
+                    '自动保存复制的文字、链接、图片和文件，与已有卡片去重；在其他应用复制后，回到本应用自动保存当前剪贴板内容',
+                  ),
+                  onChanged: (value) {
+                    setState(() {
+                      _clipboardToCards = value;
                     });
                   },
                 ),
@@ -8883,6 +9076,7 @@ class _PortSettingsResult {
     required this.port,
     required this.confirmDelete,
     required this.clipboardToTempChat,
+    required this.clipboardToCards,
     this.clearAllCards = false,
   });
 
@@ -8890,6 +9084,7 @@ class _PortSettingsResult {
   final int port;
   final bool confirmDelete;
   final bool clipboardToTempChat;
+  final bool clipboardToCards;
   final bool clearAllCards;
 }
 

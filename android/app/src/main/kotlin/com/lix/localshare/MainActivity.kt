@@ -25,6 +25,8 @@ import io.flutter.plugin.common.MethodChannel
 import java.net.InetAddress
 
 class MainActivity: FlutterActivity() {
+    private var clipboardChannel: MethodChannel? = null
+    private var clipboardChangeListener: ClipboardManager.OnPrimaryClipChangedListener? = null
     private var notificationPermissionResult: MethodChannel.Result? = null
     private var nsdRegistrationListener: NsdManager.RegistrationListener? = null
     private var registeredDiscoveryName: String? = null
@@ -89,13 +91,41 @@ class MainActivity: FlutterActivity() {
                 }
             }
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "localshare/clipboard")
+        val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "localshare/clipboard")
+        clipboardChannel = channel
+        channel
             .setMethodCallHandler { call, result ->
                 when (call.method) {
-                    "readClipboardPayload" -> result.success(readClipboardPayload())
+                    "readClipboardPayload" -> {
+                        try {
+                            result.success(readClipboardPayload(
+                                call.argument<Boolean>("includeImages") != false,
+                                call.argument<Boolean>("includeFiles") == true,
+                            ))
+                        } catch (error: Exception) {
+                            result.error("clipboard_read_failed", error.message, null)
+                        }
+                    }
+                    "cacheClipboardFile" -> {
+                        val uri = call.argument<String>("uri").orEmpty()
+                        val name = call.argument<String>("name").orEmpty()
+                        Thread {
+                            try {
+                                val path = cacheClipboardFile(Uri.parse(uri), name)
+                                runOnUiThread { result.success(path) }
+                            } catch (error: Exception) {
+                                runOnUiThread { result.error("clipboard_file_failed", error.message, null) }
+                            }
+                        }.start()
+                    }
                     else -> result.notImplemented()
                 }
             }
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        clipboardChangeListener?.let { clipboard.removePrimaryClipChangedListener(it) }
+        clipboardChangeListener = ClipboardManager.OnPrimaryClipChangedListener {
+            channel.invokeMethod("clipboardChanged", null)
+        }.also { clipboard.addPrimaryClipChangedListener(it) }
 
         val downloadChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "localshare/download")
         downloadChannel.setMethodCallHandler { call, result ->
@@ -286,10 +316,27 @@ class MainActivity: FlutterActivity() {
         return normalized.ifBlank { "localshare" }.take(48)
     }
 
-    private fun readClipboardPayload(): Map<String, Any> {
+    private fun readClipboardPayload(includeImages: Boolean = true, includeFiles: Boolean = false): Map<String, Any> {
         val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
         val clip = clipboard.primaryClip ?: return mapOf("type" to "empty")
-        val imagePayload = findImagePayload(clip)
+        val timestamp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) clip.description.timestamp else 0L
+        if (includeFiles) {
+            val files = (0 until clip.itemCount).mapNotNull { index ->
+                val uri = clip.getItemAt(index).uri ?: return@mapNotNull null
+                if (uri.scheme != "content" && uri.scheme != "file") return@mapNotNull null
+                val mimeType = try { contentResolver.getType(uri).orEmpty() } catch (_: Exception) { "" }
+                val displayName = try {
+                    if (uri.scheme == "content") queryDisplayName(uri) else null
+                } catch (_: Exception) { null }
+                val name = displayName ?: uri.lastPathSegment ?: "clipboard-file"
+                mapOf("uri" to uri.toString(), "name" to name, "mimeType" to mimeType)
+            }.distinctBy { it["uri"] }
+            if (files.isNotEmpty()) return mapOf(
+                "type" to "files", "files" to files, "timestamp" to timestamp,
+                "fingerprint" to clipboardFingerprint(files.joinToString("\n") { it["uri"].orEmpty() }.toByteArray(Charsets.UTF_8)),
+            )
+        }
+        val imagePayload = findImagePayload(clip, includeImages)
         if (imagePayload != null) {
             return imagePayload
         }
@@ -300,6 +347,7 @@ class MainActivity: FlutterActivity() {
                 return mapOf(
                     "type" to "text",
                     "text" to text,
+                    "fingerprint" to clipboardFingerprint(text.toByteArray(Charsets.UTF_8)),
                     "timestamp" to if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         clip.description.timestamp
                     } else {
@@ -311,7 +359,7 @@ class MainActivity: FlutterActivity() {
         return mapOf("type" to "empty")
     }
 
-    private fun findImagePayload(clip: ClipData): Map<String, Any>? {
+    private fun findImagePayload(clip: ClipData, includeBytes: Boolean = true): Map<String, Any>? {
         for (index in 0 until clip.itemCount) {
             val item = clip.getItemAt(index)
             val uri = item.uri ?: continue
@@ -319,6 +367,7 @@ class MainActivity: FlutterActivity() {
             if (!mimeType.startsWith("image/")) {
                 continue
             }
+            if (!includeBytes) return mapOf("type" to "image")
             val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: continue
             if (bytes.isEmpty()) {
                 continue
@@ -331,6 +380,45 @@ class MainActivity: FlutterActivity() {
             )
         }
         return null
+    }
+
+    private fun clipboardFingerprint(bytes: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(bytes).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+    private fun cacheClipboardFile(uri: Uri, name: String): String {
+        require(uri.scheme == "content" || uri.scheme == "file") { "Unsupported clipboard file URI" }
+        val directory = File(cacheDir, "clipboard-files/${java.util.UUID.randomUUID()}")
+        check(directory.mkdirs()) { "Unable to create clipboard cache" }
+        val fileName = sanitizeFileName(name).takeUnless { it == "." || it == ".." } ?: "clipboard-file"
+        val target = File(directory, fileName)
+        try {
+            val expectedSize = try {
+                if (uri.scheme == "file") {
+                    File(requireNotNull(uri.path)).length()
+                } else {
+                    contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use {
+                        val index = it.getColumnIndex(OpenableColumns.SIZE)
+                        if (it.moveToFirst() && index >= 0 && !it.isNull(index)) {
+                            it.getLong(index).takeIf { size -> size >= 0 }
+                        } else null
+                    }
+                }
+            } catch (_: Exception) { null }
+            val input = contentResolver.openInputStream(uri)
+                ?: throw java.io.IOException("Unable to open clipboard file")
+            val copied = input.use { source ->
+                target.outputStream().use { source.copyTo(it, 256 * 1024) }
+            }
+            check((expectedSize == null || expectedSize == copied) && target.length() == copied) {
+                "Clipboard file copy was incomplete"
+            }
+            return target.absolutePath
+        } catch (error: Exception) {
+            target.delete()
+            directory.delete()
+            throw error
+        }
     }
 
     private fun resolveDisplayName(uri: Uri, mimeType: String): String {
@@ -459,7 +547,16 @@ class MainActivity: FlutterActivity() {
         notificationPermissionResult = null
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) clipboardChannel?.invokeMethod("clipboardChanged", null)
+    }
+
     override fun onDestroy() {
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        clipboardChangeListener?.let { clipboard.removePrimaryClipChangedListener(it) }
+        clipboardChangeListener = null
+        clipboardChannel = null
         unregisterHttpDiscoveryService()
         super.onDestroy()
     }
